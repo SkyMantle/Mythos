@@ -1,0 +1,18 @@
+[Unit]
+Description=FPV analog video scanner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=fpv
+WorkingDirectory=/opt/fpvscan
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/fpvscan/.venv/bin/python /opt/fpvscan/run.py -c /opt/fpvscan/config.yaml
+Restart=always
+RestartSec=3
+SupplementaryGroups=plugdev
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target
