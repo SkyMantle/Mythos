@@ -117,6 +117,14 @@ class Engine:
                 name, kw = self._cmd.get_nowait()
             except Empty:
                 return
+            try:
+                self._handle_command(name, kw)
+            except Exception as e:
+                self._emit("notice", {"level": "error",
+                                "text": f"команда «{name}»: {e}"})
+            print(f"[рушій] команда «{name}» впала: {e}", flush=True)
+
+        def _handle_command(self, name: str, kw: dict):
             if name == "lock":
                 self._acc = None
                 self._afc = 0.0
@@ -138,7 +146,7 @@ class Engine:
                 self._rec_start()
             elif name == "rec_stop":
                 self._rec_stop()
-            if name in ("sweep", "lock") and self._rec is not None:
+        if name in ("sweep", "lock") and self._rec is not None:
                 self._rec_stop()      # ролик прив'язаний до одного каналу
 
         # ---------- фото і відео ----------
@@ -289,8 +297,6 @@ class Engine:
 
             f = plan[self._sweep_i]
             self._sweep_i += 1
-            self._lock_tuned = None
-            iq = self._grab(f, need)
             if self._stop.is_set():
                 return
             self._drain_commands()

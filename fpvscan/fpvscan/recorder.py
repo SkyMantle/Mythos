@@ -78,7 +78,7 @@ class VideoRecorder:
     """Запис послідовності кадрів у mp4/H.264."""
 
     def __init__(self, path: Path, width: int, height: int,
-                 fps: int = 5, crf: int = 24, preset: str = "veryfast"):
+                 fps: int = 5, crf: int = 24, preset: str = "veryfast", exe: str | None = None):
         self.path = Path(path)
         self.width = int(width)
         self.height = int(height)
@@ -92,11 +92,10 @@ class VideoRecorder:
         self._thread: threading.Thread | None = None
         self.frames_written = 0
         self.started_at = 0.0
-        exe: str | None = None
         self.exe = exe
 
     def start(self):
-        exe = ffmpeg_path()
+        exe = ffmpeg_path(self.exe)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         cmd = [
             exe, "-hide_banner", "-loglevel", "error", "-y",
