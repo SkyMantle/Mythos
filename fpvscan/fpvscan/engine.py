@@ -18,6 +18,7 @@ import time
 from pathlib import Path
 from dataclasses import dataclass, field, asdict
 from queue import Queue, Empty
+from .iqbuffer import IQRingBuffer
 
 import numpy as np
 
@@ -67,10 +68,19 @@ class Engine:
         self._snap = False
         self._peeked: dict[int, float] = {}   # частоти, які вже бачилися в цьому проході
         self._lock_tuned: float | None = None  # на що вже перебудовані
+        self._ring: IQRingBuffer | None = None       # кільцевий буфер IQ для LOCK
+        self._reader_thread: threading.Thread | None = None
+        self._reader_stop = threading.Event()
+        self._reader_err: Exception | None = None     # помилка з нитки читання
+        self._lock_state = None                        # cvbs.DecodeState | None
+        self._lock_dec: int | None = None              # коефіцієнт децимації минулого виклику
         self._lock_n = 0
         self._acc: np.ndarray | None = None
         self._afc = 0.0
         self._sweep_i = 0
+        self._timings: dict[str, float] = {}   # ковзне середнє по етапах, мс
+        self._frame_ts: float | None = None    # час минулого відданого кадру
+        self._fps_ema = 0.0
 
     # ---------- зовнішнє API ----------
 
@@ -87,6 +97,15 @@ class Engine:
         self._cmd.put((name, kw))
 
     # ---------- внутрішнє ----------
+
+    def _mark(self, stage: str, t0: float) -> float:
+        """Ковзне середнє часу етапу (мс). Легке — тільки арифметика,
+        жодних додаткових захоплень чи алокацій на гарячому шляху."""
+        t1 = time.perf_counter()
+        dt_ms = (t1 - t0) * 1000
+        prev = self._timings.get(stage)
+        self._timings[stage] = dt_ms if prev is None else prev * 0.8 + dt_ms * 0.2
+        return t1
 
     def _emit(self, kind: str, payload):
         """Кладе подію в чергу до веб-шару.
@@ -122,33 +141,33 @@ class Engine:
             except Exception as e:
                 self._emit("notice", {"level": "error",
                                 "text": f"команда «{name}»: {e}"})
-            print(f"[рушій] команда «{name}» впала: {e}", flush=True)
+                print(f"[рушій] команда «{name}» впала: {e}", flush=True)
 
-        def _handle_command(self, name: str, kw: dict):
-            if name == "lock":
-                self._acc = None
-                self._afc = 0.0
-                self._lock_tuned = None
-                self.state.lock_target = float(kw["freq_hz"])
-                self.state.mode = "LOCK"
-                self.state.auto = False
-            elif name == "sweep":
-                self.state.lock_target = None
-                self.state.mode = "SWEEP"
-                self.state.auto = False
-            elif name == "clear":
-                self._peeked.clear()
-                self._sweep_i = 0
-                self.state.detections.clear()
-            elif name == "snapshot":
-                self._snap = True
-            elif name == "rec_start":
-                self._rec_start()
-            elif name == "rec_stop":
-                self._rec_stop()
+    def _handle_command(self, name: str, kw: dict):
+        if name == "lock":
+            self._acc = None
+            self._afc = 0.0
+            self._lock_tuned = None
+            self.state.lock_target = float(kw["freq_hz"])
+            self.state.mode = "LOCK"
+            self.state.auto = False
+        elif name == "sweep":
+            self.state.lock_target = None
+            self.state.mode = "SWEEP"
+            self.state.auto = False
+            self._stop_reader()
+        elif name == "clear":
+            self._peeked.clear()
+            self._sweep_i = 0
+            self.state.detections.clear()
+        elif name == "snapshot":
+            self._snap = True
+        elif name == "rec_start":
+            self._rec_start()
+        elif name == "rec_stop":
+            self._rec_stop()
         if name in ("sweep", "lock") and self._rec is not None:
-                self._rec_stop()      # ролик прив'язаний до одного каналу
-
+            self._rec_stop()      # ролик прив'язаний до одного каналу
         # ---------- фото і відео ----------
 
     def _rec_start(self):
@@ -233,6 +252,7 @@ class Engine:
                     # їй потрібні секунди, а не мілісекунди.
                     time.sleep(min(5.0, 0.5 * fails))
         finally:
+            self._stop_reader()
             self._rec_stop()
             self.src.close()
 
@@ -458,34 +478,95 @@ class Engine:
                 return max(8e6, d.bandwidth_hz * 1.6)
         return max(8e6, default_bw)
 
+    def _start_reader(self, want: float, fs: float, ring_seconds: float):
+        """Запускає нитку безперервного читання IQ у кільцевий буфер.
+
+        Раніше кожен виклик _do_lock() сам читав IQ блоками: поки йде
+        обробка попереднього блоку, приймач простоює, а наступний блок
+        читається «з нуля» — звідси й ривки, і втрата фази синхри між
+        блоками (п.1, п.2 розділу «Що далі» в технічному описі). Тепер
+        приймач читає безперервно в окремій нитці, а _do_lock() лише
+        бере знімки з кільцевого буфера — коли завгодно, без блокування
+        приймача на час декодування.
+        """
+        self._stop_reader()
+        first = self.src.retune_and_read(want, max(2048, int(fs * 0.01)))
+        self._ring = IQRingBuffer(capacity=max(len(first), int(fs * ring_seconds)))
+        self._ring.write(first)
+        self._reader_stop = threading.Event()
+        self._reader_err = None
+        self._reader_thread = threading.Thread(
+            target=self._reader_loop, args=(fs,), daemon=True)
+        self._reader_thread.start()
+        self._lock_tuned = want
+        self._lock_state = cvbs.DecodeState()
+        self._lock_dec = None
+
+    def _stop_reader(self):
+        if self._reader_thread is not None:
+            self._reader_stop.set()
+            self._reader_thread.join(timeout=2)
+        self._reader_thread = None
+        self._ring = None
+
+    def _reader_loop(self, fs: float):
+        chunk = max(1024, int(fs * 0.005))     # 5 мс за раз
+        while not self._reader_stop.is_set():
+            try:
+                iq = self.src.read(chunk)
+            except Exception as e:
+                self._reader_err = e
+                return
+            ring = self._ring
+            if ring is None:
+                return
+            ring.write(iq)
+
     def _do_lock(self):
         vcfg = self.cfg["video"]
         fs = float(vcfg.get("sample_rate", 20e6))
         f = self.state.lock_target
+
         if self.src.sample_rate != fs:
+            self._stop_reader()          # нитка читала на старій fs — перезапуск
             self.src.set_sample_rate(fs)
 
-        # Зміщення гетеродина: ставимо ФАПЧ збоку від каналу, щоб витік
-        # гетеродина і постійне зміщення АЦП не сиділи посеред сигналу.
         off = float(vcfg.get("lo_offset_hz", 0.0))
         bw = float(vcfg.get("channel_bw_hz", 20e6))
         if off and (abs(off) + bw / 2) > fs * 0.45:
             off = 0.0
 
         capture_s = float(vcfg.get("capture_ms", 120)) / 1000
-        n = int(fs * capture_s)
+        n_full = int(fs * capture_s)
+        n = n_full
+        if (self._lock_state is not None and self._lock_state.period is not None
+                and self._lock_state.lost == 0 and self._lock_dec):
+            margin = float(vcfg.get("track_window_margin", 1.7))
+            field_lines = cvbs.FIELD_LINES.get(self._lock_state.standard,
+                                                cvbs.FIELD_LINES["?"])
+            n_track = int(self._lock_state.period * field_lines
+                         * self._lock_dec * margin)
+            n = max(int(fs * 0.02), min(n_full, n_track))
 
-        # Перебудова коштує близько 150 мс і потрібна лише коли канал
-        # змінився. Раніше вона робилась на кожен кадр — це і був
-        # головний обмежувач частоти кадрів.
+        ring_s = float(vcfg.get("ring_seconds", max(0.3, capture_s * 3)))
+
+        if self._reader_err is not None:
+            err, self._reader_err = self._reader_err, None
+            self._stop_reader()
+            raise err
+
         want = f + off + self._afc
-        if self._lock_tuned != want:
-            iq = self.src.retune_and_read(want, n)
-            self._lock_tuned = want
-        else:
-            iq = self.src.read(n)
+        if self._ring is None or self._lock_tuned != want:
+            self._start_reader(want, fs, ring_s)
 
-        # Спектр у режимі утримання потрібен для контролю, а не покадрово.
+        iq, abs_start_iq = self._ring.snapshot(n)
+        if len(iq) < n:
+            time.sleep(float(vcfg.get("idle_ms", 120)) / 1000)
+            return
+
+        t = time.perf_counter()
+        self._lock_n += 1
+
         every = max(1, int(vcfg.get("spectrum_every", 8)))
         if self._lock_n % every == 1:
             psd = spectrum.psd_db(iq, 4096, 4)
@@ -495,18 +576,18 @@ class Engine:
                 "floor_db": round(spectrum.noise_floor_db(psd), 1),
             })
 
-        iq = iq - np.mean(iq)          # прибираємо постійне зміщення
+        iq = iq - np.mean(iq)
 
-        # Виділяємо канал ПЕРЕД дискримінатором. Частотний детектор
-        # нелінійний: якщо подати йому всю смугу, найсильніший сусідній
-        # сигнал придушить корисний і на виході буде сміття замість
-        # відео. Ширину беремо з самої знахідки, а не з конфігу.
         ch_bw = self._lock_bw(f, bw)
         base_iq, fs_ch = demod.channelize(iq, fs, -off, ch_bw)
-                # Автопідстроювання. Центр зайнятої смуги, за яким ми стали на
-        # канал, не збігається з несучою: спектр ЧМ-відео несиметричний.
-        # Похибка в кілька мегагерц ставить сигнал боком у смузі
-        # фільтра, край зрізається — і картинка починає дригатись.
+        t = self._mark("channelize", t)
+
+        dec = max(1, int(fs / ch_bw))
+        if self._lock_dec != dec:
+            self._lock_dec = dec
+            self._lock_state = cvbs.DecodeState()
+        abs_start_ch = abs_start_iq / dec
+
         if vcfg.get("afc", True):
             err = demod.freq_error_hz(base_iq, fs_ch)
             lim = float(vcfg.get("afc_limit_hz", 8e6))
@@ -514,15 +595,23 @@ class Engine:
             if abs(err) > dead:
                 gain = float(vcfg.get("afc_gain", 0.5))
                 self._afc = max(-lim, min(lim, self._afc + err * gain))
-                self._lock_tuned = None        # перебудуватись наступного разу
+        t = self._mark("afc", t)
+
         base = demod.fm_demod(base_iq, fs_ch, deviation_hz=ch_bw / 4)
+        t = self._mark("demod_fm", t)
         base = demod.deemphasis(base, fs_ch)
-        frame = cvbs.decode(base, fs_ch, width=int(vcfg.get("width", 640)))
+        t = self._mark("deemphasis", t)
+
+        frame = cvbs.decode(base, fs_ch, width=int(vcfg.get("width", 640)),
+                            state=self._lock_state, abs_start=abs_start_ch + 1)
+        t = self._mark("decode", t)
 
         if frame is not None:
             min_lines = int(vcfg.get("min_lines", 250))
             if frame.lines < min_lines:
                 frame = None
+
+        if frame is not None:
             k = float(vcfg.get("average", 0.0))
             if k > 0:
                 cur = frame.luma.astype(np.float32)
@@ -532,11 +621,17 @@ class Engine:
                     a = 1.0 / max(1.0, k)
                     self._acc = self._acc * (1 - a) + cur * a
                 frame.luma = np.clip(self._acc, 0, 255).astype(np.uint8)
+
             if self._rec is not None:
                 self._rec.push(frame.luma)
+
             if self._snap:
                 self._snap = False
                 self._save_photo(frame)
+
+            img = cvbs.encode(frame, "webp", int(vcfg.get("stream_quality", 75)), height=None)
+            t = self._mark("encode", t)
+
             self._emit("frame", {
                 "freq_hz": f,
                 "standard": frame.standard,
@@ -544,19 +639,32 @@ class Engine:
                 "lines": frame.lines,
                 "locked": frame.locked,
                 "afc_hz": round(self._afc, 0),
-                "img": cvbs.encode(frame, "webp",
-                int(vcfg.get("stream_quality", 75))),
+                "img": img,
             })
 
-        # шпаруватість: даємо процесору видихнути між захопленнями
+            now = time.perf_counter()
+            prev_ts = self._frame_ts
+            self._frame_ts = now
+            if prev_ts is not None:
+                dt = now - prev_ts
+                if dt > 0:
+                    inst = 1.0 / dt
+                    if self._fps_ema == 0:
+                        self._fps_ema = inst
+                    else:
+                        self._fps_ema = self._fps_ema * 0.8 + inst * 0.2
+
+        # шпаруватість: даємо процесору видихнути між знімками
         time.sleep(float(vcfg.get("idle_ms", 120)) / 1000)
-                # Автоматичний перегляд обмежений у часі — далі шукаємо інших.
+
+        # Автоматичний перегляд обмежений у часі — далі шукаємо інших.
         if self.state.auto and time.time() >= self.state.auto_until:
             self.state.auto = False
             self.state.lock_target = None
             self.state.mode = "SWEEP"
             self._acc = None
             self._afc = 0.0
+            self._stop_reader()        # звільняємо src перед _do_sweep()
 
     def snapshot(self) -> dict:
         return {
@@ -568,7 +676,9 @@ class Engine:
             "source": self.src.name,
             "recording": self._rec is not None,
             "rec_seconds": (round(time.time() - self._rec.started_at, 1)
-                            if self._rec else 0),
+            if self._rec else 0),
+            "fps": round(self._fps_ema, 2),
+            "timings_ms": {k: round(v, 1) for k, v in self._timings.items()},
             "overflows": int(getattr(self.src, "overflows", 0)),
             "clip_frac": round(float(getattr(self.src, "clip_frac", 0.0)), 4),
             "detections": [asdict(d) for d in

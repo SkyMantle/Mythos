@@ -7,7 +7,7 @@ sdr:
   num_buffers: 32 # потік USB: більше буферів = стійкіше до зривів,
   buffer_size: 32768 # але більша затримка. buffer_size кратний 1024
   num_transfers: 16
-  gain_db: 50 # почни з 30 і підбери через scripts/bringup.py
+  gain_db: 10 # почни з 30 і підбери через scripts/bringup.py
   agc: false # АРП зручна для пошуку, шкідлива для декодування
   settle_us: 500 # час установлення ФАПЧ після перебудови
   # driver: file
@@ -19,13 +19,13 @@ scan:
   sample_rate: 35.0e6 # bladeRF A4 тягне до 61.44, але 40 стабільніше по USB
   channel_bw_hz: 10.0e6 # очікувана ширина каналу; визначає крок свіпу
   step_hz: 0 # 0 = порахувати автоматично зі смуги і ширини каналу
-  fft_size: 4096
+  fft_size: 8192
   averages: 8
   threshold_db: 6.0 # наскільки сигнал має піднятись над шумовою підлогою
   min_bw_hz: 2.0e6
   inspect_ms: 25 # довжина контрольного захоплення для перевірки кандидата
   dc_notch_hz: 200.0e3 # ширина вирізу на нулі (витік гетеродина)
-  priority_bands: false # частіше обходити 433/900/1G2/2G4/3G3/5G8
+  priority_bands: true # частіше обходити 433/900/1G2/2G4/3G3/5G8
   confirm_hits: 2
   line_tol_hz: 150.0 # допуск рядкової частоти від номіналу PAL/NTSC
   line_prominence_db: 8.0 # наскільки лінія має бути вища за фон
@@ -44,11 +44,11 @@ video:
   # при sample_rate 61.44e6 постав 8.0e6
   afc: true # автопідстроювання на несучу
   afc_gain: 0.5 # частка похибки, що виправляється за крок
-  afc_limit_hz: 10.0e+6 # межа поправки
-  afc_deadband_hz: 150.0e+3 # нижче цієї похибки не смикаємось
-  capture_ms: 70 # скільки ефіру беремо на один кадр
-  stream_quality: 75 # якість WebP для потоку в браузер
-  rec_fps: 19 # частота кадрів у файлі
+  afc_limit_hz: 20.0e+6 # межа поправки
+  afc_deadband_hz: 100.0e+3 # нижче цієї похибки не смикаємось
+  capture_ms: 80 # скільки ефіру беремо на один кадр
+  stream_quality: 60 # якість WebP для потоку в браузер
+  rec_fps: 24 # частота кадрів у файлі
   rec_height: 288 # висота запису; менше = менший файл
   rec_crf: 24 # якість H.264: менше число = краще і більше
   rec_preset: veryfast # на Pi 5 не важче за veryfast
@@ -57,6 +57,7 @@ video:
   spectrum_every: 8
   ffmpeg_path: ''
   average: 3
+  ring_seconds: 0.5
 
 web:
   host: 0.0.0.0

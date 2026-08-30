@@ -6,12 +6,21 @@
 читається, а колірна синхронізація вже розсипається. Яскравіша
 картинка дає все, що потрібно для розпізнавання обстановки.
 
-Порядок роботи:
-  1. визначення полярності (у якому боці вершина синхроімпульсу)
-  2. поріг між вершиною синхри та рівнем гасіння
-  3. пошук фронтів рядкової синхри, оцінка періоду рядка
-  4. пошук кадрової синхри (широкі імпульси, > пів рядка низького рівня)
-  5. вирізання активної частини кожного рядка та ресемплінг у пікселі
+Два режими пошуку кадрової синхри:
+
+  * "сліпий" (`_attempt`) — повний перебір: полярність, поріг,
+    пошук усіх фронтів рядкової синхри, МНК-уточнення періоду,
+    пошук кадрової синхри за часткою низького рівня у вікні.
+    Використовується на першому виклику і як запасний варіант.
+
+  * "трекінг" (`_attempt_tracked`) — коли з попереднього успішного
+    кадру відомі період і полярність (`DecodeState`), наступний
+    фронт кадрової синхри прогнозується екстраполяцією по цілій
+    кількості польових періодів і шукається лише у вузькому вікні
+    навколо прогнозу. Це і є успадкування фази між блоками
+    захоплення: кожен новий знімок з кільцевого буфера не починає
+    пошук синхри «з нуля», а продовжує з того місця, де зупинився
+    попередній, — звідси стабільніша, менш «стрибаюча» картинка.
 """
 from __future__ import annotations
 from dataclasses import dataclass
@@ -26,6 +35,10 @@ STD_GEOM = {
     "NTSC": (9.4 / 63.556,      62.0 / 63.556, 20),
     "?":    (10.0 / 64.0,       62.3 / 64.0,   22),
 }
+# орієнтовна кількість рядків в одному півкадрі (полі) — потрібна лише
+# для екстраполяції позиції наступної кадрової синхри в трекінгу,
+# точність тут не критична (похибка в межах вікна пошуку tol_frac*period)
+FIELD_LINES = {"PAL": 312.5, "NTSC": 262.5, "?": 287.5}
 
 
 @dataclass
@@ -37,6 +50,25 @@ class Frame:
     locked: bool
 
 
+@dataclass
+class DecodeState:
+    """Пам'ять декодера між послідовними викликами decode() для одного
+    каналу. Тримає Engine (по одному екземпляру на LOCK), передається
+    в decode() і оновлюється на місці.
+
+    `abs_t0` — абсолютна позиція (у відліках потоку, у тій самій шкалі,
+    що й параметр `abs_start` у decode()) останнього достовірно
+    знайденого фронту кадрової синхри. Саме вона й дозволяє прогнозувати
+    наступний фронт незалежно від того, наскільки новий знімок
+    зсунутий чи розірваний відносно попереднього.
+    """
+    sign: float = 1.0
+    period: float | None = None      # період рядка, у відліках поточної fs
+    standard: str = "?"
+    abs_t0: float | None = None
+    lost: int = 0                    # підряд невдалих спроб трекінгу
+
+
 def _sync_edges(v: np.ndarray, thr: float):
     below = v < thr
     edges = np.flatnonzero(below[1:] & ~below[:-1]) + 1
@@ -44,22 +76,23 @@ def _sync_edges(v: np.ndarray, thr: float):
 
 
 def _attempt(v: np.ndarray, fs: float, width: int, max_lines: int):
-    """Одна спроба декодування за заданої полярності.
+    """Одна спроба сліпого декодування за заданої полярності.
 
-    Повертає (оцінка_якості, Frame|None). Оцінка — частка міжсинхронних
-    інтервалів, що лягли в ±20% від медіани. У шумі або при
-    перевернутому сигналі вона розсипається, тому за нею й обираємо
-    полярність.
+    Повертає (оцінка_якості, Frame|None, t0|None). Оцінка — частка
+    міжсинхронних інтервалів, що лягли в ±20% від медіани. У шумі або
+    при перевернутому сигналі вона розсипається, тому за нею й обираємо
+    полярність. `t0` — локальний індекс використаного фронту кадрової
+    синхри, потрібен викликачу для того, щоб засіяти DecodeState.
     """
     lo, hi = np.percentile(v, [0.5, 99.5])
     if hi - lo < 1e-9:
-        return 0.0, None
+        return 0.0, None, None
     v = (v - lo) / (hi - lo)          # вершина синхри ≈ 0, білий ≈ 1
 
     thr = 0.18                        # між вершиною синхри і рівнем гасіння
     below, edges = _sync_edges(v, thr)
     if len(edges) < 24:
-        return 0.0, None
+        return 0.0, None, None
 
     d = np.diff(edges).astype(np.float64)
     # орієнтир — найдовший поширений інтервал (півкадрові імпульси коротші)
@@ -67,7 +100,7 @@ def _attempt(v: np.ndarray, fs: float, width: int, max_lines: int):
     keep = (d > med * 0.8) & (d < med * 1.2)
     score = float(keep.mean())
     if keep.sum() < 12:
-        return 0.0, None
+        return 0.0, None, None
     period = float(np.median(d[keep]))
     e = edges.astype(np.float64)
     k = np.round((e - e[0]) / period)
@@ -79,7 +112,7 @@ def _attempt(v: np.ndarray, fs: float, width: int, max_lines: int):
         period = float(period)
     line_rate = fs / period
     if not (14000 < line_rate < 17500):
-        return 0.0, None
+        return 0.0, None, None
     standard = ("PAL" if abs(line_rate - 15625) < 120 else
                 "NTSC" if abs(line_rate - 15734) < 120 else "?")
     a0_frac, a1_frac, vblank = STD_GEOM[standard]
@@ -106,7 +139,7 @@ def _attempt(v: np.ndarray, fs: float, width: int, max_lines: int):
     a1 = a1_frac * period
     n_lines = int(min(max_lines, (len(v) - t0 - period) / period))
     if a1 <= a0 or n_lines < 32:
-        return 0.0, None
+        return 0.0, None, None
 
     offs = np.linspace(a0, a1, width, dtype=np.float32)
     idx = (t0 + np.arange(n_lines, dtype=np.float32)[:, None] * period
@@ -120,23 +153,133 @@ def _attempt(v: np.ndarray, fs: float, width: int, max_lines: int):
     return score, Frame(
         luma=(luma * 255).astype(np.uint8),
         line_rate=line_rate, lines=n_lines,
-        standard=standard, locked=locked)
+        standard=standard, locked=locked), t0
+
+
+def _predict_local_t0(state: DecodeState, abs_start: float) -> float | None:
+    """Прогнозує локальну (відносно початку нового знімку) позицію
+    найближчого фронту кадрової синхри за відомими період+abs_t0.
+
+    Екстраполяція йде по цілій кількості польових періодів
+    (`round(...)`), тому прогноз завжди влучає в межі поточного поля
+    незалежно від того, наскільки великий розрив між знімками —
+    буфер міг не встигнути записати частину відліків, виклик
+    decode() міг прийти з затримкою тощо. «Пливти» разом з розміром
+    розриву тут нема чому.
+    """
+    if state.period is None or state.abs_t0 is None:
+        return None
+    field_period = state.period * FIELD_LINES.get(state.standard, FIELD_LINES["?"])
+    if field_period <= 0:
+        return None
+    n = round((abs_start - state.abs_t0) / field_period)
+    abs_pred = state.abs_t0 + n * field_period
+    return float(abs_pred - abs_start)
+
+
+def _attempt_tracked(v: np.ndarray, fs: float, width: int, max_lines: int,
+                      state: DecodeState, abs_start: float,
+                      tol_frac: float = 0.55):
+    """Швидка спроба декодування зі знанням періоду й полярності.
+
+    Шукає фронт кадрової синхри лише у вузькому вікні
+    (±tol_frac·period) навколо прогнозованої позиції, а сам період і
+    полярність не переоцінює — бере як є з `state`. Це не лише
+    швидше за повний сліпий пошук, а й головна причина стабільнішої
+    картинки: період більше не «сіпається» від незалежних оцінок
+    кожного блоку.
+
+    Повертає (Frame, abs_t0) або None, якщо синхру у вікні не
+    знайдено — тоді викликач має відкотитись на _attempt().
+    """
+    local_t0_pred = _predict_local_t0(state, abs_start)
+    if local_t0_pred is None:
+        return None
+    period = state.period
+    tol = tol_frac * period
+    lo = int(max(0, local_t0_pred - tol))
+    hi = int(min(len(v), local_t0_pred + tol))
+    if hi - lo < 8:
+        return None
+
+    vv = v * state.sign
+    p_lo, p_hi = np.percentile(vv, [0.5, 99.5])
+    if p_hi - p_lo < 1e-9:
+        return None
+    vv = (vv - p_lo) / (p_hi - p_lo)
+
+    thr = 0.18
+    window = vv[lo:hi]
+    below_w = window < thr
+    edges_w = np.flatnonzero(below_w[1:] & ~below_w[:-1]) + 1 + lo
+    if len(edges_w) == 0:
+        return None
+    t0 = float(edges_w[np.argmin(np.abs(edges_w - local_t0_pred))])
+
+    standard = state.standard
+    a0_frac, a1_frac, _vblank = STD_GEOM[standard]
+    a0 = a0_frac * period
+    a1 = a1_frac * period
+    n_lines = int(min(max_lines, (len(vv) - t0 - period) / period))
+    if a1 <= a0 or n_lines < 32:
+        return None
+
+    offs = np.linspace(a0, a1, width, dtype=np.float32)
+    idx = (t0 + np.arange(n_lines, dtype=np.float32)[:, None] * period
+           + offs[None, :])
+    idx = np.clip(idx, 0, len(vv) - 2)
+    i0 = idx.astype(np.int32)
+    fr = idx - i0
+    samp = vv[i0] * (1 - fr) + vv[i0 + 1] * fr
+
+    luma = np.clip((samp - 0.30) / 0.70, 0, 1)
+    frame = Frame(luma=(luma * 255).astype(np.uint8),
+                  line_rate=fs / period, lines=n_lines,
+                  standard=standard, locked=True)
+    return frame, abs_start + t0
 
 
 def decode(base: np.ndarray, fs: float, width: int = 640,
-           max_lines: int = 288) -> Frame | None:
-    """Декодує напівкадр. Полярність визначається перебором:
-    у реальному ефірі вона залежить від передавача, а гістограмна
-    евристика на слабкому сигналі помиляється."""
+           max_lines: int = 288,
+           state: DecodeState | None = None,
+           abs_start: float = 0.0) -> Frame | None:
+    """Декодує напівкадр.
+
+    Без `state` (або на першому виклику) — точнісінько як раніше:
+    повний перебір полярності й сліпий пошук синхри. Якщо переданий
+    `state` уже містить період з попереднього успішного кадру, спершу
+    пробує трекінг у вузькому вікні; лише після трьох поспіль
+    невдалих спроб трекінгу («lost») відкочується на сліпий пошук і
+    засіює `state` заново.
+    """
     if len(base) < int(fs * 0.02):        # менше 20 мс — нема сенсу
         return None
     v = base.astype(np.float32)
-    best_s, best_f = 0.0, None
+
+    if state is not None and state.period is not None and state.lost < 3:
+        tracked = _attempt_tracked(v, fs, width, max_lines, state, abs_start)
+        if tracked is not None:
+            frame, abs_t0 = tracked
+            state.abs_t0 = abs_t0
+            state.lost = 0
+            return frame
+        state.lost += 1
+
+    best_s, best_f, best_t0, best_sign = 0.0, None, None, 1.0
     for sign in (1.0, -1.0):
-        s, f = _attempt(v * sign, fs, width, max_lines)
+        s, f, t0 = _attempt(v * sign, fs, width, max_lines)
         if f is not None and s > best_s:
-            best_s, best_f = s, f
-    return best_f if best_s > 0.5 else None
+            best_s, best_f, best_t0, best_sign = s, f, t0, sign
+    if best_s <= 0.5:
+        return None
+
+    if state is not None:
+        state.sign = best_sign
+        state.period = fs / best_f.line_rate
+        state.standard = best_f.standard
+        state.abs_t0 = abs_start + best_t0
+        state.lost = 0
+    return best_f
 
 
 def encode(frame: Frame, fmt: str = "webp", quality: int = 80,
