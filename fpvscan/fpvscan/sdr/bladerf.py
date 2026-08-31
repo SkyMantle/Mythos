@@ -19,6 +19,7 @@ import os
 import sys
 import time
 
+from matplotlib.pyplot import rc
 import numpy as np
 
 from .base import SdrSource
@@ -254,25 +255,27 @@ def _declare(lib):
         "bladerf_is_fpga_configured": ([p], C.c_int),
         "bladerf_get_fpga_size": ([p, C.POINTER(C.c_int)], C.c_int),
         "bladerf_enable_module": ([p, C.c_int, C.c_bool], C.c_int),
+        "bladerf_set_bias_tee": ([p, C.c_int, C.c_bool], C.c_int),
+        "bladerf_get_bias_tee": ([p, C.c_int, C.POINTER(C.c_bool)], C.c_int),
         "bladerf_set_frequency": ([p, C.c_int, C.c_uint64], C.c_int),
         "bladerf_get_frequency": ([p, C.c_int, C.POINTER(C.c_uint64)], C.c_int),
         "bladerf_set_sample_rate": ([p, C.c_int, C.c_uint,
-                                     C.POINTER(C.c_uint)], C.c_int),
+                                    C.POINTER(C.c_uint)], C.c_int),
         "bladerf_set_bandwidth": ([p, C.c_int, C.c_uint,
-                                   C.POINTER(C.c_uint)], C.c_int),
+                                C.POINTER(C.c_uint)], C.c_int),
         "bladerf_set_gain": ([p, C.c_int, C.c_int], C.c_int),
         "bladerf_get_gain": ([p, C.c_int, C.POINTER(C.c_int)], C.c_int),
         "bladerf_set_gain_mode": ([p, C.c_int, C.c_int], C.c_int),
         "bladerf_get_gain_range": ([p, C.c_int,
                                     C.POINTER(C.POINTER(_Range))], C.c_int),
         "bladerf_sync_config": ([p, C.c_int, C.c_int, C.c_uint, C.c_uint,
-                                 C.c_uint, C.c_uint], C.c_int),
+                                C.c_uint, C.c_uint], C.c_int),
         "bladerf_sync_rx": ([p, C.c_void_p, C.c_uint,
-                             C.POINTER(_Metadata), C.c_uint], C.c_int),
+                            C.POINTER(_Metadata), C.c_uint], C.c_int),
         "bladerf_get_timestamp": ([p, C.c_int, C.POINTER(C.c_uint64)], C.c_int),
         "bladerf_get_quick_tune": ([p, C.c_int, C.c_void_p], C.c_int),
         "bladerf_schedule_retune": ([p, C.c_int, C.c_uint64, C.c_uint64,
-                                     C.c_void_p], C.c_int),
+                                    C.c_void_p], C.c_int),
         "bladerf_strerror": ([C.c_int], C.c_char_p),
     }
     for name, (argtypes, restype) in sig.items():
@@ -305,7 +308,8 @@ class BladeRF(SdrSource):
                 num_transfers: int = 16, timeout_ms: int = 3500,
                 bandwidth_ratio: float = 0.9,
                 settle_us: float = 400.0,
-                use_meta: bool = False):
+                use_meta: bool = False,
+                bias_tee: bool = False):
         self.lib = load_lib(lib_path)
         self.device = device
         self.ch = CHANNEL_RX(channel)
@@ -318,6 +322,7 @@ class BladeRF(SdrSource):
         self.bandwidth_ratio = bandwidth_ratio
         self.settle_us = settle_us
         self.use_meta = use_meta                # потрібен для quick tune
+        self.bias_tee = bias_tee                # потрібен для bias tee
 
         self._dev = C.c_void_p()
         self._fc = 0.0
@@ -334,12 +339,14 @@ class BladeRF(SdrSource):
 
     def open(self):
         _ck(self.lib.bladerf_open(C.byref(self._dev),
-                                  self.device.encode() or None), "bladerf_open")
+                                self.device.encode() or None), "bladerf_open")
         if self.lib.bladerf_is_fpga_configured(self._dev) <= 0:
             raise BladeRFError(
                 "FPGA не завантажена. Ubuntu: apt install bladerf-fpga-hostedxa4; "
                 "або bladeRF-cli -l hostedxA4.rbf")
         self.set_gain(self.gain_db)
+        if self.bias_tee:
+            self.set_bias_tee(True)
         if self._fs:
             self.set_sample_rate(self._fs)
 
@@ -404,7 +411,7 @@ class BladeRF(SdrSource):
             time.sleep(0.4 * (i + 1))        # 0.4, 0.8, 1.2 ... с
             dev = C.c_void_p()
             rc = self.lib.bladerf_open(C.byref(dev),
-                                       self.device.encode() or None)
+                self.device.encode() or None)
             if rc >= 0 and dev:
                 self._dev = dev
                 self._streaming = False
@@ -416,6 +423,8 @@ class BladeRF(SdrSource):
                         _ck(self.lib.bladerf_set_frequency(
                             self._dev, self.ch, int(fc)), "set_frequency")
                         self._fc = fc
+                    if self.bias_tee:
+                        self.set_bias_tee(True)
                     return
                 except BladeRFError as e:
                     last = str(e)
@@ -492,6 +501,42 @@ class BladeRF(SdrSource):
             C.byref(bw)), "set_bandwidth")
         self._bw = float(bw.value)
         self._config_stream()
+
+    def set_bias_tee(self, on: bool) -> bool:
+        """Увімкнути/вимкнути 4.5В на антенному роз'ємі RX (Bias-T) — живлення
+        зовнішнього LNA просто по коаксіалу, без окремого кабелю живлення.
+
+        Підтримується платами bladeRF 2.0 (xA4/xA9) і достатньо новою
+        бібліотекою/прошивкою. Якщо виклику нема — тихо повертаємо False,
+        а не валимо сервер (той самий принцип, що й try/except у _declare()).
+        """
+        self._need_dev()
+        fn = getattr(self.lib, "bladerf_set_bias_tee", None)
+        if fn is None:
+            if on:
+                print("[bladerf] bias-tee не підтримується цією збіркою "
+                "libbladeRF/прошивкою — потрібен bladerf_set_bias_tee",
+                flush=True)
+            self.bias_tee = False
+            return False
+        rc = fn(self._dev, self.ch, C.c_bool(bool(on)))
+        if rc < 0:
+            msg = self.lib.bladerf_strerror(rc)
+            print(f"[bladerf] bias-tee: {msg.decode() if msg else '?'} ({rc}) "
+            "— плата/прошивка не підтримує", flush=True)
+            self.bias_tee = False
+            return False
+        self.bias_tee = bool(on)
+        return True
+
+    def get_bias_tee(self) -> bool | None:
+        """Реальний стан з плати. None — невідомо/не підтримується."""
+        fn = getattr(self.lib, "bladerf_get_bias_tee", None)
+        if fn is None or not self._dev:
+            return None
+        val = C.c_bool(False)
+        rc = fn(self._dev, self.ch, C.byref(val))
+        return bool(val.value) if rc >= 0 else None
 
     def set_gain(self, db: float):
         self._need_dev()

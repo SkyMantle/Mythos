@@ -143,7 +143,7 @@ def _attempt(v: np.ndarray, fs: float, width: int, max_lines: int):
 
     offs = np.linspace(a0, a1, width, dtype=np.float32)
     idx = (t0 + np.arange(n_lines, dtype=np.float32)[:, None] * period
-           + offs[None, :])
+        + offs[None, :])
     idx = np.clip(idx, 0, len(v) - 2)
     i0 = idx.astype(np.int32)
     fr = idx - i0
@@ -156,7 +156,7 @@ def _attempt(v: np.ndarray, fs: float, width: int, max_lines: int):
         standard=standard, locked=locked), t0
 
 
-def _predict_local_t0(state: DecodeState, abs_start: float) -> float | None:
+def _predict_local_t0(state: DecodeState, abs_start: float) :
     """Прогнозує локальну (відносно початку нового знімку) позицію
     найближчого фронту кадрової синхри за відомими період+abs_t0.
 
@@ -174,27 +174,24 @@ def _predict_local_t0(state: DecodeState, abs_start: float) -> float | None:
         return None
     n = round((abs_start - state.abs_t0) / field_period)
     abs_pred = state.abs_t0 + n * field_period
-    return float(abs_pred - abs_start)
+    return float(abs_pred - abs_start), n, field_period
 
 
 def _attempt_tracked(v: np.ndarray, fs: float, width: int, max_lines: int,
-                      state: DecodeState, abs_start: float,
-                      tol_frac: float = 0.55):
+                    state: DecodeState, abs_start: float,
+                    tol_frac: float = 0.55):
     """Швидка спроба декодування зі знанням періоду й полярності.
 
-    Шукає фронт кадрової синхри лише у вузькому вікні
-    (±tol_frac·period) навколо прогнозованої позиції, а сам період і
-    полярність не переоцінює — бере як є з `state`. Це не лише
-    швидше за повний сліпий пошук, а й головна причина стабільнішої
-    картинки: період більше не «сіпається» від незалежних оцінок
-    кожного блоку.
+    Шукає фронт кадрової синхри лише у вузькому вікні (±tol_frac·period)
+    навколо прогнозованої позиції. При успіху також повільно уточнює
+    state.period (вузькосмугова ФАПЧ за фазою) — див. коментар нижче.
 
-    Повертає (Frame, abs_t0) або None, якщо синхру у вікні не
-    знайдено — тоді викликач має відкотитись на _attempt().
+    Повертає (Frame, abs_t0) або None.
     """
-    local_t0_pred = _predict_local_t0(state, abs_start)
-    if local_t0_pred is None:
+    pred = _predict_local_t0(state, abs_start)
+    if pred is None:
         return None
+    local_t0_pred, n_fields, field_period = pred
     period = state.period
     tol = tol_frac * period
     lo = int(max(0, local_t0_pred - tol))
@@ -226,7 +223,7 @@ def _attempt_tracked(v: np.ndarray, fs: float, width: int, max_lines: int,
 
     offs = np.linspace(a0, a1, width, dtype=np.float32)
     idx = (t0 + np.arange(n_lines, dtype=np.float32)[:, None] * period
-           + offs[None, :])
+        + offs[None, :])
     idx = np.clip(idx, 0, len(vv) - 2)
     i0 = idx.astype(np.int32)
     fr = idx - i0
@@ -234,15 +231,33 @@ def _attempt_tracked(v: np.ndarray, fs: float, width: int, max_lines: int,
 
     luma = np.clip((samp - 0.30) / 0.70, 0, 1)
     frame = Frame(luma=(luma * 255).astype(np.uint8),
-                  line_rate=fs / period, lines=n_lines,
-                  standard=standard, locked=True)
+                line_rate=fs / period, lines=n_lines,
+                standard=standard, locked=True)
+
+    # Повільне уточнення періоду: різниця між прогнозованою і фактично
+    # знайденою позицією, поділена на кількість польових періодів, що
+    # минули з останнього надійного вимірювання, — пряма оцінка того,
+    # наскільки поточний period відхилився від реального (тепловий
+    # дрейф вільнонесучого генератора VTx). Береться лише малою часткою
+    # (alpha), щоб один зашумлений кадр не хитав період так само різко,
+    # як повний сліпий перерахунок; і тільки коли n_fields достатньо
+    # велике, інакше похибка вимірювання самого t0 (одиниці відліків)
+    # після ділення на малий n_fields дає нестабільно завищену поправку.
+    if n_fields >= 4:
+        phase_err = t0 - local_t0_pred
+        period_err_per_line = (phase_err / n_fields) / FIELD_LINES.get(standard, FIELD_LINES["?"])
+        alpha = 0.05
+        new_period = period + alpha * period_err_per_line
+        if 0.5 * period < new_period < 1.5 * period:   # запобіжник від викиду
+            state.period = new_period
+
     return frame, abs_start + t0
 
 
 def decode(base: np.ndarray, fs: float, width: int = 640,
-           max_lines: int = 288,
-           state: DecodeState | None = None,
-           abs_start: float = 0.0) -> Frame | None:
+        max_lines: int = 288,
+        state: DecodeState | None = None,
+        abs_start: float = 0.0) -> Frame | None:
     """Декодує напівкадр.
 
     Без `state` (або на першому виклику) — точнісінько як раніше:
@@ -257,7 +272,11 @@ def decode(base: np.ndarray, fs: float, width: int = 640,
     v = base.astype(np.float32)
 
     if state is not None and state.period is not None and state.lost < 3:
-        tracked = _attempt_tracked(v, fs, width, max_lines, state, abs_start)
+        tracked = None
+        for tol_frac in (0.55, 0.75, 0.95):
+            tracked = _attempt_tracked(v, fs, width, max_lines, state, abs_start, tol_frac)
+            if tracked is not None:
+                break
         if tracked is not None:
             frame, abs_t0 = tracked
             state.abs_t0 = abs_t0

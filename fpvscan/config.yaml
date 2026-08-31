@@ -8,6 +8,7 @@ sdr:
   buffer_size: 32768 # але більша затримка. buffer_size кратний 1024
   num_transfers: 16
   gain_db: 35 # почни з 30 і підбери через scripts/bringup.py
+  bias_tee: true
   agc: false # АРП зручна для пошуку, шкідлива для декодування
   settle_us: 500 # час установлення ФАПЧ після перебудови
   # driver: file

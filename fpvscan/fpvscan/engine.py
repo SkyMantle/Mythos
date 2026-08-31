@@ -13,11 +13,14 @@
 Уся важка арифметика — в цій нитці, asyncio її не блокує.
 """
 from __future__ import annotations
+from email.mime import base
 import threading
 import time
 from pathlib import Path
 from dataclasses import dataclass, field, asdict
 from queue import Queue, Empty
+
+from fpvscan.fpvscan.sdr import base
 from .iqbuffer import IQRingBuffer
 
 import numpy as np
@@ -166,6 +169,14 @@ class Engine:
             self._rec_start()
         elif name == "rec_stop":
             self._rec_stop()
+        elif name == "bias_tee":
+            on = bool(kw.get("on", True))
+            if hasattr(self.src, "set_bias_tee"):
+                ok = self.src.set_bias_tee(on)
+            self._emit("notice", {"level": "ok" if ok else "error", "text":
+            f"bias-tee: {'увімкнено' if on and ok else 'вимкнено' if ok else 'не підтримується платою'}"})
+        else:
+            self._emit("notice", {"level": "error", "text": "джерело не підтримує bias-tee"})
         if name in ("sweep", "lock") and self._rec is not None:
             self._rec_stop()      # ролик прив'язаний до одного каналу
         # ---------- фото і відео ----------
@@ -221,12 +232,19 @@ class Engine:
             self.cfg["video"]["sample_rate"] = fs
         self.src.set_sample_rate(fs)
         self.src.set_gain(float(self.cfg["sdr"].get("gain_db", 30)))
+        if hasattr(self.src, "set_bias_tee"):
+            try:
+                self.src.set_bias_tee(bool(self.cfg["sdr"].get("bias_tee", False)))
+            except Exception as e:
+                self._emit("notice", {"level": "error",
+                            "text": f"приймач: bias-tee: {e}"})
+            
 
         if self.cfg["sdr"].get("quick_tune") and hasattr(self.src, "prime_quick_tune"):
             pts = self._sweep_plan()
             ok = self.src.prime_quick_tune(sorted(set(int(p) for p in pts)))
             print(f"[quick tune] знято профілів: {ok} з {len(set(map(int, pts)))}"
-                  + ("" if ok else "  — плата/бібліотека не підтримує, працюємо звичайно"))
+            + ("" if ok else "  — плата/бібліотека не підтримує, працюємо звичайно"))
 
         try:
             fails = 0
@@ -540,14 +558,13 @@ class Engine:
         n_full = int(fs * capture_s)
         n = n_full
         if (self._lock_state is not None and self._lock_state.period is not None
-                and self._lock_state.lost == 0 and self._lock_dec):
+        and self._lock_state.lost == 0 and self._lock_dec):
             margin = float(vcfg.get("track_window_margin", 1.7))
-            field_lines = cvbs.FIELD_LINES.get(self._lock_state.standard,
-                                                cvbs.FIELD_LINES["?"])
-            n_track = int(self._lock_state.period * field_lines
-                         * self._lock_dec * margin)
-            n = max(int(fs * 0.02), min(n_full, n_track))
-
+        field_lines = cvbs.FIELD_LINES.get(self._lock_state.standard,
+            cvbs.FIELD_LINES["?"])
+        n_track = int(self._lock_state.period * field_lines
+                            * self._lock_dec * margin)
+        n = max(int(fs * 0.02), min(n_full, n_track))
         ring_s = float(vcfg.get("ring_seconds", max(0.3, capture_s * 3)))
 
         if self._reader_err is not None:
@@ -555,7 +572,14 @@ class Engine:
             self._stop_reader()
             raise err
 
-        want = f + off + self._afc
+    # Фізична перебудова приймача — тільки на реальну зміну каналу. off
+    # тут фіксований конфігом, БЕЗ self._afc: раніше afc входив прямо у
+    # want, і будь-яка AFC-корекція перебудовувала приймач і скидала
+    # DecodeState() у _start_reader() — фазове трекання губилося щоразу,
+    # коли VTx (вільнонесучий генератор) трохи «пливе» по частоті, а він
+    # пливе постійно. Тепер дрейф компенсує цифровий зсув каналайзера
+    # нижче, а фізична перебудова лишається рідкісною подією.
+        want = f + off
         if self._ring is None or self._lock_tuned != want:
             self._start_reader(want, fs, ring_s)
 
@@ -570,31 +594,60 @@ class Engine:
         every = max(1, int(vcfg.get("spectrum_every", 8)))
         if self._lock_n % every == 1:
             psd = spectrum.psd_db(iq, 4096, 4)
-            self._emit("spectrum", {
-                "center_hz": f + off, "span_hz": fs,
-                "bins": spectrum.downsample_for_display(psd, 384),
-                "floor_db": round(spectrum.noise_floor_db(psd), 1),
-            })
+        self._emit("spectrum", {
+            "center_hz": f + off, "span_hz": fs,
+            "bins": spectrum.downsample_for_display(psd, 384),
+            "floor_db": round(spectrum.noise_floor_db(psd), 1),
+        })
 
         iq = iq - np.mean(iq)
 
         ch_bw = self._lock_bw(f, bw)
-        base_iq, fs_ch = demod.channelize(iq, fs, -off, ch_bw)
+    # Цифрова AFC-корекція: зсуваємо вікно каналайзера на self._afc
+    # замість перебудови приймача.
+        base_iq, fs_ch = demod.channelize(iq, fs, -off + self._afc, ch_bw)
         t = self._mark("channelize", t)
 
         dec = max(1, int(fs / ch_bw))
         if self._lock_dec != dec:
             self._lock_dec = dec
-            self._lock_state = cvbs.DecodeState()
+        self._lock_state = cvbs.DecodeState()
         abs_start_ch = abs_start_iq / dec
 
         if vcfg.get("afc", True):
             err = demod.freq_error_hz(base_iq, fs_ch)
-            lim = float(vcfg.get("afc_limit_hz", 8e6))
-            dead = float(vcfg.get("afc_deadband_hz", 150e3))
-            if abs(err) > dead:
-                gain = float(vcfg.get("afc_gain", 0.5))
-                self._afc = max(-lim, min(lim, self._afc + err * gain))
+        lim = float(vcfg.get("afc_limit_hz", 8e6))
+        # Цифровий зсув має лишатись у межах смуги Найквіста сирого
+        # потоку разом із фіксованим off і половиною ch_bw — інакше
+        # channelize() зачепить сусідню ділянку спектра чи накладеться
+        # сама на себе. Той самий запобіжник, що вже стоїть для
+        # статичного off вище, тепер застосований і до afc.
+        safe_lim = max(0.0, fs * 0.45 - abs(off) - ch_bw / 2)
+        lim = min(lim, safe_lim)
+        dead = float(vcfg.get("afc_deadband_hz", 150e3))
+        if abs(err) > dead:
+            gain = float(vcfg.get("afc_gain", 0.5))
+            self._afc = max(-lim, min(lim, self._afc + err * gain))
+
+        # Накопичений цифровий дрейф час від часу варто «звільнити»
+        # фізичною перебудовою — інакше при наближенні до ліміту канал
+        # зʼїжджає до краю вікна каналайзера і SNR просідає. Це той
+        # самий retune, що раніше був на кожному afc-кроці, але тепер
+        # рідкісний, тож повʼязаний з ним скид DecodeState() майже не
+        # заважає трекінгу (а якщо і зачепить один кадр — lost-лічильник
+        # у cvbs.decode() сам відновиться протягом ≤3 викликів).
+        recenter_frac = float(vcfg.get("afc_recenter_frac", 0.75))
+        if lim > 0 and abs(self._afc) > lim * recenter_frac:
+            self._start_reader(f + off + self._afc, fs, ring_s)
+            self._lock_tuned = want
+            self._afc = 0.0
+        elif lim <= 0 and self._afc != 0.0:
+            # Запасу цифрового зсуву взагалі нема (вузький fs чи
+            # широкий канал) — одразу віддаємо корекцію в перебудову,
+            # інакше clamp занулить afc і дрейф перестане компенсуватись.
+            self._start_reader(f + off + self._afc, fs, ring_s)
+            self._lock_tuned = want
+            self._afc = 0.0
         t = self._mark("afc", t)
 
         base = demod.fm_demod(base_iq, fs_ch, deviation_hz=ch_bw / 4)
@@ -603,61 +656,61 @@ class Engine:
         t = self._mark("deemphasis", t)
 
         frame = cvbs.decode(base, fs_ch, width=int(vcfg.get("width", 640)),
-                            state=self._lock_state, abs_start=abs_start_ch + 1)
+                        state=self._lock_state, abs_start=abs_start_ch + 1)
         t = self._mark("decode", t)
 
         if frame is not None:
             min_lines = int(vcfg.get("min_lines", 250))
-            if frame.lines < min_lines:
-                frame = None
+        if frame.lines < min_lines:
+            frame = None
 
         if frame is not None:
             k = float(vcfg.get("average", 0.0))
-            if k > 0:
-                cur = frame.luma.astype(np.float32)
-                if self._acc is None or self._acc.shape != cur.shape:
-                    self._acc = cur
+        if k > 0:
+            cur = frame.luma.astype(np.float32)
+            if self._acc is None or self._acc.shape != cur.shape:
+                self._acc = cur
+            else:
+                a = 1.0 / max(1.0, k)
+                self._acc = self._acc * (1 - a) + cur * a
+            frame.luma = np.clip(self._acc, 0, 255).astype(np.uint8)
+
+        if self._rec is not None:
+            self._rec.push(frame.luma)
+
+        if self._snap:
+            self._snap = False
+            self._save_photo(frame)
+
+        img = cvbs.encode(frame, "webp", int(vcfg.get("stream_quality", 75)), height=None)
+        t = self._mark("encode", t)
+
+        self._emit("frame", {
+            "freq_hz": f,
+            "standard": frame.standard,
+            "line_rate": round(frame.line_rate, 1),
+            "lines": frame.lines,
+            "locked": frame.locked,
+            "afc_hz": round(self._afc, 0),
+            "img": img,
+        })
+
+        now = time.perf_counter()
+        prev_ts = self._frame_ts
+        self._frame_ts = now
+        if prev_ts is not None:
+            dt = now - prev_ts
+            if dt > 0:
+                inst = 1.0 / dt
+                if self._fps_ema == 0:
+                    self._fps_ema = inst
                 else:
-                    a = 1.0 / max(1.0, k)
-                    self._acc = self._acc * (1 - a) + cur * a
-                frame.luma = np.clip(self._acc, 0, 255).astype(np.uint8)
+                    self._fps_ema = self._fps_ema * 0.8 + inst * 0.2
 
-            if self._rec is not None:
-                self._rec.push(frame.luma)
-
-            if self._snap:
-                self._snap = False
-                self._save_photo(frame)
-
-            img = cvbs.encode(frame, "webp", int(vcfg.get("stream_quality", 75)), height=None)
-            t = self._mark("encode", t)
-
-            self._emit("frame", {
-                "freq_hz": f,
-                "standard": frame.standard,
-                "line_rate": round(frame.line_rate, 1),
-                "lines": frame.lines,
-                "locked": frame.locked,
-                "afc_hz": round(self._afc, 0),
-                "img": img,
-            })
-
-            now = time.perf_counter()
-            prev_ts = self._frame_ts
-            self._frame_ts = now
-            if prev_ts is not None:
-                dt = now - prev_ts
-                if dt > 0:
-                    inst = 1.0 / dt
-                    if self._fps_ema == 0:
-                        self._fps_ema = inst
-                    else:
-                        self._fps_ema = self._fps_ema * 0.8 + inst * 0.2
-
-        # шпаруватість: даємо процесору видихнути між знімками
+    # шпаруватість: даємо процесору видихнути між знімками
         time.sleep(float(vcfg.get("idle_ms", 120)) / 1000)
 
-        # Автоматичний перегляд обмежений у часі — далі шукаємо інших.
+    # Автоматичний перегляд обмежений у часі — далі шукаємо інших.
         if self.state.auto and time.time() >= self.state.auto_until:
             self.state.auto = False
             self.state.lock_target = None
@@ -675,6 +728,7 @@ class Engine:
             "auto": self.state.auto,
             "source": self.src.name,
             "recording": self._rec is not None,
+            "bias_tee": bool(getattr(self.src, "bias_tee", False)),
             "rec_seconds": (round(time.time() - self._rec.started_at, 1)
             if self._rec else 0),
             "fps": round(self._fps_ema, 2),

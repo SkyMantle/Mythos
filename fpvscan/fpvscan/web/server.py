@@ -10,6 +10,8 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+from fpvscan.fpvscan import engine
+
 STATIC = Path(__file__).parent / "static"
 
 
@@ -45,6 +47,11 @@ def create_app(engine) -> FastAPI:
     @app.post("/api/record/{on}")
     async def record(on: str):
         engine.command("rec_start" if on == "start" else "rec_stop")
+        return {"ok": True}
+
+    @app.post("/api/bias_tee/{action}")
+    async def api_bias_tee(action: str):
+        engine.command("bias_tee", on=(action == "on"))
         return {"ok": True}
 
     @app.post("/api/clear")

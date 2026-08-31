@@ -26,7 +26,7 @@ def shift(iq: np.ndarray, offset_hz: float, fs: float) -> np.ndarray:
 
 
 def channelize(iq: np.ndarray, fs: float, offset_hz: float,
-               out_bw_hz: float, fast: bool = True) -> tuple[np.ndarray, float]:
+            out_bw_hz: float, fast: bool = True) -> tuple[np.ndarray, float]:
     """Зсув на нуль + децимація до потрібної смуги. Повертає (iq, fs_нов).
 
     Швидкий шлях — прямокутне усереднення через reshape+sum замість

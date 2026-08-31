@@ -387,6 +387,14 @@
     <div class="acts">
       <button id="b-shot">Знімок</button>
       <button id="b-rec">Запис</button>
+      <div class="acts">
+        <button id="b-shot">Знімок</button>
+        <button id="b-rec">Запис</button>
+      </div>
+      <div class="acts">
+        <button id="b-bias">Bias-T</button>
+      </div>
+      <div><b>Підстройка</b><span id="v-afc">—</span></div>
     </div>
     <div><b>Підстройка</b><span id="v-afc">—</span></div>
     <div id="notice"></div>
@@ -604,6 +612,9 @@
       b.classList.toggle('on', recording)
       b.textContent = recording ? `Стоп ${s.rec_seconds | 0}с` : 'Запис'
 
+      const bt = document.getElementById('b-bias')
+      if (bt) bt.classList.toggle('on', !!s.bias_tee)
+
       document.getElementById('b-manual-lock').onclick = () => {
         const v = parseFloat(document.getElementById('manual-freq').value)
         if (!isNaN(v) && v > 0) lock(v * 1e6)
@@ -667,6 +678,11 @@
 
     document.getElementById('b-rec').onclick = async () => {
       await fetch('/api/record/' + (recording ? 'stop' : 'start'), { method: 'POST' })
+    }
+
+    document.getElementById('b-bias').onclick = async () => {
+      const on = !document.getElementById('b-bias').classList.contains('on')
+      await fetch('/api/bias_tee/' + (on ? 'on' : 'off'), { method: 'POST' })
     }
 
     function connect() {
