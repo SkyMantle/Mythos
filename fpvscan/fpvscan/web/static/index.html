@@ -430,6 +430,15 @@
         <div><b>Синхро</b><span id="v-lock"><i class="dot"></i>нема</span></div>
         <div><b>Кадрів</b><span id="v-fps">0</span></div>
       </div>
+      <div class="acts">
+        <input id="manual-freq" type="number" step="0.1" placeholder="МГц, напр. 3480" style="flex:1.6;background:transparent;border:1px solid var(--line2);color:var(--text);
+                font-family:var(--mono);font-size:11px;padding:6px 4px">
+        <button id="b-manual-lock">Стати</button>
+      </div>
+      <div class="acts">
+        <button id="b-nudge-dn">− 0.5 МГц</button>
+        <button id="b-nudge-up">+ 0.5 МГц</button>
+      </div>
     </div>
   </main>
 
@@ -594,6 +603,21 @@
       const b = document.getElementById('b-rec')
       b.classList.toggle('on', recording)
       b.textContent = recording ? `Стоп ${s.rec_seconds | 0}с` : 'Запис'
+
+      document.getElementById('b-manual-lock').onclick = () => {
+        const v = parseFloat(document.getElementById('manual-freq').value)
+        if (!isNaN(v) && v > 0) lock(v * 1e6)
+      }
+      document.getElementById('manual-freq').addEventListener('keydown', e => {
+        if (e.key === 'Enter') document.getElementById('b-manual-lock').click()
+      })
+
+      function nudge(deltaHz) {
+        if (!current) return   // ще ні на чому не стоїмо — спершу «Стати»
+        lock(current + deltaHz)
+      }
+      document.getElementById('b-nudge-dn').onclick = () => nudge(-0.5e6)
+      document.getElementById('b-nudge-up').onclick = () => nudge(0.5e6)
 
       document.getElementById('s-src').textContent = s.source
       const m = document.getElementById('s-mode')

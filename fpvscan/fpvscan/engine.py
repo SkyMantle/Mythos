@@ -366,7 +366,7 @@ class Engine:
             iq = self.src.retune_and_read(occ.center_hz, int(fs * insp_s))
             ch, fs2 = demod.channelize(
                 iq, fs, 0.0,
-                out_bw_hz=max(occ.bandwidth_hz, 8e6),
+                out_bw_hz=max(occ.bandwidth_hz  + 2 * self.MERGE_TOL_HZ, 8e6),
                 fast=bool(self.cfg["scan"].get("fast_channelizer", False)))
             base = demod.fm_demod(ch, fs2, deviation_hz=occ.bandwidth_hz / 5)
             sc = self.cfg["scan"]
@@ -475,7 +475,7 @@ class Engine:
         """
         for d in self.state.detections.values():
             if abs(d.freq_hz - freq_hz) < 6e6:
-                return max(8e6, d.bandwidth_hz * 1.6)
+                return max(8e6, d.bandwidth_hz +2 * self.MERGE_TOL_HZ)
         return max(8e6, default_bw)
 
     def _start_reader(self, want: float, fs: float, ring_seconds: float):
