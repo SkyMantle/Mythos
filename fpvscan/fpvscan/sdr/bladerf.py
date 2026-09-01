@@ -19,7 +19,6 @@ import os
 import sys
 import time
 
-from matplotlib.pyplot import rc
 import numpy as np
 
 from .base import SdrSource

@@ -47,19 +47,15 @@ def main():
 
     host, port = cfg["web"]["host"], int(cfg["web"]["port"])
     if _port_busy(port):
-        print(f"Порт {port} уже зайнятий. Найімовірніше запущена інша копія —\n"
-            f"вона ж тримає і плату. Заверши її або візьми інший порт: "
-            f"--port {port + 1}")
+        print(f"Порт {port} уже зайнятий. ...")
         engine.stop()
         return
-    # 0.0.0.0 — це «слухати на всіх інтерфейсах», а не адреса для браузера
     shown = "127.0.0.1" if host in ("0.0.0.0", "::") else host
     print(f"Приймач: {src.name}   ->   http://{shown}:{port}")
     try:
-                uvicorn.run(app, host=host, port=port, log_level="warning")
+        uvicorn.run(app, host=host, port=port, log_level="warning")
     finally:
         engine.stop()
-
 
 if __name__ == "__main__":
     main()

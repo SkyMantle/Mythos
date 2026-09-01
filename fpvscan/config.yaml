@@ -13,6 +13,7 @@ sdr:
   settle_us: 500 # час установлення ФАПЧ після перебудови
   # driver: file
   # path: caps/vtx.cf32
+  bias_tee_gain_offset_db: 15
 
 scan:
   start_hz: 400.0e6

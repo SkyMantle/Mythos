@@ -10,7 +10,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from fpvscan.fpvscan import engine
+from fpvscan import engine
 
 STATIC = Path(__file__).parent / "static"
 
