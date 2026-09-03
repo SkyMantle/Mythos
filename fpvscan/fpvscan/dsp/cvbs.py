@@ -61,12 +61,20 @@ class DecodeState:
     знайденого фронту кадрової синхри. Саме вона й дозволяє прогнозувати
     наступний фронт незалежно від того, наскільки новий знімок
     зсунутий чи розірваний відносно попереднього.
+
+    `level_lo`/`level_hi` — згладжені чорна/біла точки (проти мерехтіння
+    яскравості). `target_lines` — стабільна висота растру, щоб n_lines
+    не скакав кадр-кадр. `t0_err` — згладжена похибка старту поля.
     """
     sign: float = 1.0
     period: float | None = None      # період рядка, у відліках поточної fs
     standard: str = "?"
     abs_t0: float | None = None
     lost: int = 0                    # підряд невдалих спроб трекінгу
+    level_lo: float | None = None
+    level_hi: float | None = None
+    target_lines: int | None = None
+    t0_err: float | None = None
 
 
 def _sync_edges(v: np.ndarray, thr: float):
@@ -76,7 +84,7 @@ def _sync_edges(v: np.ndarray, thr: float):
 
 
 def _genlock_starts(v: np.ndarray, t0: float, period: float, n_lines: int,
-                    thr: float, max_corr_frac: float = 0.06) -> np.ndarray:
+                    thr: float, max_corr_frac: float = 0.045) -> np.ndarray:
     """Порядковий генлок (часовий коректор бази, TBC).
 
     Замість того, щоб брати старт кожного рядка як `t0 + i*period` за
@@ -113,12 +121,31 @@ def _genlock_starts(v: np.ndarray, t0: float, period: float, n_lines: int,
     found = dist[rows, j] < big
     corr = base + edge_pos[rows, j]
     corr = np.clip(corr, starts - w, starts + w)
-    return np.where(found, corr, starts)
+    # Не беремо повний стрибок фронту: 65% виміру + 35% прогнозу гасить
+    # поодинокі хибні фронти (зрівнювальні імпульси, шум), які інакше
+    # рвуть вертикалі. Де фронту немає — лишаємо прогноз.
+    blended = 0.65 * corr + 0.35 * starts
+    return np.where(found, blended, starts)
+
+
+def _fit_height(luma: np.ndarray, target: int) -> np.ndarray:
+    """Підганяє растр до стабільної висоти: обрізає зверху або дописує
+    останнім рядком (менше мерехтить, ніж чорна смуга)."""
+    h, w = luma.shape
+    if h == target:
+        return luma
+    if h > target:
+        return luma[:target]
+    out = np.empty((target, w), dtype=luma.dtype)
+    out[:h] = luma
+    out[h:] = luma[-1]
+    return out
 
 
 def _render(v: np.ndarray, starts: np.ndarray, period: float,
             a0_frac: float, a1_frac: float, width: int,
-            auto_levels: bool = True, sharpen: float = 0.0) -> np.ndarray:
+            auto_levels: bool = True, sharpen: float = 0.0,
+            state: DecodeState | None = None) -> np.ndarray:
     """Вибирає активну частину рядків у растр + рівні + апертурна корекція.
 
     `starts` — позиції переднього фронту синхри кожного рядка (уже з
@@ -139,10 +166,21 @@ def _render(v: np.ndarray, starts: np.ndarray, period: float,
 
     if auto_levels:
         # Робастні чорна/біла точки за перцентилями активного поля.
-        flat = samp[::2, ::2].ravel()              # прорідження — дешевше
-        lo, hi = np.percentile(flat, [2.0, 99.0])
-        if hi - lo < 1e-3:
-            lo, hi = 0.30, 1.0
+        flat = samp[::4, ::4].ravel()              # грубше прорідження — дешевше
+        lo_m, hi_m = np.percentile(flat, [2.0, 99.0])
+        if hi_m - lo_m < 1e-3:
+            lo_m, hi_m = 0.30, 1.0
+        # EMA між кадрами: різкий стрибок перцентиля більше не блимає
+        # яскравістю всього кадру.
+        if state is not None and state.level_lo is not None:
+            a = 0.18
+            lo = (1.0 - a) * state.level_lo + a * float(lo_m)
+            hi = (1.0 - a) * state.level_hi + a * float(hi_m)
+        else:
+            lo, hi = float(lo_m), float(hi_m)
+        if state is not None:
+            state.level_lo = lo
+            state.level_hi = hi
     else:
         lo, hi = 0.30, 1.0
     luma = np.clip((samp - lo) / (hi - lo), 0.0, 1.0)
@@ -158,7 +196,8 @@ def _render(v: np.ndarray, starts: np.ndarray, period: float,
 
 
 def _attempt(v: np.ndarray, fs: float, width: int, max_lines: int,
-             auto_levels: bool = True, sharpen: float = 0.0):
+             auto_levels: bool = True, sharpen: float = 0.0,
+             state: DecodeState | None = None):
     """Одна спроба сліпого декодування за заданої полярності.
 
     Повертає (оцінка_якості, Frame|None, t0|None). Оцінка — частка
@@ -167,7 +206,7 @@ def _attempt(v: np.ndarray, fs: float, width: int, max_lines: int,
     полярність. `t0` — локальний індекс використаного фронту кадрової
     синхри, потрібен викликачу для того, щоб засіяти DecodeState.
     """
-    lo, hi = np.percentile(v, [0.5, 99.5])
+    lo, hi = np.percentile(v[::8], [0.5, 99.5])
     if hi - lo < 1e-9:
         return 0.0, None, None
     v = (v - lo) / (hi - lo)          # вершина синхри ≈ 0, білий ≈ 1
@@ -240,7 +279,11 @@ def _attempt(v: np.ndarray, fs: float, width: int, max_lines: int,
 
     starts = _genlock_starts(v, float(t0), period, n_lines, thr)
     luma = _render(v, starts, period, a0_frac, a1_frac, width,
-                   auto_levels=auto_levels, sharpen=sharpen)
+                   auto_levels=auto_levels, sharpen=sharpen, state=state)
+    if state is not None:
+        if state.target_lines is None:
+            state.target_lines = max_lines
+        luma = _fit_height(luma, state.target_lines)
     return score, Frame(
         luma=luma,
         line_rate=line_rate, lines=n_lines,
@@ -292,7 +335,7 @@ def _attempt_tracked(v: np.ndarray, fs: float, width: int, max_lines: int,
         return None
 
     vv = v * state.sign
-    p_lo, p_hi = np.percentile(vv, [0.5, 99.5])
+    p_lo, p_hi = np.percentile(vv[::8], [0.5, 99.5])
     if p_hi - p_lo < 1e-9:
         return None
     vv = (vv - p_lo) / (p_hi - p_lo)
@@ -303,7 +346,17 @@ def _attempt_tracked(v: np.ndarray, fs: float, width: int, max_lines: int,
     edges_w = np.flatnonzero(below_w[1:] & ~below_w[:-1]) + 1 + lo
     if len(edges_w) == 0:
         return None
-    t0 = float(edges_w[np.argmin(np.abs(edges_w - local_t0_pred))])
+    t0_raw = float(edges_w[np.argmin(np.abs(edges_w - local_t0_pred))])
+    # Згладжуємо старт поля: один шумний фронт більше не підкидає
+    # увесь кадр по вертикалі. Обрізаємо викиди і мішаємо з прогнозом.
+    err = t0_raw - local_t0_pred
+    max_err = 0.22 * period
+    err = float(np.clip(err, -max_err, max_err))
+    if state.t0_err is None:
+        state.t0_err = err
+    else:
+        state.t0_err = 0.35 * err + 0.65 * state.t0_err
+    t0 = local_t0_pred + state.t0_err
 
     standard = state.standard
     a0_frac, a1_frac, _vblank = STD_GEOM[standard]
@@ -329,7 +382,10 @@ def _attempt_tracked(v: np.ndarray, fs: float, width: int, max_lines: int,
 
     starts = _genlock_starts(vv, float(t0), period, n_lines, thr)
     luma = _render(vv, starts, period, a0_frac, a1_frac, width,
-                   auto_levels=auto_levels, sharpen=sharpen)
+                   auto_levels=auto_levels, sharpen=sharpen, state=state)
+    if state.target_lines is None:
+        state.target_lines = max_lines
+    luma = _fit_height(luma, state.target_lines)
     frame = Frame(luma=luma,
                 line_rate=fs / period, lines=n_lines,
                 standard=standard, locked=True)
@@ -403,16 +459,23 @@ def decode(base: np.ndarray, fs: float, width: int = 640,
         state.standard = best_f.standard
         state.abs_t0 = abs_start + best_t0
         state.lost = 0
+        state.t0_err = None
+        if state.target_lines is None:
+            state.target_lines = max_lines
+        best_f.luma = _fit_height(best_f.luma, state.target_lines)
     return best_f
 
 
 def encode(frame: Frame, fmt: str = "webp", quality: int = 80,
-           height: int | None = 480) -> bytes:
+           height: int | None = 480, method: int = 1) -> bytes:
     """Кадр у стиснений формат.
 
     WebP на сірій картинці дає приблизно вчетверо менший файл, ніж
     JPEG тієї ж візуальної якості, і підтримується всіма браузерами.
     Саме він іде і в веб-консоль, і в знімки.
+
+    `method` — зусилля енкодера WebP (0 найшвидший, 6 найякісніший).
+    На потоці 4 було ~36 мс/кадр; 0–1 знімає більшу частину цього.
     """
     from io import BytesIO
     from PIL import Image
@@ -426,7 +489,7 @@ def encode(frame: Frame, fmt: str = "webp", quality: int = 80,
     elif f in ("jpeg", "jpg"):
         img.save(buf, "JPEG", quality=quality)
     else:
-        img.save(buf, "WEBP", quality=quality, method=4)
+        img.save(buf, "WEBP", quality=quality, method=int(method))
     return buf.getvalue()
 
 

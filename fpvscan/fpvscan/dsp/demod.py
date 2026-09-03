@@ -66,6 +66,14 @@ def channelize(iq: np.ndarray, fs: float, offset_hz: float,
     n = (len(x) // dec) * dec
     if n == 0:
         return x.astype(np.complex64), fs
+    # dec=2 одним прямокутником 2× майже не глушить дзеркало: на
+    # 20 Мвідл/с → 10 МГц синхроімпульси розсипаються і decode()
+    # втрачає PAL, хоча рядкова лінія в спектрі ще є. Тривідлікове
+    # вікно + кожен 2-й — дешево і тримає фронти.
+    if dec == 2:
+        xx = x[:n].astype(np.complex64)
+        acc = xx[:-2] + xx[1:-1] + xx[2:]
+        return (acc[::2] / 3).astype(np.complex64), fs / 2
     # Два прямокутні вікна поспіль дають трикутне — удвічі крутіший
     # спад, майже задарма. Розкладаємо децимацію на два множники.
     d1 = int(np.sqrt(dec))
@@ -95,6 +103,19 @@ def inst_freq_hz(iq: np.ndarray, fs: float) -> np.ndarray:
     return (np.arctan2(d.imag, d.real).astype(np.float32) * (fs / (2 * np.pi)))
 
 
+def freq_error_from_demod(base: np.ndarray, deviation_hz: float) -> float:
+    """Зсув несучої з уже демодульованого ЧМ — без другого arctan2.
+
+    `fm_demod` нормує миттєву частоту на deviation_hz, тож середина
+    розмаху, помножена на deviation, дає герци. На живому LOCK це
+    знімає ~20 мс, які раніше йшли на повторний inst_freq_hz.
+    """
+    if base.size < 1024:
+        return 0.0
+    lo, hi = np.percentile(base[::8], [2.0, 98.0])
+    return float((lo + hi) / 2.0) * deviation_hz
+
+
 def freq_error_hz(iq: np.ndarray, fs: float) -> float:
     """Наскільки несуча зміщена від центру смуги.
 
@@ -110,7 +131,7 @@ def freq_error_hz(iq: np.ndarray, fs: float) -> float:
     f = inst_freq_hz(iq, fs)
     if f.size < 1024:
         return 0.0
-    lo, hi = np.percentile(f[::4], [2.0, 98.0])
+    lo, hi = np.percentile(f[::8], [2.0, 98.0])
     return float((lo + hi) / 2.0)
 
 def deemphasis(v: np.ndarray, fs: float, tau: float = 0.5e-6) -> np.ndarray:

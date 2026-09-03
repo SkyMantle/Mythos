@@ -510,7 +510,10 @@ class Engine:
         """
         for d in self.state.detections.values():
             if abs(d.freq_hz - freq_hz) < 6e6:
-                return max(8e6, d.bandwidth_hz +2 * self.MERGE_TOL_HZ)
+                # виміряна смуга + невеликий запас на крила. Раніше
+                # додавали 2·MERGE_TOL (12 МГц) — 6 МГц канал ставав
+                # 18 МГц і скасовував децимацію.
+                return max(8e6, d.bandwidth_hz + 1.5e6)
         return max(8e6, default_bw)
  
     def _start_reader(self, want: float, fs: float, ring_seconds: float):
@@ -605,7 +608,9 @@ class Engine:
  
         iq, abs_start_iq = self._ring.snapshot(n)
         if len(iq) < n:
-            time.sleep(float(vcfg.get("idle_ms", 120)) / 1000)
+            # кільце ще не наповнилось — коротка пауза, не idle_ms
+            # (той тепер 0 і інакше закрутить порожній цикл)
+            time.sleep(0.004)
             return
  
         t = time.perf_counter()
@@ -622,7 +627,11 @@ class Engine:
  
         iq = iq - np.mean(iq)
  
-        ch_bw = self._lock_bw(f, bw)
+        ch_bw = min(self._lock_bw(f, bw), fs * 0.9)
+        # На ~20 Мвідл/с децимація 2× (вікно 8–10 МГц) ламає PAL-синхру
+        # у decode(), хоча рядкова лінія в спектрі ще є. Тримаємо не
+        # вужче 12 МГц — тоді dec=1 і поле збирається.
+        ch_bw = max(ch_bw, min(12e6, fs * 0.9))
         # Цифрова AFC-корекція: зсуваємо вікно каналайзера на self._afc
         # замість перебудови приймача (див. коментар вище про want).
         base_iq, fs_ch = demod.channelize(iq, fs, -off + self._afc, ch_bw)
@@ -634,8 +643,14 @@ class Engine:
             self._lock_state = cvbs.DecodeState()
         abs_start_ch = abs_start_iq / dec
  
+        deviation = ch_bw / 4
+        base = demod.fm_demod(base_iq, fs_ch, deviation_hz=deviation)
+        t = self._mark("demod_fm", t)
+ 
         if vcfg.get("afc", True):
-            err = demod.freq_error_hz(base_iq, fs_ch)
+            # AFC з уже демодульованого сигналу — без другого arctan2.
+            # Поправка йде в наступний кадр (self._afc → channelize).
+            err = demod.freq_error_from_demod(base, deviation)
             lim = float(vcfg.get("afc_limit_hz", 8e6))
             # Цифровий зсув має лишатися в межах смуги Найквіста сирого
             # потоку разом із фіксованим off і половиною ch_bw — інакше
@@ -673,8 +688,6 @@ class Engine:
                 self._afc = 0.0
         t = self._mark("afc", t)
  
-        base = demod.fm_demod(base_iq, fs_ch, deviation_hz=ch_bw / 4)
-        t = self._mark("demod_fm", t)
         base = demod.deemphasis(base, fs_ch)
         t = self._mark("deemphasis", t)
  
@@ -725,7 +738,10 @@ class Engine:
                 self._snap = False
                 self._save_photo(frame)
  
-            img = cvbs.encode(frame, "webp", int(vcfg.get("stream_quality", 75)), height=None)
+            img = cvbs.encode(frame, str(vcfg.get("stream_fmt", "webp")),
+                              int(vcfg.get("stream_quality", 75)),
+                              height=None,
+                              method=int(vcfg.get("stream_method", 1)))
             t = self._mark("encode", t)
  
             self._emit("frame", {
@@ -750,8 +766,11 @@ class Engine:
                     else:
                         self._fps_ema = self._fps_ema * 0.8 + inst * 0.2
  
-        # шпаруватість: даємо процесору видихнути між знімками
-        time.sleep(float(vcfg.get("idle_ms", 120)) / 1000)
+        # шпаруватість: даємо процесору видихнути між знімками.
+        # 0 — без штучної стелі fps (раніше 10 мс різали все, що вище ~15 к/с).
+        idle = float(vcfg.get("idle_ms", 0))
+        if idle > 0:
+            time.sleep(idle / 1000)
  
         # Автоматичний перегляд обмежений у часі — далі шукаємо інших.
         if self.state.auto and time.time() >= self.state.auto_until:
