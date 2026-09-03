@@ -82,6 +82,12 @@ class Engine:
         self._timings: dict[str, float] = {}   # ковзне середнє по етапах, мс
         self._frame_ts: float | None = None    # час минулого відданого кадру
         self._fps_ema = 0.0
+        self._last_ch_bw = 0.0                 # для діагностики через /api/state
+        self._last_afc_lim = 0.0
+        self._logged_afc_lim: float | None = None   # щоб не спамити консоль щоцикл
+        self._err_dbg_last = 0.0   # тротлінг діагностики сирого freq_error_hz()
+        self._recenter_count = 0   # поспільні recenter без жодного кадру
+        self._last_classify_dbg = 0.0   # тротлінг crosscheck-друку нижче
  
     # ---------- зовнішнє API ----------
  
@@ -107,6 +113,74 @@ class Engine:
         prev = self._timings.get(stage)
         self._timings[stage] = dt_ms if prev is None else prev * 0.8 + dt_ms * 0.2
         return t1
+ 
+    def _log_classify_crosscheck(self, base, fs_ch):
+        """Незалежна перевірка на ТОМУ Ж capture, коли cvbs.decode() не
+        зійшовся: чи бачить ``demod.classify_video()`` (окремий,
+        встановлений детектор свіп/inspect-етапу — не той самий код, що
+        `_fft_line_rate()`, і вже підтверджений зовнішнім сканером на
+        реальному відео) хоч якийсь натяк на рядкову лінію 15625/15734Гц
+        у цьому ж `base`.
+ 
+        Знахідка 02.09.2026 (лист користувача "накосячила ти знатно
+        ніхріна не працює"): після переходу `_fft_line_rate()` на Уелч і
+        прибирання старого резервного шляху ``cvbs.decode()`` перестав
+        видавати кадри взагалі — і це саме собою ще нічого не каже: чи
+        Уелч-поріг тепер справедливо відкидає капчі БЕЗ реального відео,
+        чи на стенді просто немає зараз активного передавача. Цей
+        crosscheck дає пряму відповідь у наступному ж логу: якщо
+        `classify_video()` теж мовчить (`is_video=False`,
+        `confidence`≈0) — сигналу справді нема, питання до заліза/ефіру,
+        не до `cvbs.py`. Якщо ж `classify_video()` впевнено бачить лінію
+        (`is_video=True`) на тому самому `base`, а `cvbs.decode()` — ні,
+        це вказує на розбіжність між двома детекторами (напр. надто
+        короткий capture для Уелч-усереднення в `_fft_line_rate()`
+        порівняно з тим, що бачить `classify_video()`), і треба звужувати
+        далі саме там.
+ 
+        Тротлиться так само, як і власний друк `cvbs.decode()` — інакше
+        при утримуваному каналі без сигналу лог заллє дублями що ~100мс.
+ 
+        Друга знахідка 02.09.2026 (лог одразу після прибирання
+        резервного шляху): на кількох каналах (`4538.8МГц` двічі) сам
+        `classify_video()` під час LOCK показує `confidence`≈0.00-0.01,
+        хоча ТОЙ САМИЙ канал за кілька секунд до того на етапі INSPECT
+        (окреме, чисте `retune_and_read()` без AFC/автогейну) дав
+        `confidence` 0.77 при SNR 35.4дБ. Це вказує, що проблема — не в
+        порозі `_fft_line_rate()`/`classify_video()`, а десь у самому
+        шляху захоплення/підготовки сигналу під час LOCK (цифрова AFC-
+        корекція `self._afc`, автопідбір gain у `_autolevel_gain()`,
+        або щось у безперервному кільцевому читачі), яка гасить сигнал,
+        що INSPECT ловить без проблем. Тому друк тепер несе й `afc`
+        (поточний цифровий зсув), `gain` (поточний gain_db приймача) і
+        `clip_frac` — щоб побачити, чи AFC зʼїхала на щось нетривіальне,
+        чи gain після автопідбору сів значно нижче базового, чи є
+        кліпування. Порівнювати варто з gain_db/bias_tee_gain_offset_db
+        з конфігу (базовий рівень, який використовує і INSPECT) і з
+        afc_lim_hz із сусіднього `[afc]`-рядка.
+        """
+        now = time.time()
+        if now - self._last_classify_dbg < 1.0:
+            return
+        self._last_classify_dbg = now
+        try:
+            sc = self.cfg["scan"]
+            score = demod.classify_video(
+                base, fs_ch,
+                tol_hz=float(sc.get("line_tol_hz", 150)),
+                min_prominence_db=float(sc.get("line_prominence_db", 8)),
+                min_conf=float(sc.get("min_confidence", 0.45)))
+            gain = getattr(self.src, "gain_db", None)
+            gain_s = f"{gain:.1f}дБ" if gain is not None else "?"
+            print(f"[crosscheck] classify_video() на тому ж base: "
+                  f"is_video={score.is_video} line_rate={score.line_rate:.0f}Гц "
+                  f"standard={score.standard} confidence={score.confidence:.2f} "
+                  f"prominence={score.prominence_db:.1f}дБ harmonics={score.harmonics} "
+                  f"| afc={self._afc/1e3:.1f}кГц gain={gain_s} "
+                  f"clip_frac={float(getattr(self.src, 'clip_frac', 0.0)):.4f}",
+                  flush=True)
+        except Exception as e:
+            print(f"[crosscheck] classify_video() впав: {e}", flush=True)
  
     def _emit(self, kind: str, payload):
         """Кладе подію в чергу до веб-шару.
@@ -149,7 +223,32 @@ class Engine:
             self._acc = None
             self._afc = 0.0
             self._lock_tuned = None
-            self.state.lock_target = float(kw["freq_hz"])
+            # fps/мітка кадру — з попереднього лока, інакше /api/state
+            # бреше про поточну ціль (показує привид старої частоти).
+            self._frame_ts = None
+            self._fps_ema = 0.0
+            self._recenter_count = 0
+            req = float(kw["freq_hz"])
+            # Знахідка 02.09.2026: якщо запит влучає в ту саму "МГц-
+            # комірку" (той самий int(freq_hz/1e6)), що й уже знайдена
+            # детекція в self.state.detections — беремо ТОЧНУ детековану
+            # freq_hz замість того, що надіслала панель. Панель ідентифікує
+            # канал саме за цим цілим МГц (те число, що показане в UI,
+            # напр. "5010"), і схоже, що саме його й шле назад при виборі
+            # каналу — тобто ручний вибір міг втрачати до ~0.5-1МГц
+            # точності порівняно з автовідтворенням (`_maybe_auto_peek()`
+            # нижче завжди бере `det.freq_hz` напряму, без округлення).
+            # На межі "втягування" AFC (`freq_error_hz()` — percentile-
+            # оцінка, надійна лише при відносно малій розстройці) така
+            # різниця цілком може пояснювати, чому ручний вибір каналу
+            # іноді зависає (AFC ніколи не сходиться), а вибір ТІЄЇ Ж
+            # частоти під час активного автовідтворення — працює: останнє
+            # стартує з точної частоти й ніколи не виходить за межі
+            # надійного діапазону оцінки. Якщо збігу немає (панель і так
+            # слала точне значення, або канал не з детекцій) — поведінка
+            # не змінюється, це чистий safety net, не гадання.
+            det = self.state.detections.get(int(req / 1e6))
+            self.state.lock_target = det.freq_hz if det is not None else req
             self.state.mode = "LOCK"
             self.state.auto = False
         elif name == "sweep":
@@ -501,17 +600,80 @@ class Engine:
  
     # ---------- LOCK ----------
  
+    def _autolevel_gain(self, want: float, fs: float):
+        """Автопідбір gain під конкретний сигнал перед стартом читача.
+ 
+        Фіксований gain_db (навіть з підрізкою під Bias-T) підходить
+        лише для сигналів середньої сили: борт на короткій дистанції
+        все одно заганяє АЦП у кліп (бачили clip_frac 0.35 у /api/state
+        під час "лок є, а відео не йде") — decode() тоді не знаходить
+        синхру майже ніколи, і LOCK лише зрідка ловить випадковий кадр.
+        Слабший сигнал, навпаки, недоотримує чутливості від тієї самої
+        константи.
+ 
+        Тому перед кожним новим читачем (новий канал або afc-recenter,
+        усе йде через _start_reader) стартуємо з базового gain_db (з
+        урахуванням Bias-T-офсету) і, якщо АЦП все одно клипить,
+        підрізаємо gain ступінчасто, поки clip_frac не впаде нижче
+        безпечного порогу. Калібрування не накопичується між локами —
+        щоразу починається заново з базового рівня, інакше рушій рано
+        чи пізно "з'їде" в мінімальний gain і застрягне там на слабких
+        сигналах.
+        """
+        sc = self.cfg["sdr"]
+        if not sc.get("gain_autolevel", True):
+            return
+        target = float(sc.get("clip_target", 0.02))
+        step = float(sc.get("gain_step_db", 3.0))
+        floor = float(sc.get("gain_floor_db", -10.0))
+        max_steps = int(sc.get("gain_autolevel_steps", 6))
+ 
+        bt_on = bool(getattr(self.src, "bias_tee", False))
+        self._apply_bias_tee_gain(bt_on)     # старт завжди з базового рівня
+ 
+        probe_n = max(4096, int(fs * 0.005))
+        for _ in range(max_steps):
+            try:
+                self.src.retune_and_read(want, probe_n)
+            except Exception:
+                return      # хай далі це ловить звичайний шлях помилок
+            clip = float(getattr(self.src, "clip_frac", 0.0))
+            if clip <= target:
+                return
+            gain = float(getattr(self.src, "gain_db", 30.0)) - step
+            if gain < floor:
+                return
+            try:
+                self.src.set_gain(gain)
+            except Exception:
+                return
+ 
     def _lock_bw(self, freq_hz: float, default_bw: float) -> float:
         """Ширина каналу для утримання.
  
         Беремо зміряну під час свіпу — передавачі відрізняються
         девіацією в рази, і константа з конфігу тут або зріже сигнал,
         або впустить половину сусіднього діапазону.
+ 
+        Маржа НЕ перевикористовує MERGE_TOL_HZ (це поріг злиття
+        детекцій під час свіпу — 6МГц, зовсім інша мета). Побачили на
+        реальних сигналах: додавання 2×MERGE_TOL_HZ (12МГц) до широких
+        детекцій (bandwidth_hz 5-6+МГц) при fs=20МГц підганяло ch_bw
+        впритул до fs і з'їдало майже весь safe_lim у _do_lock() —
+        AFC лишалась або без запасу (постійні recenter, "стрибає
+        підстройка"), або взагалі з safe_lim=0 (AFC вимкнена, дрейф
+        несучої нічим не компенсується — "lock є, відео немає").
+        Тепер окрема, менша маржа (`video.lock_bw_margin_hz`) плюс
+        жорсткий стеля в частці fs — щоб один широкий сигнал не зжирав
+        увесь запас Найквіста.
         """
+        vcfg = self.cfg["video"]
+        margin = float(vcfg.get("lock_bw_margin_hz", 3e6))
+        cap = float(vcfg.get("sample_rate", 20e6)) * 0.7
         for d in self.state.detections.values():
             if abs(d.freq_hz - freq_hz) < 6e6:
-                return max(8e6, d.bandwidth_hz +2 * self.MERGE_TOL_HZ)
-        return max(8e6, default_bw)
+                return min(cap, max(8e6, d.bandwidth_hz + 2 * margin))
+        return min(cap, max(8e6, default_bw))
  
     def _start_reader(self, want: float, fs: float, ring_seconds: float):
         """Запускає нитку безперервного читання IQ у кільцевий буфер.
@@ -525,6 +687,7 @@ class Engine:
         приймача на час декодування.
         """
         self._stop_reader()
+        self._autolevel_gain(want, fs)
         first = self.src.retune_and_read(want, max(2048, int(fs * 0.01)))
         self._ring = IQRingBuffer(capacity=max(len(first), int(fs * ring_seconds)))
         self._ring.write(first)
@@ -556,6 +719,50 @@ class Engine:
             if ring is None:
                 return
             ring.write(iq)
+ 
+    def _log_freq_err(self, f, base_iq, fs_ch, ch_bw, err, afc_on=True):
+        """Тротлена діагностика розстройки (02.09.2026).
+ 
+        Друкує СИРИЙ `freq_error_hz()` (до клампу й до накопичення в
+        `self._afc`) поруч із тим, де сигнал стоїть НАСПРАВДІ —
+        спектральний пік і центроїд потужності `base_iq`.
+ 
+        Навіщо саме центроїд: у логах користувача `err` тримався
+        -12.14МГц, сталий до ±9кГц, і НЕ змінювався після фізичної
+        перебудови на 5.4-5.8МГц (справжня розстройка зсунулась би
+        рівно на стільки). Власна симуляція показала, що перцентильна
+        оцінка сама по собі такого не породжує: широкосмугове ЧМ-відео
+        з девіацією до 20МГц у нефільтрованій смузі дає зміщення
+        щонайбільше ±4.5МГц, і воно спадає до нуля з падінням SNR.
+        Центроїд же на синтетиці з ВІДОМИМ зсувом відновлює його з
+        похибкою <60кГц (перевірено на 0/+5.8/-12.14МГц), а пік
+        зміщений на девіацію — тому читати треба центроїд, пік лише
+        як довідку.
+ 
+        Розрізняє однозначно: центроїд ≈0 при великому `err` — бреше
+        оцінювач; центроїд ≈`err` — сигнал справді не там, де вважає код.
+ 
+        Працює і при `video.afc=false` (там викликається з окремої
+        гілки) — інакше вимкнення AFC заодно глушило б єдину
+        діагностику, здатну перевірити гіпотезу «винна AFC».
+        """
+        if abs(err) <= 300e3:
+            return
+        self._err_dbg_last = time.time()
+        try:
+            m = min(len(base_iq), 1 << 15)
+            sp = np.abs(np.fft.fftshift(np.fft.fft(base_iq[:m] * np.hanning(m)))) ** 2
+            fr = np.fft.fftshift(np.fft.fftfreq(m, 1 / fs_ch))
+            pk = float(fr[int(np.argmax(sp))])
+            cen = float((fr * sp).sum() / max(sp.sum(), 1e-30))
+            spec_s = (f"пік={pk/1e6:+.2f}МГц центроїд={cen/1e6:+.2f}МГц "
+                      f"fs_ch={fs_ch/1e6:.1f}МГц")
+        except Exception as ex:
+            spec_s = f"спектр не порахувався: {ex}"
+        print(f"[afc/err] {f/1e6:.1f}МГц: сирий freq_error_hz()={err/1e3:+.0f}кГц "
+              f"(ch_bw={ch_bw/1e6:.1f}МГц, накопичено afc={self._afc/1e3:+.0f}кГц"
+              + ("" if afc_on else ", AFC ВИМКНЕНА — лише вимірювання") + ") | "
+              + spec_s, flush=True)
  
     def _do_lock(self):
         vcfg = self.cfg["video"]
@@ -634,8 +841,22 @@ class Engine:
             self._lock_state = cvbs.DecodeState()
         abs_start_ch = abs_start_iq / dec
  
+        if not vcfg.get("afc", True):
+            # Знахідка 02.09.2026: діагностика мусить працювати і при
+            # video.afc=false. Інакше виходить пастка — щоб перевірити
+            # гіпотезу "AFC заважає", користувач вимикає AFC, а разом з
+            # нею замовкає і єдиний друк, який міг би цю гіпотезу
+            # підтвердити чи спростувати (весь блок був усередині
+            # того самого if). Тут AFC не вмикається — лише вимірюється
+            # й друкується те саме, що й у робочому режимі.
+            if time.time() - self._err_dbg_last > 1.0:
+                self._log_freq_err(f, base_iq, fs_ch, ch_bw,
+                                    demod.freq_error_hz(base_iq, fs_ch),
+                                    afc_on=False)
+ 
         if vcfg.get("afc", True):
             err = demod.freq_error_hz(base_iq, fs_ch)
+            self._log_freq_err(f, base_iq, fs_ch, ch_bw, err, afc_on=True)
             lim = float(vcfg.get("afc_limit_hz", 8e6))
             # Цифровий зсув має лишатися в межах смуги Найквіста сирого
             # потоку разом із фіксованим off і половиною ch_bw — інакше
@@ -645,6 +866,14 @@ class Engine:
             # динамічної частини (afc).
             safe_lim = max(0.0, fs * 0.45 - abs(off) - ch_bw / 2)
             lim = min(lim, safe_lim)
+            self._last_ch_bw = ch_bw
+            self._last_afc_lim = lim
+            if self._logged_afc_lim != round(lim):
+                self._logged_afc_lim = round(lim)
+                print(f"[afc] {f/1e6:.1f}МГц: ch_bw={ch_bw/1e6:.1f}МГц "
+                      f"afc_lim={lim/1e3:.0f}кГц"
+                      + ("  !! AFC де-факто вимкнена (lim=0)" if lim <= 0 else ""),
+                      flush=True)
             dead = float(vcfg.get("afc_deadband_hz", 150e3))
             if abs(err) > dead:
                 gain = float(vcfg.get("afc_gain", 0.5))
@@ -658,8 +887,30 @@ class Engine:
             # DecodeState() майже не заважає трекінгу (а якщо і
             # зачепить один кадр — lost-лічильник у cvbs.decode() сам
             # відновиться протягом ≤3 викликів).
+            # Запобіжник: якщо recenter спрацьовує знову й знову без
+            # жодного вдалого кадру між ними (типово на аномально
+            # широких/зашумлених ділянках, де freq_error_hz() ловить
+            # не зсув несучої, а сусідній сигнал чи шум і ніколи не
+            # сходиться) — фізичні перебудови зупиняються, а цифрова
+            # afc лишається затиснутою на межі. Інакше _start_reader()
+            # щоцикл скидає DecodeState() і decode() ніколи не встигає
+            # накопичити фазу. Лічильник скидається на будь-якому
+            # успішно декодованому кадрі (нижче).
+            recenter_max = int(vcfg.get("afc_recenter_max", 4))
             recenter_frac = float(vcfg.get("afc_recenter_frac", 0.75))
-            if lim > 0 and abs(self._afc) > lim * recenter_frac:
+            want_recenter = ((lim > 0 and abs(self._afc) > lim * recenter_frac)
+                              or (lim <= 0 and self._afc != 0.0))
+            if want_recenter and self._recenter_count >= recenter_max:
+                if self._recenter_count == recenter_max:
+                    print(f"[afc] {f/1e6:.1f}МГц: {recenter_max} recenter поспіль "
+                          f"без кадру — зупиняю фізичні перебудови (канал завеликий "
+                          f"чи зашумлений, ch_bw={ch_bw/1e6:.1f}МГц)", flush=True)
+                    self._recenter_count += 1   # щоб print не повторювався щоцикл
+            elif lim > 0 and abs(self._afc) > lim * recenter_frac:
+                self._recenter_count += 1
+                print(f"[afc] recenter {f/1e6:.1f}МГц: afc={self._afc/1e3:.0f}кГц "
+                      f"lim={lim/1e3:.0f}кГц ch_bw={ch_bw/1e6:.1f}МГц "
+                      f"(#{self._recenter_count})", flush=True)
                 self._start_reader(f + off + self._afc, fs, ring_s)
                 self._lock_tuned = want
                 self._afc = 0.0
@@ -668,6 +919,11 @@ class Engine:
                 # широкий канал) — одразу віддаємо корекцію в
                 # перебудову, інакше clamp занулить afc і дрейф
                 # перестане компенсуватись.
+                self._recenter_count += 1
+                print(f"[afc] lim<=0, форсована перебудова {f/1e6:.1f}МГц: "
+                      f"afc={self._afc/1e3:.0f}кГц ch_bw={ch_bw/1e6:.1f}МГц "
+                      f"(AFC де-факто вимкнена на цьому каналі, #{self._recenter_count})",
+                      flush=True)
                 self._start_reader(f + off + self._afc, fs, ring_s)
                 self._lock_tuned = want
                 self._afc = 0.0
@@ -679,8 +935,14 @@ class Engine:
         t = self._mark("deemphasis", t)
  
         frame = cvbs.decode(base, fs_ch, width=int(vcfg.get("width", 640)),
-                            state=self._lock_state, abs_start=abs_start_ch + 1)
+                            state=self._lock_state, abs_start=abs_start_ch + 1,
+                            presmooth_us=float(vcfg.get("presmooth_us", 1.0e-6)),
+                            min_score=float(vcfg.get("sync_score_threshold", 0.5)),
+                            min_row_corr=float(vcfg.get("min_row_corr", 0.5)))
         t = self._mark("decode", t)
+        if frame is None:
+            self._log_classify_crosscheck(base, fs_ch)
+ 
  
         if frame is not None:
             min_lines = int(vcfg.get("min_lines", 250))
@@ -688,6 +950,7 @@ class Engine:
                 frame = None
  
         if frame is not None:
+            self._recenter_count = 0   # вдалий кадр — запобіжник знову "довіряє" AFC
             k = float(vcfg.get("average", 0.0))
             if k > 0:
                 cur = frame.luma.astype(np.float32)
@@ -758,6 +1021,8 @@ class Engine:
             "timings_ms": {k: round(v, 1) for k, v in self._timings.items()},
             "overflows": int(getattr(self.src, "overflows", 0)),
             "clip_frac": round(float(getattr(self.src, "clip_frac", 0.0)), 4),
+            "ch_bw_hz": round(self._last_ch_bw, 0),
+            "afc_lim_hz": round(self._last_afc_lim, 0),
             "detections": [asdict(d) for d in
                         sorted(self.state.detections.values(),
                         key=lambda x: -x.snr_db)
@@ -765,5 +1030,8 @@ class Engine:
                         "confirm_hits", 2))],
         }
  
+ 
+ 
+
 
 
