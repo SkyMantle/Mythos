@@ -1,0 +1,16 @@
+{
+  "name": "fpvscan",
+  "install": "bash .cursor/install.sh",
+  "terminals": [
+    {
+      "name": "web",
+      "command": "cd fpvscan && ./.venv/bin/python run.py --driver sim --port 8080"
+    }
+  ],
+  "ports": [
+    {
+      "name": "console",
+      "port": 8080
+    }
+  ]
+}
