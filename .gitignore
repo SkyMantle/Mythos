@@ -1,0 +1,9 @@
+# Python virtualenv (created by .cursor/install.sh)
+.venv/
+
+# Byte-compiled files
+__pycache__/
+*.py[cod]
+
+# Self-test output
+fpvscan/scripts/decoded.png
