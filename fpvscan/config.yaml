@@ -3,9 +3,9 @@ sdr:
   device: '' # порожньо = перша знайдена плата; або "*:serial=abcd1234"
   lib_path: '' # порожньо = шукати автоматично; або точний шлях до bladeRF.dll
   rx_channel: 0 # 0 = RX1, 1 = RX2
-  quick_tune: false # профілі швидкої перебудови; звір через bench_retune.py
+  quick_tune: true # профілі швидкої перебудови; звір через bench_retune.py
   num_buffers: 32 # потік USB: більше буферів = стійкіше до зривів,
-  buffer_size: 32768 # але більша затримка. buffer_size кратний 1024
+  buffer_size: 8192 # але більша затримка. buffer_size кратний 1024
   num_transfers: 16
   gain_db: 35 # почни з 30 і підбери через scripts/bringup.py
   bias_tee: true
@@ -19,7 +19,7 @@ scan:
   start_hz: 400.0e6
   stop_hz: 6000.0e6
   sample_rate: 35.0e6 # bladeRF A4 тягне до 61.44, але 40 стабільніше по USB
-  channel_bw_hz: 10.0e6 # очікувана ширина каналу; визначає крок свіпу
+  channel_bw_hz: 15.0e6 # очікувана ширина каналу; визначає крок свіпу
   step_hz: 0 # 0 = порахувати автоматично зі смуги і ширини каналу
   fft_size: 8192
   averages: 8
@@ -41,7 +41,7 @@ scan:
 video:
   sample_rate: 35.0e6 # має накривати всю зайняту смугу каналу
   deviation_hz: 10.0e6
-  channel_bw_hz: 10.0e6 # очікувана зайнята смуга каналу
+  channel_bw_hz: 15.0e6 # очікувана зайнята смуга каналу
   lo_offset_hz: 0.0 # зміщення ФАПЧ від центру каналу; для 5.8 ГГц
   # при sample_rate 61.44e6 постав 8.0e6
   afc: true # автопідстроювання на несучу
@@ -49,7 +49,7 @@ video:
   afc_limit_hz: 20.0e+6 # межа поправки
   afc_deadband_hz: 100.0e+3 # нижче цієї похибки не смикаємось
   capture_ms: 80 # скільки ефіру беремо на один кадр
-  stream_quality: 30 # якість WebP для потоку в браузер
+  stream_quality: 24 # якість WebP для потоку в браузер
   rec_fps: 24 # частота кадрів у файлі
   rec_height: 288 # висота запису; менше = менший файл
   rec_crf: 24 # якість H.264: менше число = краще і більше

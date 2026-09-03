@@ -1,3 +1,4 @@
+
 """Рушій сканування.
  
 Три режими роботи, які перемикає одна робоча нитка:
@@ -971,6 +972,20 @@ class Engine:
                             min_score=float(vcfg.get("sync_score_threshold", 0.5)),
                             min_row_corr=float(vcfg.get("min_row_corr", 0.5)))
         t = self._mark("decode", t)
+        # #region agent log
+        _st = self._lock_state
+        cvbs._agent_log("E", "engine.py:_do_lock", "lock decode result", {
+            "ok": frame is not None,
+            "fs_ch": float(fs_ch),
+            "dec": int(dec),
+            "n_iq": int(len(iq)),
+            "n_base": int(len(base)),
+            "afc": float(self._afc),
+            "line_rate": None if frame is None else float(frame.line_rate),
+            "lines": None if frame is None else int(frame.lines),
+            "period_state": None if _st is None else _st.period,
+        })
+        # #endregion
         if frame is None:
             self._log_classify_crosscheck(base, fs_ch)
  
@@ -1066,8 +1081,6 @@ class Engine:
  
  
  
- 
- 
- 
- 
+
+
 

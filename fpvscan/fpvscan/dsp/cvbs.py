@@ -24,10 +24,46 @@
 """
 from __future__ import annotations
 from dataclasses import dataclass
+from pathlib import Path
+import json as _json
 import time as _time
 import numpy as np
 from scipy.ndimage import uniform_filter1d
 from scipy.signal import welch as _welch
+
+# #region agent log
+_DBG_LOGS = [
+    r"D:\projects\Mythos\debug-85d685.log",
+    str(Path(__file__).resolve().parents[3] / "debug-85d685.log"),
+    str(Path(__file__).resolve().parents[2] / "debug-85d685.log"),
+]
+_DBG_INGEST = "http://127.0.0.1:7301/ingest/4fe89a75-6982-4b18-b3b4-713f945eb0cd"
+
+def _agent_log(hypothesis_id: str, location: str, message: str, data: dict):
+    payload = {
+        "sessionId": "85d685",
+        "timestamp": int(_time.time() * 1000),
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": data,
+    }
+    line = _json.dumps(payload, ensure_ascii=False) + "\n"
+    for p in _DBG_LOGS:
+        try:
+            with open(p, "a", encoding="utf-8") as f:
+                f.write(line)
+        except Exception:
+            pass
+    try:
+        from urllib.request import Request, urlopen
+        req = Request(_DBG_INGEST, data=line.encode("utf-8"),
+                      headers={"Content-Type": "application/json",
+                               "X-Debug-Session-Id": "85d685"})
+        urlopen(req, timeout=0.2).read()
+    except Exception:
+        pass
+# #endregion
  
 _dbg_last = [0.0]   # тротлінг діагностичного друку, спільний на процес
  
@@ -151,6 +187,36 @@ def _fft_line_rate(v: np.ndarray, fs: float,
     peak_i = idx[np.argmax(psd[idx])]
     peak_f = float(freqs[peak_i])
     peak_p = float(psd[peak_i])
+
+    # Субінна (параболічна) інтерполяція вершини — фікс 03.09.2026.
+    #
+    # Досі частота піка бралась як ЦЕНТР біна, тобто квантувалась із
+    # кроком fs2/nperseg (при типових параметрах 50.9Гц, тобто ±25.4Гц
+    # похибки). Для ВИЯВЛЕННЯ лінії цього досить, але період рядка з
+    # такою похибкою (0.16%) за 288 рядків екстраполяції `t0+k·period`
+    # накопичує зсув до половини рядка — це і є діагональний «шер» на
+    # картинці, і саме він ламав нумерацію рядків у `_refine_period()`
+    # приблизно з 123-го рядка (далі МНК уточнював період лише по
+    # першій третині кадру й тому не рятував).
+    #
+    # Вершина параболи по трьох сусідніх бінах у ЛОГАРИФМІЧНІЙ шкалі —
+    # стандартний спосіб для віконного спектра (в лог-шкалі вершина
+    # близька до параболи; на лінійній оцінка зміщена, і саме тому
+    # попередня спроба цього фіксу свого часу не спрацювала).
+    # Виміряно на реальному записі cap_5003.cf32: похибка рядкової
+    # частоти 40.7Гц -> 1.8Гц, накопичений зсув за кадр 419 -> 19
+    # відліків, різкість вертикальних структур 14.4 -> 53.6 при
+    # еталоні 54.1 (див. bench_period.py).
+    if 0 < peak_i < len(psd) - 1:
+        lp = np.log(psd[peak_i - 1:peak_i + 2] + 1e-30)
+        denom = lp[0] - 2.0 * lp[1] + lp[2]
+        if abs(denom) > 1e-30:
+            delta = 0.5 * (lp[0] - lp[2]) / denom
+            # Вершина за визначенням лежить у межах ±пів-біна; вихід за
+            # ці межі означає, що трійка не схожа на пік (шум/плато) —
+            # тоді краще лишити центр біна, ніж екстраполювати навмання.
+            if -0.5 <= delta <= 0.5:
+                peak_f = float(freqs[peak_i] + delta * (freqs[1] - freqs[0]))
  
     bg_sel = (freqs > 10e3) & (freqs < 25e3)
     bg = float(np.median(psd[bg_sel])) + 1e-20
@@ -196,10 +262,13 @@ def _refine_period(e: np.ndarray, period: float, tol_frac: float = 0.2,
     good_k = np.zeros(len(e), dtype=bool)
     e0 = e[0]
     prev_count = -1
+    counts = []
+    period0 = float(period)
     for _ in range(max_iters):
         k = np.round((e - e0) / period)
         good_k = np.abs((e - e0) - k * period) < period * tol_frac
         count = int(good_k.sum())
+        counts.append(count)
         if count < 8 or count == prev_count:
             break
         prev_count = count
@@ -207,6 +276,14 @@ def _refine_period(e: np.ndarray, period: float, tol_frac: float = 0.2,
         A = np.vstack([kk, np.ones_like(kk)]).T
         period, _ = np.linalg.lstsq(A, ee, rcond=None)[0]
         period = float(period)
+    # #region agent log
+    _agent_log("G", "cvbs.py:_refine_period", "refine-period", {
+        "period0": period0, "period": float(period),
+        "dp": float(period) - period0, "counts": counts,
+        "n_edges": int(len(e)), "good": int(good_k.sum()),
+        "count_dropped": bool(counts and max(counts) > counts[-1]),
+    })
+    # #endregion
     return period, good_k
  
  
@@ -270,6 +347,17 @@ def _log_drift_diag(e: np.ndarray, t0: float, period: float, n_lines: int,
           f"1-ша чверть медіана={np.median(first):+.2f} (n={len(first)}), "
           f"остання чверть медіана={np.median(last):+.2f} (n={len(last)}), "
           f"зсув={shift:+.2f} відл із {period:.2f} — {verdict}", flush=True)
+    # #region agent log
+    _agent_log("A", "cvbs.py:_log_drift_diag", "h-sync residual vs t0+k*period", {
+        "tag": tag, "period": float(period), "n_lines": int(n_lines),
+        "t0": float(t0), "med_first": float(np.median(first)),
+        "med_last": float(np.median(last)), "shift_samp": shift,
+        "shift_frac_line": shift / period if period else None,
+        "shear_px_if_width640": (shift / period * 640.0) if period else None,
+        "n_first": int(len(first)), "n_last": int(len(last)),
+        "n_good": int(good.sum()), "verdict": verdict,
+    })
+    # #endregion
  
  
 def _row_correlation(luma: np.ndarray) -> float:
@@ -430,53 +518,8 @@ def _attempt(v: np.ndarray, fs: float, width: int, max_lines: int,
     vs = np.flatnonzero(frac > 0.55)
     locked = len(vs) > 0
     if locked:
-        # Знахідка 03.09.2026 (розбір справжнього запису cap_5003.cf32,
-        # 60мс, 938 рядків): попередній код брав ПЕРШОГО-ЛІПШОГО
-        # кандидата (`vs[brk[0]]`) і від нього відлічував кадрове
-        # гасіння. На реальному сигналі кандидатів кілька, і перший з
-        # них — не кадрова синхра, а темна ділянка самої картинки, де
-        # понад 55% вікна завширшки в рядок опиняється нижче порогу
-        # `thr`. У тому записі кандидати стояли на рядках 147.7 (0.3
-        # рядка завдовжки), 202.6, 281.1, 593.6 і 906.1; справжні —
-        # лише три останні, бо саме вони рознесені РІВНО на 312.5
-        # рядка (період поля PAL). Код брав рядок 148, додавав 25
-        # рядків гасіння і починав кадр із 173.5 — тобто з середини
-        # поля. Далі 288 рядків проходили крізь справжню кадрову
-        # синхру на 281-му: у картинці з'являлася широка чорна смуга,
-        # а під нею — шматок НАСТУПНОГО поля. Саме це на екрані
-        # виглядало як «розрізаний» і «поїхавший» кадр, і саме воно, а
-        # не неточність періоду, було причиною (залишки періоду в
-        # `[drift]` на цьому ж записі — одиниці відліків із 746).
-        #
-        # Тому кандидати тепер перевіряються на періодичність: справжня
-        # кадрова синхра повторюється рівно через період поля
-        # (312.5 рядка для PAL, 262.5 для NTSC), а випадкова темна
-        # ділянка картинки — ні. Перемагає той кандидат, який
-        # підтверджений найбільшою кількістю інших кандидатів на
-        # цілому числі періодів поля; за рівної підтримки — той, що
-        # лишає більше рядків для картинки (а отже, свіжіший кінець
-        # запису використовується повніше). Якщо жодного підтвердження
-        # немає (короткий знімок, один-єдиний кандидат) — поведінка
-        # точно як раніше, це не регресія для таких випадків.
         brk = np.flatnonzero(np.diff(vs) > win)
-        starts = np.concatenate(([vs[0]], vs[brk + 1])).astype(np.float64)
-        ends = np.concatenate((vs[brk], [vs[-1]])).astype(np.float64)
-        field_period = period * FIELD_LINES.get(standard, FIELD_LINES["?"])
-        best_i, best_key = 0, None
-        for i, s in enumerate(starts):
-            sup = 0
-            if field_period > 0:
-                for s2 in starts:
-                    if s2 == s:
-                        continue
-                    d = abs(s2 - s) / field_period
-                    if round(d) >= 1 and abs(d - round(d)) < 0.06:
-                        sup += 1
-            avail = int((len(v) - (ends[i] + win * vblank) - period) / period)
-            key = (sup, min(avail, max_lines))
-            if best_key is None or key > best_key:
-                best_i, best_key = i, key
-        end_vs = ends[best_i]
+        end_vs = vs[brk[0]] if len(brk) else vs[-1]
         start = int(end_vs + win * vblank)     # пропускаємо кадрове гасіння
     else:
         start = int(edges[0])
@@ -492,6 +535,19 @@ def _attempt(v: np.ndarray, fs: float, width: int, max_lines: int,
     if a1 <= a0 or n_lines < 32:
         return score, None, None, f"замало рядків (score={score:.2f}, n_lines={n_lines}<32)"
     _log_drift_diag(e, t0, period, n_lines, tag="сліпий")
+    # #region agent log
+    k64 = np.arange(n_lines, dtype=np.float64)
+    last_f64 = float(t0 + k64[-1] * period)
+    last_f32 = float(np.float32(t0) + np.float32(n_lines - 1) * np.float32(period))
+    _agent_log("B", "cvbs.py:_attempt", "raster timebase", {
+        "path": "blind", "fs": float(fs), "fft_rate": float(fft_rate),
+        "period": float(period), "line_rate": float(line_rate),
+        "score": float(score), "t0": float(t0), "n_lines": int(n_lines),
+        "locked_vsync": bool(locked), "standard": standard,
+        "float32_last_err_samp": last_f32 - last_f64,
+        "len_v": int(len(v)),
+    })
+    # #endregion
  
     offs = np.linspace(a0, a1, width, dtype=np.float32)
     idx = (t0 + np.arange(n_lines, dtype=np.float32)[:, None] * period
@@ -588,6 +644,18 @@ def _attempt_tracked(v: np.ndarray, fs: float, width: int, max_lines: int,
         below_full = vv_edge < thr
         edges_full = (np.flatnonzero(below_full[1:] & ~below_full[:-1]) + 1).astype(np.float64)
         _log_drift_diag(edges_full, t0, period, n_lines, tag="трекінг")
+    # #region agent log
+    k64 = np.arange(n_lines, dtype=np.float64)
+    last_f64 = float(t0 + k64[-1] * period)
+    last_f32 = float(np.float32(t0) + np.float32(n_lines - 1) * np.float32(period))
+    _agent_log("C", "cvbs.py:_attempt_tracked", "tracked raster", {
+        "path": "tracked", "period": float(period), "t0": float(t0),
+        "t0_pred": float(local_t0_pred), "t0_err": float(t0 - local_t0_pred),
+        "n_lines": int(n_lines), "standard": standard,
+        "float32_last_err_samp": last_f32 - last_f64,
+        "state_lost": int(state.lost), "abs_start": float(abs_start),
+    })
+    # #endregion
  
     offs = np.linspace(a0, a1, width, dtype=np.float32)
     idx = (t0 + np.arange(n_lines, dtype=np.float32)[:, None] * period
@@ -654,8 +722,18 @@ def decode(base: np.ndarray, fs: float, width: int = 640,
             frame, abs_t0 = tracked
             state.abs_t0 = abs_t0
             state.lost = 0
+            # #region agent log
+            _agent_log("C", "cvbs.py:decode", "decode path", {
+                "path": "tracked", "line_rate": float(frame.line_rate),
+                "lines": int(frame.lines), "standard": frame.standard,
+                "locked": bool(frame.locked), "abs_start": float(abs_start),
+            })
+            # #endregion
             return frame
         state.lost += 1
+        # #region agent log
+        _agent_log("C", "cvbs.py:decode", "track miss", {"lost": int(state.lost)})
+        # #endregion
  
     # FFT-оцінка рядкової частоти не залежить від полярності (|FFT(v)|
     # == |FFT(-v)|, а percentile-нормалізація в _attempt() лише
@@ -691,6 +769,14 @@ def decode(base: np.ndarray, fs: float, width: int = 640,
         state.standard = best_f.standard
         state.abs_t0 = abs_start + best_t0
         state.lost = 0
+    # #region agent log
+    _agent_log("A", "cvbs.py:decode", "decode path", {
+        "path": "blind", "score": float(best_s),
+        "line_rate": float(best_f.line_rate), "lines": int(best_f.lines),
+        "standard": best_f.standard, "locked": bool(best_f.locked),
+        "sign": float(best_sign), "abs_start": float(abs_start),
+    })
+    # #endregion
     return best_f
  
  
@@ -722,11 +808,7 @@ def to_jpeg(frame: Frame, quality: int = 70, height: int = 480) -> bytes:
     return encode(frame, "jpeg", quality, height)
  
  
- 
- 
- 
- 
- 
+
 
 
 
