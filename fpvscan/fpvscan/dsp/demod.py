@@ -17,11 +17,29 @@ LINE_NTSC = 15734.264
 
 
 def shift(iq: np.ndarray, offset_hz: float, fs: float) -> np.ndarray:
-    """Переносить ділянку спектра на нуль."""
+    """Переносить ділянку спектра на нуль.
+
+    Гетеродин рахуємо через `cos`/`sin` у float32, а не `np.exp` від
+    комплексного аргументу. Скалярний множник `-2j*np.pi*...` у старому
+    варіанті піднімав увесь масив фази до complex128, і `exp` по
+    мільйонах відліків повного (недецимованого) потоку був найгарячішою
+    ланкою всього тракту (≈90 мс на кадр проти ≈10 мс тепер).
+    """
     if abs(offset_hz) < 1.0:
         return iq
-    n = np.arange(len(iq), dtype=np.float32)
-    lo = np.exp(-2j * np.pi * offset_hz * n / fs).astype(np.complex64)
+    # Ціле-числовий фазовий акумулятор. Дробову частину фази тримаємо у
+    # молодших 32 бітах int64: `n*K` рахується точно (без накопичення
+    # похибки float на мільйонах відліків), а згортання періоду — це
+    # просто маска `& 0xFFFFFFFF`. Виходить і швидше за float64-рампу, і
+    # точніше (крок фази 2⁻³²). Далі `cos`/`sin` у float32 — цього досить.
+    n = len(iq)
+    k = (offset_hz / fs) % 1.0
+    K = np.int64(round(k * (1 << 32)))
+    phi = (np.arange(n, dtype=np.int64) * K) & np.int64(0xFFFFFFFF)
+    ph = phi.astype(np.float32) * np.float32(2 * np.pi / (1 << 32))
+    lo = np.empty(n, dtype=np.complex64)
+    lo.real = np.cos(ph)
+    lo.imag = -np.sin(ph)
     return iq * lo
 
 

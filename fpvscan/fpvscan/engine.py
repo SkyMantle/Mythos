@@ -679,11 +679,17 @@ class Engine:
         t = self._mark("deemphasis", t)
  
         frame = cvbs.decode(base, fs_ch, width=int(vcfg.get("width", 640)),
-                            state=self._lock_state, abs_start=abs_start_ch + 1)
+                            state=self._lock_state, abs_start=abs_start_ch + 1,
+                            auto_levels=bool(vcfg.get("auto_levels", True)),
+                            sharpen=float(vcfg.get("sharpen", 0.0)))
         t = self._mark("decode", t)
  
         if frame is not None:
-            min_lines = int(vcfg.get("min_lines", 250))
+            # Поле рендериться до наступної кадрової синхри (один польовий
+            # прохід), тож для NTSC це ~230-240 активних рядків, для
+            # PAL — ~250-288. Поріг лишаємо низьким, щоб відсіювати лише
+            # явний брак, а не коректні поля коротшого стандарту.
+            min_lines = int(vcfg.get("min_lines", 200))
             if frame.lines < min_lines:
                 frame = None
  
@@ -694,7 +700,21 @@ class Engine:
                 if self._acc is None or self._acc.shape != cur.shape:
                     self._acc = cur
                 else:
-                    a = 1.0 / max(1.0, k)
+                    # Рухомо-адаптивне часове усереднення. Проста EMA
+                    # рівномірно змішувала кадри й давала два артефакти,
+                    # добре видні на реальних записах: змазування руху
+                    # (рухомий об'єкт лишає «хвіст») і роздвоєння по
+                    # вертикалі на нерухомому тексті (сусідні знімки —
+                    # це протилежні поля черезрядкового відео, зсунуті на
+                    # пів-рядка). Тому усереднюємо СИЛЬНО лише там, де
+                    # кадри збігаються (нерухомий фон — виграш С/Ш), і
+                    # майже не чіпаємо ділянки, що змінились (рух, краї
+                    # тексту лишаються різкими).
+                    a_static = 1.0 / max(1.0, k)
+                    thr = float(vcfg.get("motion_thresh", 24.0))
+                    diff = np.abs(cur - self._acc)
+                    w = np.minimum(diff / max(1.0, thr), 1.0)   # 0 нерухомо .. 1 рух
+                    a = a_static + w * (1.0 - a_static)
                     self._acc = self._acc * (1 - a) + cur * a
                 frame.luma = np.clip(self._acc, 0, 255).astype(np.uint8)
  

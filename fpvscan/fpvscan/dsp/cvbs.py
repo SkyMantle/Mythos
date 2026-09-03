@@ -75,7 +75,90 @@ def _sync_edges(v: np.ndarray, thr: float):
     return below, edges
 
 
-def _attempt(v: np.ndarray, fs: float, width: int, max_lines: int):
+def _genlock_starts(v: np.ndarray, t0: float, period: float, n_lines: int,
+                    thr: float, max_corr_frac: float = 0.06) -> np.ndarray:
+    """Порядковий генлок (часовий коректор бази, TBC).
+
+    Замість того, щоб брати старт кожного рядка як `t0 + i*period` за
+    єдиним глобальним періодом, знаходимо фактичний передній фронт
+    рядкової синхри поряд із прогнозом і рівняємо рядок по ньому. Це
+    прибирає дві найпомітніші вади: **нахил вертикалей** (навіть частка
+    відлічку похибки періоду накопичується у зсув за 288 рядків) і
+    **розрив кадру** по діагоналі. Корекція обмежена вузьким вікном
+    (±max_corr_frac·period), тож завади й зрівнювальні імпульси кадрового
+    гасіння не здатні «перекинути» рядок на сусідній період; де фронт не
+    знайдено — лишаємо прогноз.
+    """
+    w = max(2, int(max_corr_frac * period))
+    starts = t0 + np.arange(n_lines, dtype=np.float64) * period
+    base = np.floor(starts).astype(np.int64)
+    fracpos = starts - base
+    rel = np.arange(-w, w + 2, dtype=np.int64)
+    wi = base[:, None] + rel[None, :]
+    np.clip(wi, 0, len(v) - 1, out=wi)
+    seg = v[wi]                                   # (n_lines, len(rel))
+    below = seg < thr
+    fall = below[:, 1:] & ~below[:, :-1]          # передній фронт синхри
+    # субвідлікова позиція перетину порогу для кожного потенційного фронту
+    a = seg[:, :-1]
+    b = seg[:, 1:]
+    denom = a - b
+    safe = np.abs(denom) > 1e-6
+    cross_frac = np.where(safe, (a - thr) / np.where(safe, denom, 1.0), 0.0)
+    edge_pos = rel[:-1].astype(np.float64)[None, :] + np.clip(cross_frac, 0.0, 1.0)
+    big = 1e9
+    dist = np.where(fall, np.abs(edge_pos - fracpos[:, None]), big)
+    j = np.argmin(dist, axis=1)
+    rows = np.arange(n_lines)
+    found = dist[rows, j] < big
+    corr = base + edge_pos[rows, j]
+    corr = np.clip(corr, starts - w, starts + w)
+    return np.where(found, corr, starts)
+
+
+def _render(v: np.ndarray, starts: np.ndarray, period: float,
+            a0_frac: float, a1_frac: float, width: int,
+            auto_levels: bool = True, sharpen: float = 0.0) -> np.ndarray:
+    """Вибирає активну частину рядків у растр + рівні + апертурна корекція.
+
+    `starts` — позиції переднього фронту синхри кожного рядка (уже з
+    генлоком). Далі: лінійна інтерполяція активної частини, авторівні
+    (розтяг контрасту за перцентилями замість фіксованого відображення —
+    прибирає «сірий» недоконтрастний вигляд) і горизонтальна апертурна
+    корекція (компенсує завал ВЧ у демодуляторі й децимації — прибирає
+    «мило» по горизонталі, робить текст різкішим).
+    """
+    a0 = a0_frac * period
+    a1 = a1_frac * period
+    offs = np.linspace(a0, a1, width, dtype=np.float32)
+    idx = starts[:, None].astype(np.float32) + offs[None, :]
+    np.clip(idx, 0, len(v) - 2, out=idx)
+    i0 = idx.astype(np.int32)
+    fr = idx - i0
+    samp = v[i0] * (1 - fr) + v[i0 + 1] * fr       # (n_lines, width)
+
+    if auto_levels:
+        # Робастні чорна/біла точки за перцентилями активного поля.
+        flat = samp[::2, ::2].ravel()              # прорідження — дешевше
+        lo, hi = np.percentile(flat, [2.0, 99.0])
+        if hi - lo < 1e-3:
+            lo, hi = 0.30, 1.0
+    else:
+        lo, hi = 0.30, 1.0
+    luma = np.clip((samp - lo) / (hi - lo), 0.0, 1.0)
+
+    if sharpen > 0.0:
+        # Нерізке маскування лише по горизонталі (аналогове відео втрачає
+        # саме горизонтальну роздільність). Ядро 1-2-1 як дешевий ФНЧ.
+        blur = luma.copy()
+        blur[:, 1:-1] = 0.25 * luma[:, :-2] + 0.5 * luma[:, 1:-1] + 0.25 * luma[:, 2:]
+        luma = np.clip(luma + sharpen * (luma - blur), 0.0, 1.0)
+
+    return (luma * 255).astype(np.uint8)
+
+
+def _attempt(v: np.ndarray, fs: float, width: int, max_lines: int,
+             auto_levels: bool = True, sharpen: float = 0.0):
     """Одна спроба сліпого декодування за заданої полярності.
 
     Повертає (оцінка_якості, Frame|None, t0|None). Оцінка — частка
@@ -123,10 +206,21 @@ def _attempt(v: np.ndarray, fs: float, width: int, max_lines: int):
     frac = (csum[win:] - csum[:-win]) / win
     vs = np.flatnonzero(frac > 0.55)
     locked = len(vs) > 0
+    next_vs_start = None
     if locked:
         brk = np.flatnonzero(np.diff(vs) > win)
-        end_vs = vs[brk[0]] if len(brk) else vs[-1]
+        # межі кожної групи широких імпульсів (кожна = одне кадрове гасіння)
+        group_starts = np.concatenate(([vs[0]], vs[brk + 1])) if len(brk) else vs[:1]
+        group_ends = np.concatenate((vs[brk], vs[-1:])) if len(brk) else vs[-1:]
+        end_vs = group_ends[0]
         start = int(end_vs + win * vblank)     # пропускаємо кадрове гасіння
+        # Початок наступного кадрового гасіння: далі за нього заходити не
+        # можна, інакше в кадр потрапляє синхра сусіднього поля і картинка
+        # «рветься» по діагоналі. Саме це й давало розрив у записах, де
+        # захоплення починається посеред поля.
+        later = group_starts[group_starts > start + win]
+        if len(later):
+            next_vs_start = int(later[0])
     else:
         start = int(edges[0])
 
@@ -137,21 +231,18 @@ def _attempt(v: np.ndarray, fs: float, width: int, max_lines: int):
 
     a0 = a0_frac * period
     a1 = a1_frac * period
-    n_lines = int(min(max_lines, (len(v) - t0 - period) / period))
+    avail = (len(v) - t0 - period) / period
+    if next_vs_start is not None:
+        avail = min(avail, (next_vs_start - t0) / period - 1.0)
+    n_lines = int(min(max_lines, avail))
     if a1 <= a0 or n_lines < 32:
         return 0.0, None, None
 
-    offs = np.linspace(a0, a1, width, dtype=np.float32)
-    idx = (t0 + np.arange(n_lines, dtype=np.float32)[:, None] * period
-        + offs[None, :])
-    idx = np.clip(idx, 0, len(v) - 2)
-    i0 = idx.astype(np.int32)
-    fr = idx - i0
-    samp = v[i0] * (1 - fr) + v[i0 + 1] * fr      # лінійна інтерполяція
-
-    luma = np.clip((samp - 0.30) / 0.70, 0, 1)    # гасіння -> чорний
+    starts = _genlock_starts(v, float(t0), period, n_lines, thr)
+    luma = _render(v, starts, period, a0_frac, a1_frac, width,
+                   auto_levels=auto_levels, sharpen=sharpen)
     return score, Frame(
-        luma=(luma * 255).astype(np.uint8),
+        luma=luma,
         line_rate=line_rate, lines=n_lines,
         standard=standard, locked=locked), t0
 
@@ -179,7 +270,8 @@ def _predict_local_t0(state: DecodeState, abs_start: float) :
 
 def _attempt_tracked(v: np.ndarray, fs: float, width: int, max_lines: int,
                     state: DecodeState, abs_start: float,
-                    tol_frac: float = 0.55):
+                    tol_frac: float = 0.55,
+                    auto_levels: bool = True, sharpen: float = 0.0):
     """Швидка спроба декодування зі знанням періоду й полярності.
 
     Шукає фронт кадрової синхри лише у вузькому вікні (±tol_frac·period)
@@ -217,20 +309,28 @@ def _attempt_tracked(v: np.ndarray, fs: float, width: int, max_lines: int,
     a0_frac, a1_frac, _vblank = STD_GEOM[standard]
     a0 = a0_frac * period
     a1 = a1_frac * period
-    n_lines = int(min(max_lines, (len(vv) - t0 - period) / period))
+    avail = (len(vv) - t0 - period) / period
+    # Той самий захист від розриву, що й у сліпому шляху: не заходити за
+    # наступне кадрове гасіння. Шукаємо його лише в тій частині буфера,
+    # яку збираємось рендерити (обмежений cumsum — дешево).
+    win = int(period)
+    lo_s = int(t0 + 5 * period)
+    hi_s = int(min(len(vv), t0 + (max_lines + 6) * period))
+    if hi_s - lo_s > 2 * win:
+        seg_below = (vv[lo_s:hi_s] < thr).astype(np.int32)
+        csum = np.cumsum(np.concatenate(([0], seg_below)))
+        vfrac = (csum[win:] - csum[:-win]) / win
+        vsloc = np.flatnonzero(vfrac > 0.55)
+        if len(vsloc):
+            avail = min(avail, (lo_s + int(vsloc[0]) - t0) / period - 1.0)
+    n_lines = int(min(max_lines, avail))
     if a1 <= a0 or n_lines < 32:
         return None
 
-    offs = np.linspace(a0, a1, width, dtype=np.float32)
-    idx = (t0 + np.arange(n_lines, dtype=np.float32)[:, None] * period
-        + offs[None, :])
-    idx = np.clip(idx, 0, len(vv) - 2)
-    i0 = idx.astype(np.int32)
-    fr = idx - i0
-    samp = vv[i0] * (1 - fr) + vv[i0 + 1] * fr
-
-    luma = np.clip((samp - 0.30) / 0.70, 0, 1)
-    frame = Frame(luma=(luma * 255).astype(np.uint8),
+    starts = _genlock_starts(vv, float(t0), period, n_lines, thr)
+    luma = _render(vv, starts, period, a0_frac, a1_frac, width,
+                   auto_levels=auto_levels, sharpen=sharpen)
+    frame = Frame(luma=luma,
                 line_rate=fs / period, lines=n_lines,
                 standard=standard, locked=True)
 
@@ -257,7 +357,9 @@ def _attempt_tracked(v: np.ndarray, fs: float, width: int, max_lines: int,
 def decode(base: np.ndarray, fs: float, width: int = 640,
         max_lines: int = 288,
         state: DecodeState | None = None,
-        abs_start: float = 0.0) -> Frame | None:
+        abs_start: float = 0.0,
+        auto_levels: bool = True,
+        sharpen: float = 0.0) -> Frame | None:
     """Декодує напівкадр.
 
     Без `state` (або на першому виклику) — точнісінько як раніше:
@@ -274,7 +376,9 @@ def decode(base: np.ndarray, fs: float, width: int = 640,
     if state is not None and state.period is not None and state.lost < 3:
         tracked = None
         for tol_frac in (0.55, 0.75, 0.95):
-            tracked = _attempt_tracked(v, fs, width, max_lines, state, abs_start, tol_frac)
+            tracked = _attempt_tracked(v, fs, width, max_lines, state, abs_start,
+                                       tol_frac, auto_levels=auto_levels,
+                                       sharpen=sharpen)
             if tracked is not None:
                 break
         if tracked is not None:
@@ -286,7 +390,8 @@ def decode(base: np.ndarray, fs: float, width: int = 640,
 
     best_s, best_f, best_t0, best_sign = 0.0, None, None, 1.0
     for sign in (1.0, -1.0):
-        s, f, t0 = _attempt(v * sign, fs, width, max_lines)
+        s, f, t0 = _attempt(v * sign, fs, width, max_lines,
+                            auto_levels=auto_levels, sharpen=sharpen)
         if f is not None and s > best_s:
             best_s, best_f, best_t0, best_sign = s, f, t0, sign
     if best_s <= 0.5:
