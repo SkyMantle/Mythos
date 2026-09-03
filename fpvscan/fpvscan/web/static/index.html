@@ -608,21 +608,6 @@
       const bt = document.getElementById('b-bias')
       if (bt) bt.classList.toggle('on', !!s.bias_tee)
 
-      document.getElementById('b-manual-lock').onclick = () => {
-        const v = parseFloat(document.getElementById('manual-freq').value)
-        if (!isNaN(v) && v > 0) lock(v * 1e6)
-      }
-      document.getElementById('manual-freq').addEventListener('keydown', e => {
-        if (e.key === 'Enter') document.getElementById('b-manual-lock').click()
-      })
-
-      function nudge(deltaHz) {
-        if (!current) return   // ще ні на чому не стоїмо — спершу «Стати»
-        lock(current + deltaHz)
-      }
-      document.getElementById('b-nudge-dn').onclick = () => nudge(-0.5e6)
-      document.getElementById('b-nudge-up').onclick = () => nudge(0.5e6)
-
       document.getElementById('s-src').textContent = s.source
       const m = document.getElementById('s-mode')
       curMode = s.mode
@@ -676,6 +661,25 @@
     document.getElementById('b-bias').onclick = async () => {
       const on = !document.getElementById('b-bias').classList.contains('on')
       await fetch('/api/bias_tee/' + (on ? 'on' : 'off'), { method: 'POST' })
+    }
+
+    // Обробники разово. applyState() приходить з heartbeat кожні 2 с —
+    // якщо вішати addEventListener там, Enter після години консолі
+    // шле сотні lock-команд, кожна з яких скидає декодер і ріже запис.
+    document.getElementById('b-manual-lock').onclick = () => {
+      const v = parseFloat(document.getElementById('manual-freq').value)
+      if (!isNaN(v) && v > 0) lock(v * 1e6)
+    }
+    document.getElementById('manual-freq').addEventListener('keydown', e => {
+      if (e.key === 'Enter') document.getElementById('b-manual-lock').click()
+    })
+    document.getElementById('b-nudge-dn').onclick = () => {
+      if (!current) return
+      lock(current - 0.5e6)
+    }
+    document.getElementById('b-nudge-up').onclick = () => {
+      if (!current) return
+      lock(current + 0.5e6)
     }
 
     function connect() {
