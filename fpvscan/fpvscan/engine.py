@@ -245,9 +245,15 @@ class Engine:
         self.src.open()
         if getattr(self.src, "fixed_freq", False):
             fs = self.src.sample_rate         # запис диктує смугу
+        self.src.set_sample_rate(fs)
+        # libbladeRF (і інші джерела) можуть віддати сусідню реальну
+        # частоту дискретизації замість запитаної. Далі і свіп, і LOCK
+        # мають рахувати відліки саме з неї — інакше LOCK бачить
+        # `sample_rate != fs` щокадру і рве нитку читання.
+        if self.src.sample_rate:
+            fs = float(self.src.sample_rate)
             self.cfg["scan"]["sample_rate"] = fs
             self.cfg["video"]["sample_rate"] = fs
-        self.src.set_sample_rate(fs)
         self.src.set_gain(float(self.cfg["sdr"].get("gain_db", 30)))
         if hasattr(self.src, "set_bias_tee"):
             try:
@@ -559,12 +565,17 @@ class Engine:
  
     def _do_lock(self):
         vcfg = self.cfg["video"]
-        fs = float(vcfg.get("sample_rate", 20e6))
+        fs_want = float(vcfg.get("sample_rate", 20e6))
         f = self.state.lock_target
  
-        if self.src.sample_rate != fs:
+        # Точне `!=` тут неприпустиме: плата часто повертає, наприклад,
+        # 34999872 замість 35000000. Свіп уже порівнює з допуском 1 Гц;
+        # без нього LOCK щокадру гасить IQ-нитку, скидає DecodeState()
+        # і ніколи не утримує картинку.
+        if abs(float(self.src.sample_rate) - fs_want) > 1.0:
             self._stop_reader()          # нитка читала на старій fs — перезапуск
-            self.src.set_sample_rate(fs)
+            self.src.set_sample_rate(fs_want)
+        fs = float(self.src.sample_rate) or fs_want
  
         off = float(vcfg.get("lo_offset_hz", 0.0))
         bw = float(vcfg.get("channel_bw_hz", 20e6))
