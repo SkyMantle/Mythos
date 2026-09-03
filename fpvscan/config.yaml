@@ -60,9 +60,9 @@ video:
   ffmpeg_path: ''
   average: 3
   ring_seconds: 0.5
-  sync_score_threshold: 0.35
+  sync_score_threshold: 0.30
   presmooth_us: 1.0e-6
-  min_row_corr: 0.30
+  min_row_corr: 0.25
 
 web:
   host: 0.0.0.0

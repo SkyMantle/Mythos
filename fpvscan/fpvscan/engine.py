@@ -1,4 +1,3 @@
-
 """Рушій сканування.
  
 Три режими роботи, які перемикає одна робоча нитка:
@@ -78,6 +77,9 @@ class Engine:
         self._lock_n = 0
         self._acc: np.ndarray | None = None
         self._afc = 0.0
+        self._hw_afc_offset = 0.0   # частина AFC, вже "запечена" в реальну
+                                     # перебудову приймача (див. фікс 03.09.2026
+                                     # бага _lock_tuned/channelize нижче)
         self._sweep_i = 0
         self._timings: dict[str, float] = {}   # ковзне середнє по етапах, мс
         self._frame_ts: float | None = None    # час минулого відданого кадру
@@ -222,6 +224,7 @@ class Engine:
         if name == "lock":
             self._acc = None
             self._afc = 0.0
+            self._hw_afc_offset = 0.0
             self._lock_tuned = None
             # fps/мітка кадру — з попереднього лока, інакше /api/state
             # бреше про поточну ціль (показує привид старої частоти).
@@ -760,7 +763,8 @@ class Engine:
         except Exception as ex:
             spec_s = f"спектр не порахувався: {ex}"
         print(f"[afc/err] {f/1e6:.1f}МГц: сирий freq_error_hz()={err/1e3:+.0f}кГц "
-              f"(ch_bw={ch_bw/1e6:.1f}МГц, накопичено afc={self._afc/1e3:+.0f}кГц"
+              f"(ch_bw={ch_bw/1e6:.1f}МГц, накопичено afc={self._afc/1e3:+.0f}кГц, "
+              f"hw_afc_offset={self._hw_afc_offset/1e3:+.0f}кГц"
               + ("" if afc_on else ", AFC ВИМКНЕНА — лише вимірювання") + ") | "
               + spec_s, flush=True)
  
@@ -806,7 +810,12 @@ class Engine:
         # пливе постійно. Тепер AFC компенсується нижче цифровим
         # зсувом каналайзера, а фізична перебудова лишається рідкісною
         # подією (див. afc_recenter_frac нижче).
-        want = f + off
+        # Фікс 03.09.2026: `want` мусить включати вже "запечену" в залізо
+        # частину AFC (self._hw_afc_offset), інакше цей сторож після
+        # ПЕРШОГО ЖЕ recenter побачить розбіжність між номінальним f+off
+        # і реально застосованою частотою й одразу ж перебудує приймач
+        # НАЗАД на нескориговане f+off — звівши recenter нанівець.
+        want = f + off + self._hw_afc_offset
         if self._ring is None or self._lock_tuned != want:
             self._start_reader(want, fs, ring_s)
  
@@ -822,7 +831,7 @@ class Engine:
         if self._lock_n % every == 1:
             psd = spectrum.psd_db(iq, 4096, 4)
             self._emit("spectrum", {
-                "center_hz": f + off, "span_hz": fs,
+                "center_hz": f + off + self._hw_afc_offset, "span_hz": fs,
                 "bins": spectrum.downsample_for_display(psd, 384),
                 "floor_db": round(spectrum.noise_floor_db(psd), 1),
             })
@@ -832,6 +841,16 @@ class Engine:
         ch_bw = self._lock_bw(f, bw)
         # Цифрова AFC-корекція: зсуваємо вікно каналайзера на self._afc
         # замість перебудови приймача (див. коментар вище про want).
+        #
+        # ВАЖЛИВО (перевірено синтетичним тестом 03.09.2026, verify_fix_
+        # synthetic.py): тут НЕ потрібно віднімати self._hw_afc_offset.
+        # IQ з приймача завжди відносні до того, куди залізо ФІЗИЧНО
+        # зараз налаштоване — а після recenter воно вже там, і
+        # self._afc щоразу заново стартує з 0 та вимірює лише СВІЖИЙ
+        # залишок відносно вже скоригованого гетеродина. Перша версія
+        # цього фіксу помилково віднімала hw_afc_offset і тут теж — це
+        # робило гірше (постійно повертало похибку до повного історичного
+        # зсуву замість збіжності до нуля), підтверджено симуляцією.
         base_iq, fs_ch = demod.channelize(iq, fs, -off + self._afc, ch_bw)
         t = self._mark("channelize", t)
  
@@ -911,8 +930,19 @@ class Engine:
                 print(f"[afc] recenter {f/1e6:.1f}МГц: afc={self._afc/1e3:.0f}кГц "
                       f"lim={lim/1e3:.0f}кГц ch_bw={ch_bw/1e6:.1f}МГц "
                       f"(#{self._recenter_count})", flush=True)
-                self._start_reader(f + off + self._afc, fs, ring_s)
-                self._lock_tuned = want
+                # Фікс 03.09.2026: складаємо поточну цифрову корекцію в
+                # ПОСТІЙНИЙ hw_afc_offset (а не відкидаємо її бухгалтерію
+                # разом з обнулінням self._afc) і перебудовуємось на
+                # реально потрібну частоту f+off+hw_afc_offset. НЕ
+                # перезаписуємо self._lock_tuned значенням `want` зі
+                # старого (до цього recenter) стану — _start_reader()
+                # сам коректно виставляє self._lock_tuned у ту частоту,
+                # на яку щойно фізично перебудувався приймач; старий
+                # рядок `self._lock_tuned = want` це затирав і саме
+                # через це приймач замерзав на зсунутій частоті до
+                # кінця сесії LOCK (див. аналіз гілок main/test-branch).
+                self._hw_afc_offset += self._afc
+                self._start_reader(f + off + self._hw_afc_offset, fs, ring_s)
                 self._afc = 0.0
             elif lim <= 0 and self._afc != 0.0:
                 # Запасу цифрового зсуву взагалі нема (вузький fs чи
@@ -924,8 +954,9 @@ class Engine:
                       f"afc={self._afc/1e3:.0f}кГц ch_bw={ch_bw/1e6:.1f}МГц "
                       f"(AFC де-факто вимкнена на цьому каналі, #{self._recenter_count})",
                       flush=True)
-                self._start_reader(f + off + self._afc, fs, ring_s)
-                self._lock_tuned = want
+                # Той самий фікс 03.09.2026, що й у гілці вище.
+                self._hw_afc_offset += self._afc
+                self._start_reader(f + off + self._hw_afc_offset, fs, ring_s)
                 self._afc = 0.0
         t = self._mark("afc", t)
  
@@ -978,6 +1009,7 @@ class Engine:
                 "lines": frame.lines,
                 "locked": frame.locked,
                 "afc_hz": round(self._afc, 0),
+                "hw_afc_offset_hz": round(self._hw_afc_offset, 0),
                 "img": img,
             })
  
@@ -1003,6 +1035,7 @@ class Engine:
             self.state.mode = "SWEEP"
             self._acc = None
             self._afc = 0.0
+            self._hw_afc_offset = 0.0
             self._stop_reader()        # звільняємо src перед _do_sweep()
  
     def snapshot(self) -> dict:
@@ -1023,6 +1056,7 @@ class Engine:
             "clip_frac": round(float(getattr(self.src, "clip_frac", 0.0)), 4),
             "ch_bw_hz": round(self._last_ch_bw, 0),
             "afc_lim_hz": round(self._last_afc_lim, 0),
+            "hw_afc_offset_hz": round(self._hw_afc_offset, 0),
             "detections": [asdict(d) for d in
                         sorted(self.state.detections.values(),
                         key=lambda x: -x.snr_db)
@@ -1032,6 +1066,8 @@ class Engine:
  
  
  
-
-
+ 
+ 
+ 
+ 
 
