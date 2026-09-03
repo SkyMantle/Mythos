@@ -685,7 +685,11 @@ class Engine:
         t = self._mark("decode", t)
  
         if frame is not None:
-            min_lines = int(vcfg.get("min_lines", 250))
+            # Поле рендериться до наступної кадрової синхри (один польовий
+            # прохід), тож для NTSC це ~230-240 активних рядків, для
+            # PAL — ~250-288. Поріг лишаємо низьким, щоб відсіювати лише
+            # явний брак, а не коректні поля коротшого стандарту.
+            min_lines = int(vcfg.get("min_lines", 200))
             if frame.lines < min_lines:
                 frame = None
  
