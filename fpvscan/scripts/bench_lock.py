@@ -28,15 +28,15 @@ from fpvscan.dsp import demod, cvbs
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--fs", type=float, default=35.0, help="Мвідл/с у LOCK")
-    ap.add_argument("--bw", type=float, default=8.0, help="смуга каналу, МГц")
+    ap.add_argument("--fs", type=float, default=20.0, help="Мвідл/с у LOCK")
+    ap.add_argument("--bw", type=float, default=12.0, help="смуга каналу, МГц")
     ap.add_argument("--dev", type=float, default=10.0, help="девіація ЧМ, МГц")
-    ap.add_argument("--capture-ms", type=float, default=80.0)
-    ap.add_argument("--margin", type=float, default=1.7,
+    ap.add_argument("--capture-ms", type=float, default=56.0)
+    ap.add_argument("--margin", type=float, default=1.25,
                     help="track_window_margin: скільки полів беремо на кадр")
     ap.add_argument("--width", type=int, default=640)
     ap.add_argument("--max-lines", type=int, default=288)
-    ap.add_argument("--encode", default="webp4",
+    ap.add_argument("--encode", default="webp0",
                     choices=["webp4", "webp1", "webp0", "jpeg", "none"])
     ap.add_argument("--quality", type=int, default=82)
     ap.add_argument("--iters", type=int, default=40)
@@ -125,7 +125,7 @@ def main():
           f"capture={a.capture_ms:.0f}мс  margin={a.margin}  "
           f"encode={a.encode} q={a.quality}")
     print(f"кадрів декодовано: {ok}/{n_meas}"
-          + (f"  рядків≈{int(np.median(lines_seen))}" if lines_seen else ""))
+          + (f"  рядків~{int(np.median(lines_seen))}" if lines_seen else ""))
     print("-" * 46)
     for k in ("channelize", "afc", "demod_fm", "deemphasis",
               "decode", "encode", "total"):

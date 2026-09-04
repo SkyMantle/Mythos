@@ -149,6 +149,7 @@ class Engine:
             self._acc = None
             self._afc = 0.0
             self._lock_tuned = None
+            self._lock_n = 0
             self.state.lock_target = float(kw["freq_hz"])
             self.state.mode = "LOCK"
             self.state.auto = False
@@ -409,17 +410,37 @@ class Engine:
                 base, fs2,
                 tol_hz=float(sc.get("line_tol_hz", 150)),
                 min_prominence_db=float(sc.get("line_prominence_db", 8)),
-                min_conf=float(sc.get("min_confidence", 0.45)))
+                min_conf=float(sc.get("min_confidence", 0.45)),
+                min_harmonics=int(sc.get("min_harmonics", 1)))
         except Exception as e:
             if self.cfg["scan"].get("debug_candidates"):
                 self._emit("candidate", {"freq_hz": occ.center_hz,
             "reason": f"збій: {e}"})
             return
- 
+
+        accepted = score.is_video
+        pic = None
+        # Димова перевірка CVBS: рядкова лінія буває і в чистому тоні /
+        # шумі, а справжнє аналогове відео збирає поле. Той самий
+        # score_picture, що й частотний пошук у LOCK.
+        if accepted and sc.get("inspect_decode", True):
+            ok, pic = self._decode_confirm(base, fs2)
+            if not ok:
+                bypass = float(sc.get("inspect_conf_bypass", 0.85))
+                strong = (score.confidence >= bypass
+                          and score.standard in ("PAL", "NTSC")
+                          and score.harmonics >= 1)
+                if not strong:
+                    accepted = False
+
         # Кожен кандидат, що пройшов спектральний відбір, віддається
         # назовні разом із причиною рішення. Без цього неможливо
         # відрізнити «поріг завищений» від «сигналу немає».
         if self.cfg["scan"].get("debug_candidates"):
+            reason = score.reason
+            if score.is_video and not accepted and pic is not None:
+                reason = (f"димова: corr={pic.row_corr:.2f} "
+                          f"locked={pic.locked} lines={pic.lines}")
             self._emit("candidate", {
                 "freq_hz": occ.center_hz,
                 "bandwidth_hz": occ.bandwidth_hz,
@@ -429,10 +450,12 @@ class Engine:
                 "confidence": score.confidence,
                 "prominence_db": score.prominence_db,
                 "harmonics": score.harmonics,
-                "accepted": score.is_video,
-                "reason": score.reason,
+                "accepted": accepted,
+                "reason": reason,
+                "row_corr": None if pic is None else round(pic.row_corr, 3),
+                "pic_locked": None if pic is None else pic.locked,
             })
-        if not score.is_video:
+        if not accepted:
             return
  
         now = time.time()
@@ -447,7 +470,27 @@ class Engine:
             first_seen=now, last_seen=now,
         )
         self._merge(det)
- 
+
+    def _decode_confirm(self, base: np.ndarray, fs: float):
+        """Коротке cvbs.decode + score_picture для INSPECT.
+
+        Повертає (чи схоже на аналогове відео, оцінка). Той самий
+        рахунок, що й _freq_hunt — критерії не розходяться.
+        """
+        sc = self.cfg["scan"]
+        vcfg = self.cfg.get("video", {})
+        fr = cvbs.decode(demod.deemphasis(base, fs), fs,
+                         width=int(vcfg.get("width", 640)),
+                         state=None,
+                         auto_levels=bool(vcfg.get("auto_levels", True)),
+                         sharpen=0.0)
+        pic = cvbs.score_picture(fr)
+        ok = pic.is_analog(
+            min_corr=float(sc.get("inspect_min_row_corr", 0.25)),
+            require_lock=bool(sc.get("inspect_require_lock", False)),
+            min_lines=int(sc.get("inspect_min_lines", 80)))
+        return ok, pic
+
     MERGE_TOL_HZ = 6e6
  
     def _merge(self, det: Detection):
@@ -560,6 +603,65 @@ class Engine:
                 return
             ring.write(iq)
  
+    def _freq_hunt(self, iq: np.ndarray, fs: float, off: float,
+                   ch_bw: float, vcfg: dict, current: cvbs.Frame | None):
+        """Цифровий пошук кращої частоти навколо lock_target.
+
+        Не чіпає приймач: ті самі IQ, інший зсув каналайзера. Якщо
+        знайдений зсув разом із AFC виходить за lim — спрацює вже
+        наявний afc_recenter (фізична перебудова). Рахунок той самий,
+        що в INSPECT (`cvbs.score_picture`).
+        """
+        skip = float(vcfg.get("hunt_skip_if_score", 0.75))
+        if cvbs.score_picture(current).value >= skip:
+            return
+
+        offsets_mhz = vcfg.get("hunt_offsets_mhz") or [0.25, 0.5, 1.0]
+        trials = []
+        for m in offsets_mhz:
+            hz = float(m) * 1e6
+            trials.append(hz)
+            trials.append(-hz)
+
+        safe = max(0.0, fs * 0.45 - abs(off) - ch_bw / 2)
+        mix0 = -off + self._afc
+        width = min(320, int(vcfg.get("width", 640)))
+        auto_lv = bool(vcfg.get("auto_levels", True))
+        # одне поле досить, щоб порівняти офсети — не ганяємо весь знімок
+        n_h = min(len(iq), max(int(fs * 0.022), 1))
+        iq_h = iq[-n_h:]
+        need = float(vcfg.get("hunt_min_gain", 0.12))
+
+        def score_mix(mix_hz: float) -> cvbs.PictureScore:
+            ch, fs_ch = demod.channelize(iq_h, fs, mix_hz, ch_bw)
+            base = demod.fm_demod(ch, fs_ch, deviation_hz=ch_bw / 4)
+            base = demod.deemphasis(base, fs_ch)
+            fr = cvbs.decode(base, fs_ch, width=width, state=None,
+                             auto_levels=auto_lv, sharpen=0.0)
+            return cvbs.score_picture(fr)
+
+        # база на тому ж зрізі й сліпому decode, інакше трекінг завжди
+        # «виграє» у проб з іншим офсетом
+        cur = score_mix(mix0)
+        best_off = 0.0
+        best = cur
+        for trial in trials:
+            if abs(self._afc + trial) > safe:
+                continue
+            pic = score_mix(mix0 + trial)
+            if pic.value > best.value:
+                best = pic
+                best_off = trial
+                if pic.value >= skip:
+                    break
+
+        if best_off != 0.0 and best.value >= cur.value + need:
+            self._afc = max(-safe, min(safe, self._afc + best_off))
+            if abs(best_off) >= 0.5e6:
+                self._emit("notice", {"level": "ok", "text":
+                    f"пошук частоти {best_off/1e6:+.2f} МГц "
+                    f"(оцінка {cur.value:.2f}→{best.value:.2f})"})
+
     def _do_lock(self):
         vcfg = self.cfg["video"]
         fs = float(vcfg.get("sample_rate", 20e6))
@@ -616,14 +718,19 @@ class Engine:
         t = time.perf_counter()
         self._lock_n += 1
  
-        every = max(1, int(vcfg.get("spectrum_every", 8)))
+        every = max(1, int(vcfg.get("spectrum_every", 16)))
+        did_spec = False
         if self._lock_n % every == 1:
-            psd = spectrum.psd_db(iq, 4096, 4)
+            # LOCK-спектр лише індикація: короткий зріз, не повний знімок.
+            nfft = 2048
+            sl = iq[:nfft * 2] if len(iq) >= nfft * 2 else iq
+            psd = spectrum.psd_db(sl, nfft, 2)
             self._emit("spectrum", {
                 "center_hz": f + off, "span_hz": fs,
                 "bins": spectrum.downsample_for_display(psd, 384),
                 "floor_db": round(spectrum.noise_floor_db(psd), 1),
             })
+            did_spec = True
  
         iq = iq - np.mean(iq)
  
@@ -705,7 +812,16 @@ class Engine:
             min_lines = int(vcfg.get("min_lines", 200))
             if frame.lines < min_lines:
                 frame = None
- 
+
+        if (vcfg.get("hunt", True) and not did_spec and self._lock_n >= 3):
+            hunt_every = max(4, int(vcfg.get("hunt_every", 12)))
+            if self._lock_n <= int(vcfg.get("hunt_after_lock", 16)):
+                hunt_every = max(4, hunt_every // 3)
+            if self._lock_n % hunt_every == 0:
+                t_h = time.perf_counter()
+                self._freq_hunt(iq, fs, off, ch_bw, vcfg, frame)
+                self._mark("hunt", t_h)
+
         if frame is not None:
             k = float(vcfg.get("average", 0.0))
             if k > 0:
@@ -741,7 +857,7 @@ class Engine:
             img = cvbs.encode(frame, str(vcfg.get("stream_fmt", "webp")),
                               int(vcfg.get("stream_quality", 75)),
                               height=None,
-                              method=int(vcfg.get("stream_method", 1)))
+                              method=int(vcfg.get("stream_method", 0)))
             t = self._mark("encode", t)
  
             self._emit("frame", {

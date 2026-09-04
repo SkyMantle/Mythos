@@ -56,7 +56,9 @@ def channelize(iq: np.ndarray, fs: float, offset_hz: float,
     x = shift(iq, offset_hz, fs)
     dec = max(1, int(fs / out_bw_hz))
     if dec == 1:
-        return x.astype(np.complex64), fs
+        if x.dtype != np.complex64:
+            x = x.astype(np.complex64)
+        return x, fs
 
     if not fast:
         return (signal.decimate(x, dec, ftype="fir",
@@ -153,7 +155,8 @@ class VideoScore:
 def classify_video(base: np.ndarray, fs: float,
                 tol_hz: float = 150.0,
                 min_prominence_db: float = 8.0,
-                min_conf: float = 0.45) -> VideoScore:
+                min_conf: float = 0.45,
+                min_harmonics: int = 1) -> VideoScore:
     """Шукає рядкову лінію в спектрі демодульованого сигналу."""
     # Досить смуги до ~200 кГц — рядкова та кілька її гармонік.
     # Просте прорідження тут неприпустиме: воно завернуло б увесь
@@ -166,7 +169,7 @@ def classify_video(base: np.ndarray, fs: float,
         x = ((c[dec:] - c[:-dec]) / dec)[::dec].astype(np.float32)
     fs2 = fs / dec
     if len(x) < 8192:      # менше ~20 мс ефіру — рядкову не виміряти
-        return VideoScore(False, 0.0, "?", 0.0)
+        return VideoScore(False, 0.0, "?", 0.0, reason="закороткий буфер")
 
     x = x - x.mean()
     nfft = 1 << int(np.floor(np.log2(len(x))))
@@ -178,7 +181,7 @@ def classify_video(base: np.ndarray, fs: float,
     # шукаємо максимум у вікні 15.0–16.2 кГц
     sel = (freqs > 15.0e3) & (freqs < 16.2e3)
     if not np.any(sel):
-        return VideoScore(False, 0.0, "?", 0.0)
+        return VideoScore(False, 0.0, "?", 0.0, reason="нема лінії 15–16 кГц")
     idx = np.where(sel)[0]
     peak_i = idx[np.argmax(sp[idx])]
     peak_f = float(freqs[peak_i])
@@ -200,7 +203,6 @@ def classify_video(base: np.ndarray, fs: float,
         if len(win) and 10 * np.log10(win.max() / bg) > 6:
             harm += 1
 
-    conf = min(1.0, max(0.0, (prominence_db - 8) / 20)) * (0.6 + 0.2 * harm)
     std = "?"
     if abs(peak_f - LINE_PAL) < tol_hz:
         std = "PAL"
@@ -212,17 +214,16 @@ def classify_video(base: np.ndarray, fs: float,
     if std == "?":
         conf *= 0.5        # знижуємо, але не відкидаємо: буває нестандарт
 
-    reason = ""
+    # Гармоніки обов'язкові: одиночний пік дає будь-яка вузька завада,
+    # а гребінець із кратних частот — тільки рядкова розгортка.
+    if harm < min_harmonics:
+        return VideoScore(False, peak_f, std, round(conf, 2),
+                          round(prominence_db, 1), harm,
+                          f"гармонік {harm} < {min_harmonics}")
     if conf <= min_conf:
-        reason = (f"впевненість {conf:.2f}: підйом {prominence_db:.1f} дБ, "
-                f"гармонік {harm}, стандарт {std}")
-    return VideoScore(conf > min_conf, peak_f, std, round(conf, 2),
-                    round(prominence_db, 1), harm, reason)
-
-    # Гармоніки теж обов'язкові: одиночний пік дає будь-яка вузька
-    # завада, а гребінець із кратних частот - тільки розгортка.
-    if harm < 1:
-        return VideoScore(False, peak_f, std, 0.0)
-
-    conf = min(1.0, max(0.0, (prominence_db - 12) / 18)) * (0.7 + 0.15 * harm)
-    return VideoScore(conf > 0.5, peak_f, std, round(conf, 2))
+        return VideoScore(False, peak_f, std, round(conf, 2),
+                          round(prominence_db, 1), harm,
+                          f"впевненість {conf:.2f}: підйом {prominence_db:.1f} дБ, "
+                          f"гармонік {harm}, стандарт {std}")
+    return VideoScore(True, peak_f, std, round(conf, 2),
+                      round(prominence_db, 1), harm, "")

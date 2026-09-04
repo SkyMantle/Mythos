@@ -51,6 +51,74 @@ class Frame:
 
 
 @dataclass
+class PictureScore:
+    """Спільна оцінка «чи це справжня картинка».
+
+    Один рахунок і для димової перевірки INSPECT, і для пошуку
+    частоти в LOCK — щоб не розмножувати критерії.
+    """
+    value: float
+    locked: bool
+    lines: int
+    row_corr: float
+
+    def is_analog(self, min_corr: float = 0.25, require_lock: bool = False,
+                  min_lines: int = 80) -> bool:
+        if self.lines < min_lines and not self.locked:
+            return False
+        if require_lock and not self.locked:
+            return False
+        if self.row_corr >= min_corr:
+            return True
+        # слабке, але зібране поле — не ховаємо (типове 3G3 на межі С/Ш)
+        return bool(self.locked and self.lines >= min_lines)
+
+
+def row_correlation(luma: np.ndarray, pairs: int = 8) -> float:
+    """Середня кореляція сусідніх рядків активної частини кадру.
+
+    Шум дає ~0; аналогове відео — помітно додатну величину, бо
+    сусідні рядки майже однакові.
+    """
+    if luma is None or luma.ndim != 2:
+        return 0.0
+    h, w = luma.shape
+    if h < 16 or w < 16:
+        return 0.0
+    lo = int(h * 0.12)
+    hi = int(h * 0.88)
+    if hi - lo < 4:
+        return 0.0
+    n = min(pairs, hi - lo - 1)
+    ys = np.linspace(lo, hi - 2, n, dtype=np.int32)
+    x = luma.astype(np.float32)
+    acc = 0.0
+    n_ok = 0
+    for y in ys:
+        a = x[y] - x[y].mean()
+        b = x[y + 1] - x[y + 1].mean()
+        na = float(np.dot(a, a))
+        nb = float(np.dot(b, b))
+        if na < 1.0 or nb < 1.0:
+            continue
+        acc += float(np.dot(a, b) / np.sqrt(na * nb))
+        n_ok += 1
+    return acc / n_ok if n_ok else 0.0
+
+
+def score_picture(frame: Frame | None) -> PictureScore:
+    """Скаляр 0..1: кадрова синхра + рядки + схожість рядків."""
+    if frame is None or frame.luma is None or frame.luma.size == 0:
+        return PictureScore(0.0, False, 0, 0.0)
+    corr = row_correlation(frame.luma)
+    corr_n = float(np.clip(corr, 0.0, 1.0))
+    lines_n = min(frame.lines / 250.0, 1.0)
+    locked_n = 1.0 if frame.locked else 0.0
+    value = 0.45 * corr_n + 0.35 * locked_n + 0.20 * lines_n
+    return PictureScore(value, bool(frame.locked), int(frame.lines), float(corr))
+
+
+@dataclass
 class DecodeState:
     """Пам'ять декодера між послідовними викликами decode() для одного
     каналу. Тримає Engine (по одному екземпляру на LOCK), передається
@@ -444,12 +512,20 @@ def decode(base: np.ndarray, fs: float, width: int = 640,
             return frame
         state.lost += 1
 
+    # Відому полярність пробуємо першою: на зриві трекінгу це часто
+    # одразу дає поле і не ганяє другий повний сліпий прохід.
+    signs = (1.0, -1.0)
+    known = state is not None and state.period is not None
+    if known:
+        signs = (state.sign, -state.sign)
     best_s, best_f, best_t0, best_sign = 0.0, None, None, 1.0
-    for sign in (1.0, -1.0):
+    for sign in signs:
         s, f, t0 = _attempt(v * sign, fs, width, max_lines,
                             auto_levels=auto_levels, sharpen=sharpen)
         if f is not None and s > best_s:
             best_s, best_f, best_t0, best_sign = s, f, t0, sign
+            if known and best_s > 0.85:
+                break
     if best_s <= 0.5:
         return None
 
