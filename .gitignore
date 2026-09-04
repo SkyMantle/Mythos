@@ -7,3 +7,5 @@ __pycache__/
 
 # Self-test output
 fpvscan/scripts/decoded.png
+.pytest_cache/
+fpvscan/out/
