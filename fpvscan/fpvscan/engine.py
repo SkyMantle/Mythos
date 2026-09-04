@@ -82,11 +82,8 @@ class Engine:
         self._lock_n = 0
         self._lock_gen = 0                         # покоління LOCK (скидає hunt)
         self._acc: np.ndarray | None = None
-        self._afc = 0.0
-        self._rf_off = 0.0                         # уже всотаний у перебудову зсув
+        self._afc = 0.0                            # лише цифровий зсув каналайзера
         self._last_err = 0.0
-        self._afc_notice_t = 0.0
-        self._last_frame_t = 0.0
         self._hunt_th: threading.Thread | None = None
         self._hunt_out: float | None = None
         self._hunt_note: tuple[float, float, float] | None = None
@@ -161,7 +158,6 @@ class Engine:
         if name == "lock":
             self._acc = None
             self._afc = 0.0
-            self._rf_off = 0.0
             self._last_err = 0.0
             self._hunt_out = None
             self._hunt_note = None
@@ -176,7 +172,6 @@ class Engine:
             self.state.mode = "SWEEP"
             self.state.auto = False
             self._afc = 0.0
-            self._rf_off = 0.0
             self._lock_gen += 1
             self._stop_reader()
         elif name == "clear":
@@ -647,7 +642,6 @@ class Engine:
         self._peeked[key] = now
         self._lock_tuned = None
         self._afc = 0.0
-        self._rf_off = 0.0
         self._lock_n = 0
         self._lock_gen += 1
         self.state.lock_target = det.freq_hz
@@ -685,9 +679,8 @@ class Engine:
         блоками. Тепер приймач читає безперервно в окремій нитці, а
         _do_lock() лише бере знімки з кільцевого буфера.
 
-        keep_state: AFC-перебудова. Період/полярність лишаємо, abs_t0
-        скидаємо (нове кільце — інша шкала часу), щоб не трекати в
-        порожнечу. Сліпий кадр раз, далі знову трекінг.
+        keep_state: лишити період/полярність після перезапуску кільця.
+        Цифрова AFC кільце не чіпає — DecodeState живе між кадрами сам.
         """
         old = self._lock_state if keep_state else None
         old_dec = self._lock_dec if keep_state else None
@@ -731,79 +724,51 @@ class Engine:
                 return
             ring.write(iq)
  
-    def _recenter_rf(self, f: float, off: float, fs: float, ring_s: float,
-                     delta: float, vcfg: dict):
-        """Всотати цифровий зсув у фізичну перебудову.
-
-        lock_target зсувається — в UI видно, що AFC женеться за VTX.
-        DecodeState не обнуляємо (keep_state): один сліпий кадр замість
-        повної втрати генлока.
-        """
+    def _digital_afc_lim(self, fs: float, off: float, ch_bw: float,
+                         vcfg: dict) -> float:
+        """Стеля |цифрового AFC|: запас Найквіста. Далі — стоп, не RF."""
         lim = float(vcfg.get("afc_limit_hz", 20e6))
-        max_step = float(vcfg.get("afc_max_step_hz", 0.8e6))
-        delta = float(np.clip(delta, -max_step, max_step))
-        new_f = float(np.clip(f + delta, f - lim, f + lim))
-        self.state.lock_target = new_f
-        self._rf_off = 0.0
-        self._afc = 0.0
-        self._start_reader(new_f + off, fs, ring_s, keep_state=True)
-        now = time.time()
-        if now - self._afc_notice_t >= 1.2 and abs(delta) >= 120e3:
-            self._afc_notice_t = now
-            self._emit("notice", {"level": "ok", "text":
-                f"AFC {delta/1e3:+.0f} кГц → {new_f/1e6:.2f} МГц"})
+        nyq = max(0.0, fs * 0.45 - abs(off) - ch_bw / 2)
+        return min(lim, nyq)
 
-    def _apply_afc(self, base, base_iq, fs_ch, deviation, fs, off, ch_bw,
-                   f, ring_s, vcfg):
-        """Щокадрова дешева AFC + RF-перебудова, коли цифра не вміщається.
+    def _video_ok_for_afc(self, frame: cvbs.Frame | None) -> bool:
+        """AFC лише коли вже видно відео — на снігу freq_error бреше."""
+        if frame is None or not frame.locked:
+            return False
+        return 14_000.0 < float(frame.line_rate) < 17_500.0
 
-        Два виміри: середина ЧМ-розмаху (точно, коли вже в каналі) і
-        центр спектральної плями (грубо, коли стоїмо на спідниці).
-        Широкий канал раніше зануляв safe_lim — тоді afc_hz вічно 0.
+    def _apply_afc(self, base, fs: float, off: float, ch_bw: float,
+                   deviation: float, vcfg: dict):
+        """Щокадрова дешева AFC: лише цифровий зсув каналайзера.
+
+        lock_target після «Стати» — якір оператора. Не складаємо AFC
+        в якір і не перебудовуємо RF: freq_error (середина перцентилів
+        ЧМ-відео) зміщена в бік синхри/спідниці і з'їжджала з картинки
+        (3080→3075, той самий клас що 4989). На межі Найквіста — стоп.
         """
-        err_fm = demod.freq_error_from_demod(base, deviation)
-        err_blob = demod.blob_offset_hz(base_iq, fs_ch)
-        max_step = float(vcfg.get("afc_max_step_hz", 0.8e6))
-        dead = float(vcfg.get("afc_deadband_hz", 80e3))
-        # Пляма тягне на спідницю лише коли ЧМ-похибка мертва — інакше
-        # один стрибок 4–5 МГц (як з 3080 на 3075) ще до першого кадру.
-        if abs(err_blob) > 1.2e6 and abs(err_fm) < dead:
-            err = err_blob * 0.35
-        else:
-            err = err_fm
+        err = demod.freq_error_from_demod(base, deviation)
         self._last_err = err
-
-        lim = float(vcfg.get("afc_limit_hz", 20e6))
-        safe_lim = max(0.0, fs * 0.45 - abs(off) - ch_bw / 2)
-        dig_lim = min(lim, safe_lim)
+        dead = float(vcfg.get("afc_deadband_hz", 80e3))
+        if abs(err) <= dead:
+            return
+        dig_lim = self._digital_afc_lim(fs, off, ch_bw, vcfg)
+        if dig_lim < 50e3:
+            return
+        max_step = float(vcfg.get("afc_max_step_hz", 0.8e6))
         gain = float(vcfg.get("afc_gain", 0.7))
-
-        if abs(err) > dead:
-            step = float(np.clip(err * gain, -max_step, max_step))
-            if dig_lim > 0.25e6:
-                self._afc = max(-dig_lim, min(dig_lim, self._afc + step))
-            elif time.time() - self._last_frame_t < 1.5:
-                self._recenter_rf(f, off, fs, ring_s,
-                                  float(np.clip(step, -max_step, max_step)), vcfg)
-                return
-
-        recenter = float(vcfg.get("afc_recenter_hz", 0.5e6))
-        if dig_lim > 0:
-            recenter = min(recenter, max(0.2e6, dig_lim * 0.55))
-        if abs(self._afc) >= recenter:
-            # На снігу ЧМ-похибка бреше і гоняла б lock_target без картинки.
-            if time.time() - self._last_frame_t < 1.5:
-                self._recenter_rf(f, off, fs, ring_s, self._afc, vcfg)
+        step = float(np.clip(err * gain, -max_step, max_step))
+        self._afc = max(-dig_lim, min(dig_lim, self._afc + step))
 
     def _take_hunt_result(self, fs: float, off: float, ch_bw: float):
-        """Застосувати зсув, який нарахувала фонова нитка пошуку."""
+        """Цифровий зсув з фонової нитки. lock_target — якір, не чіпаємо."""
         delta = self._hunt_out
         note = self._hunt_note
         self._hunt_out = None
         self._hunt_note = None
         if not delta:
             return
-        safe = max(0.0, fs * 0.45 - abs(off) - ch_bw / 2)
+        vcfg = self.cfg["video"]
+        safe = self._digital_afc_lim(fs, off, ch_bw, vcfg)
         self._afc = max(-safe, min(safe, self._afc + delta))
         if note and abs(delta) >= 0.25e6:
             d, cur_v, best_v = note
@@ -821,6 +786,8 @@ class Engine:
         """
         if not vcfg.get("hunt", True):
             return
+        if frame is None:
+            return
         if self._hunt_th is not None and self._hunt_th.is_alive():
             return
         skip = float(vcfg.get("hunt_skip_if_score", 0.60))
@@ -837,16 +804,16 @@ class Engine:
         gen = self._lock_gen
         self._hunt_th = threading.Thread(
             target=self._freq_hunt_worker,
-            args=(gen, iq_h, fs, mix0, ch_bw, vcfg, self._last_err, self._afc),
+            args=(gen, iq_h, fs, mix0, off, ch_bw, vcfg, self._last_err, self._afc),
             daemon=True, name="fpv-hunt")
         self._hunt_th.start()
 
     def _freq_hunt_worker(self, gen: int, iq_h: np.ndarray, fs: float,
-                          mix0: float, ch_bw: float, vcfg: dict, err: float,
-                          afc0: float):
+                          mix0: float, off: float, ch_bw: float, vcfg: dict,
+                          err: float, afc0: float):
         try:
             delta, cur_v, best_v = self._freq_hunt_compute(
-                iq_h, fs, mix0, ch_bw, vcfg, err, afc0)
+                iq_h, fs, mix0, off, ch_bw, vcfg, err, afc0)
         except Exception:
             return
         if gen != self._lock_gen or not delta:
@@ -855,11 +822,15 @@ class Engine:
         self._hunt_note = (delta, cur_v, best_v)
 
     def _freq_hunt_compute(self, iq_h: np.ndarray, fs: float, mix0: float,
-                           ch_bw: float, vcfg: dict, err: float, afc0: float):
-        """Порівняти кілька цифрових зсувів. Спершу в бік freq_error."""
+                           off: float, ch_bw: float, vcfg: dict, err: float,
+                           afc0: float):
+        """Дрібний цифровий пошук (±0.25 МГц). lock_target не рухаємо.
+
+        Лише якщо поточна оцінка слабка і кандидат явно кращий.
+        """
         skip = float(vcfg.get("hunt_skip_if_score", 0.60))
         need = float(vcfg.get("hunt_min_gain", 0.10))
-        offsets_mhz = vcfg.get("hunt_offsets_mhz") or [0.5, 1.0, 2.0]
+        offsets_mhz = vcfg.get("hunt_offsets_mhz") or [0.25]
         sign = 1.0 if err >= 0 else -1.0
         trials = []
         for m in offsets_mhz:
@@ -870,7 +841,7 @@ class Engine:
 
         width = min(320, int(vcfg.get("width", 640)))
         auto_lv = bool(vcfg.get("auto_levels", True))
-        safe = max(0.0, fs * 0.45 - ch_bw / 2)
+        safe = self._digital_afc_lim(fs, off, ch_bw, vcfg)
 
         def score_mix(mix_hz: float) -> cvbs.PictureScore:
             ch, fs_ch = demod.channelize(iq_h, fs, mix_hz, ch_bw)
@@ -929,11 +900,10 @@ class Engine:
             self._stop_reader()
             raise err
  
-        # Фізична перебудова — на зміну каналу або після AFC-fold у
-        # lock_target. Цифровий _afc у want не входить: його компенсує
-        # зсув каналайзера. Раніше recenter писав SDR на f+afc, а
-        # _lock_tuned лишав f — наступна перебудова «з'їдала» зсув.
-        want = f + off + self._rf_off
+        # RF стоїть на якорі lock_target (клік / ±0.5 МГц). Цифровий
+        # _afc у want не входить: його компенсує зсув каналайзера.
+        # Складати AFC в lock_target — це 3080→3075.
+        want = f + off
         if self._ring is None or self._lock_tuned != want:
             self._start_reader(want, fs, ring_s)
  
@@ -988,17 +958,11 @@ class Engine:
         deviation = ch_bw / 4
         base = demod.fm_demod(base_iq, fs_ch, deviation_hz=deviation)
         t = self._mark("demod_fm", t)
+        fm_base = base  # AFC міряє до деемфазису
 
-        self._take_hunt_result(fs, off, ch_bw)
-        if vcfg.get("afc", True):
-            self._apply_afc(base, base_iq, fs_ch, deviation, fs, off, ch_bw,
-                            f, ring_s, vcfg)
-            f = self.state.lock_target or f
-        t = self._mark("afc", t)
- 
         base = demod.deemphasis(base, fs_ch)
         t = self._mark("deemphasis", t)
- 
+
         frame = cvbs.decode(base, fs_ch, width=int(vcfg.get("width", 640)),
                             state=self._lock_state, abs_start=abs_start_ch + 1,
                             auto_levels=bool(vcfg.get("auto_levels", True)),
@@ -1013,6 +977,11 @@ class Engine:
             min_lines = int(vcfg.get("min_lines", 200))
             if frame.lines < min_lines:
                 frame = None
+
+        self._take_hunt_result(fs, off, ch_bw)
+        if vcfg.get("afc", True) and self._video_ok_for_afc(frame):
+            self._apply_afc(fm_base, fs, off, ch_bw, deviation, vcfg)
+        t = self._mark("afc", t)
 
         self._kick_hunt(iq, fs, off, ch_bw, vcfg, frame)
 
@@ -1064,8 +1033,7 @@ class Engine:
                 "freq_err_hz": round(self._last_err, 0),
                 "img": img,
             })
-            self._last_frame_t = time.time()
- 
+
             now = time.perf_counter()
             prev_ts = self._frame_ts
             self._frame_ts = now
@@ -1091,7 +1059,6 @@ class Engine:
             self.state.mode = "SWEEP"
             self._acc = None
             self._afc = 0.0
-            self._rf_off = 0.0
             self._lock_gen += 1
             self._stop_reader()        # звільняємо src перед _do_sweep()
  

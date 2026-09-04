@@ -111,6 +111,9 @@ def freq_error_from_demod(base: np.ndarray, deviation_hz: float) -> float:
     `fm_demod` нормує миттєву частоту на deviation_hz, тож середина
     розмаху, помножена на deviation, дає герци. На живому LOCK це
     знімає ~20 мс, які раніше йшли на повторний inst_freq_hz.
+
+    Середина перцентилів зміщена в бік синхри/спідниці — це поправка
+    для цифрового каналайзера, не для перебудови RF і не для lock_target.
     """
     if base.size < 1024:
         return 0.0
