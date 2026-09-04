@@ -16,6 +16,21 @@ LINE_PAL = 15625.0
 LINE_NTSC = 15734.264
 
 
+def identify_standard(line_rate: float, tol_hz: float = 120.0) -> str:
+    """PAL / NTSC / «?» за рядковою частотою.
+
+    Обираємо БЛИЖЧИЙ номінал, а не перший, що влізав у допуск: інакше
+    NTSC (15 734 Гц) завжди програє PAL (15 625 Гц) при tol ≥ 109 Гц.
+    Саме так LOCK брав FIELD_LINES=312.5 на NTSC-полі (262.5) і зривав
+    трекінг кадрової синхри.
+    """
+    d_pal = abs(line_rate - LINE_PAL)
+    d_ntsc = abs(line_rate - LINE_NTSC)
+    if min(d_pal, d_ntsc) >= tol_hz:
+        return "?"
+    return "PAL" if d_pal <= d_ntsc else "NTSC"
+
+
 def shift(iq: np.ndarray, offset_hz: float, fs: float) -> np.ndarray:
     """Переносить ділянку спектра на нуль.
 
@@ -180,11 +195,7 @@ def classify_video(base: np.ndarray, fs: float,
             harm += 1
 
     conf = min(1.0, max(0.0, (prominence_db - 8) / 20)) * (0.6 + 0.2 * harm)
-    std = "?"
-    if abs(peak_f - LINE_PAL) < tol_hz:
-        std = "PAL"
-    elif abs(peak_f - LINE_NTSC) < tol_hz:
-        std = "NTSC"
+    std = identify_standard(peak_f, tol_hz)
 
     conf = min(1.0, max(0.0,
                (prominence_db - min_prominence_db) / 18)) * (0.6 + 0.2 * harm)

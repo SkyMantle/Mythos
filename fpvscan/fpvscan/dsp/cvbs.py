@@ -26,6 +26,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import numpy as np
 
+from .demod import identify_standard
+
 SYNC_US = 4.7e-6
 # BACK_PORCH_US = 9.4e-6
 # FRONT_PORCH_US = 1.5e-6
@@ -196,8 +198,7 @@ def _attempt(v: np.ndarray, fs: float, width: int, max_lines: int,
     line_rate = fs / period
     if not (14000 < line_rate < 17500):
         return 0.0, None, None
-    standard = ("PAL" if abs(line_rate - 15625) < 120 else
-                "NTSC" if abs(line_rate - 15734) < 120 else "?")
+    standard = identify_standard(line_rate, 120.0)
     a0_frac, a1_frac, vblank = STD_GEOM[standard]
 
     # --- кадрова синхра: вікно в один рядок, де низького рівня > 55% ---
