@@ -458,6 +458,11 @@
     let fpsHist = []
 
     const fmt = hz => hz >= 1e9 ? (hz / 1e9).toFixed(3) + ' ГГц' : (hz / 1e6).toFixed(1) + ' МГц'
+    function fmtAfc(hz) {
+      const a = Number(hz) || 0
+      if (Math.abs(a) >= 1e6) return (a / 1e6).toFixed(2) + ' МГц'
+      return (a / 1e3).toFixed(0) + ' кГц'
+    }
 
     // холодна → сигнальна шкала, свідомо не «jet» і не «viridis»
     function ramp(u) {
@@ -585,10 +590,11 @@
       if (hint) hint.style.display = 'none'
 
       put('v-f', fmt(d.freq_hz))
+      if (d.freq_hz) current = d.freq_hz
       put('v-std', d.standard)
       put('v-line', d.line_rate + ' Гц')
       put('v-lines', d.lines)
-      put('v-afc', d.afc_hz ? (d.afc_hz / 1e6).toFixed(2) + ' МГц' : '0')
+      put('v-afc', fmtAfc(d.afc_hz))
       const lk = document.getElementById('v-lock')
       if (lk) lk.innerHTML =
         `<i class="dot ${d.locked ? 'ok' : ''}"></i>${d.locked ? 'є' : 'нема'}`
@@ -629,6 +635,7 @@
       m.textContent = s.mode; m.className = 'mode-' + s.mode
       document.getElementById('s-tuned').textContent = fmt(s.tuned_hz)
       document.getElementById('s-sweeps').textContent = s.sweeps_done
+      if (s.afc_hz != null) put('v-afc', fmtAfc(s.afc_hz))
       // Дивимось відео — прибираємо все інше з очей.
       document.querySelector('main').classList.toggle('watching', s.mode === 'LOCK')
 

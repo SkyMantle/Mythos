@@ -83,6 +83,12 @@ noise_fr = cvbs.Frame(luma=noise_luma, line_rate=15625.0, lines=fr.lines,
 npic = cvbs.score_picture(noise_fr)
 print(f"   шум: score={npic.value:.2f} corr={npic.row_corr:.2f}")
 assert not npic.is_analog(min_corr=0.22), "шум не має проходити димову перевірку"
+snow_locked = cvbs.Frame(luma=noise_luma, line_rate=15625.0, lines=fr.lines,
+                         standard="PAL", locked=True)
+spic = cvbs.score_picture(snow_locked)
+print(f"   сніг із «синхрою»: score={spic.value:.2f} corr={spic.row_corr:.2f}")
+assert not spic.is_analog(min_corr=0.22, require_lock=True), \
+    "залочений сніг не має проходити як відео"
 
 print("7) оцінка зсуву частоти (те, чим полює hunt)")
 src.set_sample_rate(FS_VID)
