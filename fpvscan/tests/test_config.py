@@ -37,3 +37,7 @@ def test_shipped_config_yaml_is_numeric():
     assert cfg["scan"]["start_hz"] < cfg["scan"]["stop_hz"]
     assert isinstance(cfg["video"]["sample_rate"], (int, float))
     assert isinstance(cfg["video"]["afc_limit_hz"], (int, float))
+    assert isinstance(cfg["video"]["motion_thresh"], (int, float))
+    assert isinstance(cfg["video"]["sharpen"], (int, float))
+    assert cfg["video"]["auto_levels"] is True
+    assert cfg["video"]["sharpen"] > 0.0

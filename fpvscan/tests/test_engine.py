@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import time
 from queue import Queue
+from unittest.mock import patch
 
 import numpy as np
 
+from fpvscan.dsp.cvbs import Frame
 from fpvscan.engine import Detection, Engine
 from tests.helpers import MockSource, engine_cfg, make_engine
 
@@ -258,3 +260,103 @@ def test_snapshot_reports_source_and_empty_lock():
     assert snap["recording"] is False
     assert snap["lock_target"] is None
     assert snap["fps"] == 0
+
+
+def _still_frame(lines: int, width: int = 32, fill: int = 128) -> Frame:
+    return Frame(
+        luma=np.full((lines, width), fill, dtype=np.uint8),
+        line_rate=15625.0,
+        lines=lines,
+        standard="NTSC",
+        locked=True,
+    )
+
+
+def _lock_once(eng, frame: Frame):
+    eng.state.mode = "LOCK"
+    eng.state.lock_target = 5800e6
+    with patch("fpvscan.engine.cvbs.decode", return_value=frame):
+        eng._do_lock()
+
+
+def test_min_lines_default_keeps_one_field_ntsc():
+    """One-field clamp yields ~230-240 lines; the old 250 gate dropped NTSC."""
+    frame = _still_frame(232)
+    cfg = engine_cfg()
+    del cfg["video"]["min_lines"]
+    events = Queue()
+    eng = Engine(MockSource(), cfg, events)
+    try:
+        _lock_once(eng, frame)
+        kinds = [e["type"] for e in _drain(events)]
+        assert "frame" in kinds
+    finally:
+        eng._stop_reader()
+
+
+def test_min_lines_250_drops_one_field_ntsc():
+    frame = _still_frame(232)
+    events = Queue()
+    eng = make_engine(events=events, min_lines=250)
+    try:
+        _lock_once(eng, frame)
+        kinds = [e["type"] for e in _drain(events)]
+        assert "frame" not in kinds
+    finally:
+        eng._stop_reader()
+
+
+def test_motion_average_holds_static_and_follows_moving_block():
+    """Static pixels mix; a jump larger than motion_thresh is taken as-is
+    (no smear / no interlace doubling)."""
+    h = w = 32
+    first = np.full((h, w), 80, dtype=np.uint8)
+    first[8:16, 8:16] = 200
+    second = np.full((h, w), 88, dtype=np.uint8)  # small global lift
+    second[8:16, 20:28] = 200                     # block moved right
+
+    frames = [
+        Frame(luma=first.copy(), line_rate=15625.0, lines=h,
+              standard="PAL", locked=True),
+        Frame(luma=second.copy(), line_rate=15625.0, lines=h,
+              standard="PAL", locked=True),
+    ]
+
+    def fake_decode(*_a, **_k):
+        return frames.pop(0)
+
+    eng = make_engine(min_lines=1, average=4.0, motion_thresh=24.0,
+                      afc=False, spectrum_every=10_000)
+    eng.state.mode = "LOCK"
+    eng.state.lock_target = 5800e6
+    try:
+        with patch("fpvscan.engine.cvbs.decode", side_effect=fake_decode):
+            eng._do_lock()
+            eng._do_lock()
+        acc = eng._acc
+        assert acc is not None
+        # moved-away square: large diff → follow current (88, no 200 tail)
+        assert acc[12, 12] < 120
+        # new square: large diff → follow current (200, not blended to 88)
+        assert acc[12, 24] > 180
+        # static-ish corner: small 80→88 lift is mixed, not snapped
+        assert 80 < acc[0, 0] < 88
+    finally:
+        eng._stop_reader()
+
+
+def test_afc_recenter_restarts_reader_when_digital_shift_hits_limit():
+    src = MockSource(tone_hz=400e3)
+    eng = make_engine(src=src, afc=True, afc_limit_hz=200e3,
+                      afc_deadband_hz=1.0, afc_recenter_frac=0.4,
+                      afc_gain=1.0)
+    eng.state.mode = "LOCK"
+    eng.state.lock_target = 5800e6
+    try:
+        eng._do_lock()
+        assert src.retune_calls >= 2, (
+            f"AFC at the limit must retune the reader, got {src.retune_calls}"
+        )
+        assert eng._afc == 0.0
+    finally:
+        eng._stop_reader()

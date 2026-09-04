@@ -82,7 +82,11 @@ def engine_cfg(**video_kw) -> dict:
         "afc_recenter_frac": 0.75,
         "width": 64,
         "spectrum_every": 10_000,
-        "min_lines": 250,
+        "min_lines": 200,
+        "average": 0.0,
+        "motion_thresh": 24.0,
+        "auto_levels": True,
+        "sharpen": 0.0,
     }
     video.update(video_kw)
     return {

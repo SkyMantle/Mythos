@@ -79,3 +79,30 @@ def test_freq_error_short_iq_is_zero():
 def test_shift_near_zero_offset_returns_same_object():
     iq = np.ones(8, dtype=np.complex64)
     assert demod.shift(iq, 0.0, 1e6) is iq
+
+
+def test_shift_moves_tone_to_dc_without_phase_walk():
+    """Integer phase accumulator must wrap cleanly; float-ramp mixers walk
+    off DC over a long capture and the LOCK channelizer then smears."""
+    fs = 8e6
+    offset = 1.234567e6
+    n = 1 << 18
+    t = np.arange(n, dtype=np.float64) / fs
+    iq = np.exp(2j * np.pi * offset * t).astype(np.complex64)
+    y = demod.shift(iq, offset, fs)
+    assert y.dtype == np.complex64
+    assert abs(demod.freq_error_hz(y[:16384], fs)) < 500
+    assert abs(demod.freq_error_hz(y[-16384:], fs)) < 500
+    # residual is a DC phasor: block means stay near unity, not rotate away
+    assert abs(np.mean(y[:4096])) > 0.9
+    assert abs(np.mean(y[-4096:])) > 0.9
+
+
+def test_shift_negative_offset_and_int_wrap():
+    fs = 4e6
+    offset = -750e3
+    n = 200_000  # n*K crosses 2**32 several times
+    t = np.arange(n, dtype=np.float64) / fs
+    iq = np.exp(2j * np.pi * offset * t).astype(np.complex64)
+    y = demod.shift(iq, offset, fs)
+    assert abs(demod.freq_error_hz(y, fs)) < 1e3
