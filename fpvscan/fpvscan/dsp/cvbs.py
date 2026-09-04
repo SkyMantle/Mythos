@@ -64,14 +64,17 @@ class PictureScore:
 
     def is_analog(self, min_corr: float = 0.25, require_lock: bool = False,
                   min_lines: int = 80) -> bool:
-        if self.lines < min_lines and not self.locked:
+        """Справжнє CVBS: рядки + схожість рядків (+ кадрова, якщо треба).
+
+        Сама кадрова синхра в шумі спрацьовує часто — «залочене» поле
+        зі снігу не має потрапляти в список. Кореляція рядків це і
+        відсікає: шум ~0, живе відео помітно додатне.
+        """
+        if self.lines < min_lines:
             return False
         if require_lock and not self.locked:
             return False
-        if self.row_corr >= min_corr:
-            return True
-        # слабке, але зібране поле — не ховаємо (типове 3G3 на межі С/Ш)
-        return bool(self.locked and self.lines >= min_lines)
+        return self.row_corr >= min_corr
 
 
 def row_correlation(luma: np.ndarray, pairs: int = 8) -> float:
@@ -143,6 +146,7 @@ class DecodeState:
     level_hi: float | None = None
     target_lines: int | None = None
     t0_err: float | None = None
+    h_roll: int | None = None        # зсув розгортки, якщо H-синхра в кадрі
 
 
 def _sync_edges(v: np.ndarray, thr: float):
@@ -194,6 +198,45 @@ def _genlock_starts(v: np.ndarray, t0: float, period: float, n_lines: int,
     # рвуть вертикалі. Де фронту немає — лишаємо прогноз.
     blended = 0.65 * corr + 0.35 * starts
     return np.where(found, blended, starts)
+
+
+def _h_unwrap(luma: np.ndarray, state: DecodeState | None) -> np.ndarray:
+    """Прибирає «ходіння» картинки, коли H-гасіння опинилось у кадрі.
+
+    Генлок шукає фронт лише в ±4.5% періоду; якщо t0 сів не на той
+    фронт, темна смуга синхри стоїть посередині і здається дрейфом
+    частоти. Крутимо растр так, щоб яма яскравості була на лівому краї.
+    """
+    if luma is None or luma.ndim != 2:
+        return luma
+    h, w = luma.shape
+    if w < 48 or h < 24:
+        return luma
+    col = luma.astype(np.float32).mean(axis=0)
+    ksz = max(7, (w // 48) | 1)
+    ker = np.ones(ksz, dtype=np.float32) / ksz
+    sm = np.convolve(col, ker, mode="same")
+    j = int(np.argmin(sm))
+    med = float(np.median(sm))
+    if med < 1.0 or sm[j] > med * 0.62:
+        j = 0
+    elif j <= int(w * 0.06) or j >= int(w * 0.94):
+        j = 0
+    if state is not None:
+        if state.h_roll is None:
+            state.h_roll = j
+        else:
+            prev = int(state.h_roll)
+            d = (j - prev + w // 2) % w - w // 2
+            state.h_roll = int(prev + 0.4 * d) % w
+        roll = int(state.h_roll)
+    else:
+        roll = j
+    if not roll:
+        return luma
+    # яма на лівому краї + ~12% рядка гасіння, яке інакше лишається смугою
+    extra = int(w * 0.12)
+    return np.roll(luma, -(roll + extra), axis=1)
 
 
 def _fit_height(luma: np.ndarray, target: int) -> np.ndarray:
@@ -260,7 +303,8 @@ def _render(v: np.ndarray, starts: np.ndarray, period: float,
         blur[:, 1:-1] = 0.25 * luma[:, :-2] + 0.5 * luma[:, 1:-1] + 0.25 * luma[:, 2:]
         luma = np.clip(luma + sharpen * (luma - blur), 0.0, 1.0)
 
-    return (luma * 255).astype(np.uint8)
+    out = (luma * 255).astype(np.uint8)
+    return _h_unwrap(out, state)
 
 
 def _attempt(v: np.ndarray, fs: float, width: int, max_lines: int,
@@ -536,6 +580,7 @@ def decode(base: np.ndarray, fs: float, width: int = 640,
         state.abs_t0 = abs_start + best_t0
         state.lost = 0
         state.t0_err = None
+        state.h_roll = None
         if state.target_lines is None:
             state.target_lines = max_lines
         best_f.luma = _fit_height(best_f.luma, state.target_lines)

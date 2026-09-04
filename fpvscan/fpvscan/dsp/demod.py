@@ -136,6 +136,31 @@ def freq_error_hz(iq: np.ndarray, fs: float) -> float:
     lo, hi = np.percentile(f[::8], [2.0, 98.0])
     return float((lo + hi) / 2.0)
 
+
+def blob_offset_hz(iq: np.ndarray, fs: float,
+                   dc_notch_hz: float = 300e3) -> float:
+    """Центр енергії ЧМ-плями відносно DC — дешеве FFT, без демодуляції.
+
+    На спідниці каналу ЧМ-похибка (перцентилі синхра/білий) бреше, а
+    спектральна «пляма» все ще показує, куди зсувати вікно. На вже
+    зведеному каналі ~0 означає, що AFC влучила в центр.
+    """
+    n = min(len(iq), 4096)
+    n = 1 << int(np.floor(np.log2(max(n, 2))))
+    if n < 256:
+        return 0.0
+    x = iq[:n]
+    sp = np.abs(np.fft.fftshift(np.fft.fft(x))) ** 2
+    freqs = np.fft.fftshift(np.fft.fftfreq(n, 1.0 / fs))
+    mask = np.abs(freqs) > dc_notch_hz
+    if not np.any(mask):
+        return 0.0
+    w = sp[mask]
+    s = float(w.sum())
+    if s < 1e-20:
+        return 0.0
+    return float(np.dot(freqs[mask], w) / s)
+
 def deemphasis(v: np.ndarray, fs: float, tau: float = 0.5e-6) -> np.ndarray:
     a = np.exp(-1.0 / (fs * tau))
     return signal.lfilter([1 - a], [1, -a], v).astype(np.float32)
