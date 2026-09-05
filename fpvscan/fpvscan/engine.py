@@ -78,6 +78,7 @@ class Engine:
         self._lock_n = 0
         self._acc: np.ndarray | None = None
         self._afc = 0.0
+        self._afc_hw = 0.0   # частина AFC, уже внесена в перебудову LO
         self._sweep_i = 0
         self._timings: dict[str, float] = {}   # ковзне середнє по етапах, мс
         self._frame_ts: float | None = None    # час минулого відданого кадру
@@ -148,6 +149,7 @@ class Engine:
         if name == "lock":
             self._acc = None
             self._afc = 0.0
+            self._afc_hw = 0.0
             self._lock_tuned = None
             self.state.lock_target = float(kw["freq_hz"])
             self.state.mode = "LOCK"
@@ -156,6 +158,8 @@ class Engine:
             self.state.lock_target = None
             self.state.mode = "SWEEP"
             self.state.auto = False
+            self._afc = 0.0
+            self._afc_hw = 0.0
             self._stop_reader()
         elif name == "clear":
             self._peeked.clear()
@@ -497,6 +501,8 @@ class Engine:
             return
         self._peeked[key] = now
         self._lock_tuned = None
+        self._afc = 0.0
+        self._afc_hw = 0.0
         self.state.lock_target = det.freq_hz
         self.state.mode = "LOCK"
         self.state.auto = True
@@ -610,7 +616,11 @@ class Engine:
         # пливе постійно. Тепер AFC компенсується нижче цифровим
         # зсувом каналайзера, а фізична перебудова лишається рідкісною
         # подією (див. afc_recenter_frac нижче).
-        want = f + off
+        # LO = канал + фіксований off + уже внесена апаратна AFC.
+        # Без _afc_hw повторна перебудова завжди цілилась у f+off+цифрове
+        # і з'їдала попередній зсув — при помилці більшій за lim LOCK
+        # крутився на одному й тому ж LO і скидав DecodeState щокадру.
+        want = f + off + self._afc_hw
         if self._ring is None or self._lock_tuned != want:
             self._start_reader(want, fs, ring_s)
  
@@ -649,38 +659,36 @@ class Engine:
             err = demod.freq_error_hz(base_iq, fs_ch)
             lim = float(vcfg.get("afc_limit_hz", 8e6))
             # Цифровий зсув має лишатися в межах смуги Найквіста сирого
-            # потоку разом із фіксованим off і половиною ch_bw — інакше
-            # channelize() або накладеться сама на себе, або зачепить
-            # сусідню ділянку спектра. Той самий запобіжник, що вже
-            # стоїть для статичного off вище, тепер застосований і до
-            # динамічної частини (afc).
-            safe_lim = max(0.0, fs * 0.45 - abs(off) - ch_bw / 2)
+            # потоку разом із фіксованим off. Віднімати ch_bw/2 варто
+            # лише коли каналайзер справді децимує (dec>1): при dec==1
+            # смуга лишається повною, а ch_bw на типовому 5.8 ГГц
+            # (20–27 МГц + 12 МГц запас) обнуляв lim і вбивав AFC.
+            half_win = 0.0 if dec <= 1 else ch_bw / 2.0
+            safe_lim = max(0.0, fs * 0.45 - abs(off) - half_win)
             lim = min(lim, safe_lim)
             dead = float(vcfg.get("afc_deadband_hz", 150e3))
+            proposed = self._afc
             if abs(err) > dead:
                 gain = float(vcfg.get("afc_gain", 0.5))
-                self._afc = max(-lim, min(lim, self._afc + err * gain))
- 
+                proposed = self._afc + err * gain
+                self._afc = max(-lim, min(lim, proposed))
+
             # Накопичений цифровий дрейф час від часу варто «звільнити»
             # фізичною перебудовою — інакше при наближенні до ліміту
             # канал зʼїжджає до краю вікна каналайзера і SNR просідає.
-            # Це той самий retune, що раніше був на кожному afc-кроці,
-            # але тепер рідкісний, тож повʼязаний з ним скид
-            # DecodeState() майже не заважає трекінгу (а якщо і
-            # зачепить один кадр — lost-лічильник у cvbs.decode() сам
-            # відновиться протягом ≤3 викликів).
+            # Зсув складаємо в _afc_hw, а не цілимось знову від f+off:
+            # інакше друга перебудова забуває першу.
+            # Якщо lim==0, clamp щойно занулив _afc — беремо proposed,
+            # інакше гілка «нема запасу» ніколи не спрацьовує.
             recenter_frac = float(vcfg.get("afc_recenter_frac", 0.75))
+            apply_hw = 0.0
             if lim > 0 and abs(self._afc) > lim * recenter_frac:
-                self._start_reader(f + off + self._afc, fs, ring_s)
-                self._lock_tuned = want
-                self._afc = 0.0
-            elif lim <= 0 and self._afc != 0.0:
-                # Запасу цифрового зсуву взагалі нема (вузький fs чи
-                # широкий канал) — одразу віддаємо корекцію в
-                # перебудову, інакше clamp занулить afc і дрейф
-                # перестане компенсуватись.
-                self._start_reader(f + off + self._afc, fs, ring_s)
-                self._lock_tuned = want
+                apply_hw = self._afc
+            elif lim <= 0 and proposed != 0.0:
+                apply_hw = proposed
+            if apply_hw:
+                self._afc_hw += apply_hw
+                self._start_reader(f + off + self._afc_hw, fs, ring_s)
                 self._afc = 0.0
         t = self._mark("afc", t)
  
@@ -771,6 +779,7 @@ class Engine:
             self.state.mode = "SWEEP"
             self._acc = None
             self._afc = 0.0
+            self._afc_hw = 0.0
             self._stop_reader()        # звільняємо src перед _do_sweep()
  
     def snapshot(self) -> dict:
