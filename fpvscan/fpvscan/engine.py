@@ -334,6 +334,10 @@ class Engine:
         return fast(f, n) if fast else self.src.retune_and_read(f, n)
  
     def _do_sweep(self):
+        if self._reader_alive():
+            self._stop_reader()
+            if self._reader_alive():
+                return
         scan = self.cfg["scan"]
         fs = float(scan["sample_rate"])
         if not getattr(self.src, "fixed_freq", False) and \
@@ -531,35 +535,57 @@ class Engine:
         приймача на час декодування.
         """
         self._stop_reader()
+        if self._reader_alive():
+            # Стара нитка все ще всередині src.read() — чіпати
+            # приймач звідси не можна (див. _reader_join_s).
+            raise RuntimeError("нитка читання IQ не зупинилась")
         first = self.src.retune_and_read(want, max(2048, int(fs * 0.01)))
-        self._ring = IQRingBuffer(capacity=max(len(first), int(fs * ring_seconds)))
-        self._ring.write(first)
+        ring = IQRingBuffer(capacity=max(len(first), int(fs * ring_seconds)))
+        ring.write(first)
+        self._ring = ring
         self._reader_stop = threading.Event()
         self._reader_err = None
         self._reader_thread = threading.Thread(
-            target=self._reader_loop, args=(fs,), daemon=True)
+            target=self._reader_loop, args=(fs, ring), daemon=True)
         self._reader_thread.start()
         self._lock_tuned = want
         self._lock_state = cvbs.DecodeState()
         self._lock_dec = None
- 
+
+    def _reader_join_s(self) -> float:
+        """Скільки чекати, поки нитка читання вийде з src.read().
+
+        BladeRF.sync_rx тримає пристрій до timeout_ms (типово 3.5 с),
+        після таймауту ще раз стільки ж на повтор, а _recover() після
+        зриву USB спить ~8 с. Старий join(2) був коротший за всі ці
+        шляхи: _start_reader() тоді перебудовував той самий хендл, поки
+        стара нитка ще була в libbladeRF. Контракт джерела — один
+        потік-власник; sync_config під час летючого USB вішає NIOS.
+        """
+        ms = float(getattr(self.src, "timeout_ms", 3500.0) or 3500.0)
+        return max(20.0, ms / 1000.0 * 2.0 + 12.0)
+
+    def _reader_alive(self) -> bool:
+        t = self._reader_thread
+        return t is not None and t.is_alive()
+
     def _stop_reader(self):
-        if self._reader_thread is not None:
+        t = self._reader_thread
+        if t is not None:
             self._reader_stop.set()
-            self._reader_thread.join(timeout=2)
+            t.join(timeout=self._reader_join_s())
+            if t.is_alive():
+                return
         self._reader_thread = None
         self._ring = None
- 
-    def _reader_loop(self, fs: float):
+
+    def _reader_loop(self, fs: float, ring: IQRingBuffer):
         chunk = max(1024, int(fs * 0.005))     # 5 мс за раз
         while not self._reader_stop.is_set():
             try:
                 iq = self.src.read(chunk)
             except Exception as e:
                 self._reader_err = e
-                return
-            ring = self._ring
-            if ring is None:
                 return
             ring.write(iq)
  
@@ -574,6 +600,8 @@ class Engine:
         # і ніколи не утримує картинку.
         if abs(float(self.src.sample_rate) - fs_want) > 1.0:
             self._stop_reader()          # нитка читала на старій fs — перезапуск
+            if self._reader_alive():
+                raise RuntimeError("нитка читання IQ не зупинилась")
             self.src.set_sample_rate(fs_want)
         fs = float(self.src.sample_rate) or fs_want
  
