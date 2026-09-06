@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 import time
 from pathlib import Path
 from queue import Queue
@@ -136,6 +137,90 @@ def test_run_writes_actual_rate_into_cfg():
     assert cfg["video"]["sample_rate"] == actual
 
 
+class _SlowReadSource(_Source):
+    """read() hangs past the old 2 s join, like bladeRF sync_rx / _recover."""
+
+    def __init__(self, requested_fs: float, actual_fs: float, block_s: float):
+        super().__init__(requested_fs, actual_fs)
+        self.block_s = block_s
+        self._gate = threading.Lock()
+        self.in_flight = 0
+        self.max_in_flight = 0
+        self.entered = threading.Event()
+
+    def _enter(self):
+        with self._gate:
+            self.in_flight += 1
+            self.max_in_flight = max(self.max_in_flight, self.in_flight)
+
+    def _leave(self):
+        with self._gate:
+            self.in_flight -= 1
+
+    def read(self, n: int) -> np.ndarray:
+        self._enter()
+        self.entered.set()
+        try:
+            time.sleep(self.block_s)
+            return np.zeros(int(n), dtype=np.complex64)
+        finally:
+            self._leave()
+
+    def retune_and_read(self, hz: float, n: int) -> np.ndarray:
+        # Counts as using the device: must not overlap an in-flight read().
+        self._enter()
+        try:
+            self.retune_calls += 1
+            return np.zeros(int(n), dtype=np.complex64)
+        finally:
+            self._leave()
+
+
+def test_start_reader_waits_out_in_flight_read():
+    """AFC recenter / channel change must not touch src during sync_rx.
+
+    BladeRF.read() can block for timeout_ms (3.5 s) plus _recover() sleeps
+    (~8 s). _stop_reader used to join(2) and then _start_reader retuned
+    the same handle — two owner threads, which the SDR contract forbids
+    and which hangs NIOS if sync_config runs mid-transfer.
+    """
+    want = 2_000_000.0
+    src = _SlowReadSource(want, want, block_s=2.3)
+    eng = Engine(src, _cfg(want), Queue())
+    try:
+        eng._start_reader(5800e6, want, 0.05)
+        assert src.entered.wait(1.0), "reader never entered src.read"
+        eng._start_reader(5801e6, want, 0.05)
+        assert src.max_in_flight == 1, (
+            f"src was used from two threads at once "
+            f"(max in-flight={src.max_in_flight})"
+        )
+    finally:
+        eng._stop_reader()
+
+
+def test_start_reader_refuses_if_join_times_out():
+    """A wedged read must not be abandoned so a second thread can use src."""
+    want = 2_000_000.0
+    src = _SlowReadSource(want, want, block_s=0.5)
+    eng = Engine(src, _cfg(want), Queue())
+    eng._reader_join_s = lambda: 0.05  # type: ignore[method-assign]
+    try:
+        eng._start_reader(5800e6, want, 0.05)
+        assert src.entered.wait(1.0)
+        raised = False
+        try:
+            eng._start_reader(5801e6, want, 0.05)
+        except RuntimeError as e:
+            raised = True
+            assert "IQ" in str(e) or "читання" in str(e)
+        assert raised, "second start must refuse while the old read owns src"
+        assert src.max_in_flight == 1
+    finally:
+        eng._reader_join_s = lambda: 2.0  # type: ignore[method-assign]
+        eng._stop_reader()
+
+
 def test_manual_lock_listener_is_registered_once():
     """Heartbeat applyState() раніше вішав новий keydown щодва секунди."""
     html = (Path(__file__).resolve().parents[1]
@@ -151,5 +236,7 @@ if __name__ == "__main__":
     test_lock_keeps_reader_when_fs_off_by_fraction()
     test_lock_retunes_when_fs_really_changes()
     test_run_writes_actual_rate_into_cfg()
+    test_start_reader_waits_out_in_flight_read()
+    test_start_reader_refuses_if_join_times_out()
     test_manual_lock_listener_is_registered_once()
     print("OK")
