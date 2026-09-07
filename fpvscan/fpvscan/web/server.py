@@ -10,13 +10,15 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from fpvscan import engine
+from fpvscan.app.bootstrap import attach_test_api
+from fpvscan.web.coalesce import coalesce_ws_events
 
 STATIC = Path(__file__).parent / "static"
 
 
 def create_app(engine) -> FastAPI:
     app = FastAPI(title="FPV Scan")
+    attach_test_api(app, engine)
     clients: set[WebSocket] = set()
 
     app.mount("/static", StaticFiles(directory=STATIC), name="static")
@@ -84,22 +86,32 @@ def create_app(engine) -> FastAPI:
             except Exception:
                 await asyncio.sleep(0.1)
                 continue
-            if ev["type"] == "frame":
-                ev["data"]["img"] = base64.b64encode(ev["data"]["img"]).decode()
-            msg = json.dumps(ev)
-            dead = []
-            for c in list(clients):
+            batch = [ev]
+            while True:
                 try:
-                    await c.send_text(msg)
-                except Exception:
-                    dead.append(c)
-            for c in dead:
-                clients.discard(c)
+                    batch.append(q.get_nowait())
+                except Empty:
+                    break
+            for item in coalesce_ws_events(batch):
+                if item["type"] == "frame":
+                    raw = item["data"].get("img")
+                    if isinstance(raw, (bytes, bytearray)):
+                        item["data"]["img"] = base64.b64encode(raw).decode()
+                msg = json.dumps(item)
+                dead = []
+                for c in list(clients):
+                    try:
+                        await c.send_text(msg)
+                    except Exception:
+                        dead.append(c)
+                for c in dead:
+                    clients.discard(c)
 
     async def heartbeat():
         while True:
             await asyncio.sleep(2)
-            msg = json.dumps({"type": "state", "data": engine.snapshot()})
+            snap = engine.snapshot()
+            msg = json.dumps({"type": "state", "data": snap})
             for c in list(clients):
                 try:
                     await c.send_text(msg)

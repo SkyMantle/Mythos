@@ -105,10 +105,16 @@ def find_occupied(psd: np.ndarray, center_hz: float, fs: float,
         bw = (j - i) * bin_hz
         if bw >= min_bw_hz:
             seg = view[i:j]
-            lo = (guard + i - nfft / 2) * bin_hz
-            hi = (guard + j - nfft / 2) * bin_hz
+            local = int(np.argmax(seg))
+            frac = 0.0
+            if 0 < local < len(seg) - 1:
+                y0, y1, y2 = float(seg[local - 1]), float(seg[local]), float(seg[local + 1])
+                denom = y0 - 2.0 * y1 + y2
+                if abs(denom) > 1e-6:
+                    frac = float(np.clip(0.5 * (y0 - y2) / denom, -0.5, 0.5))
+            peak_bin = guard + i + local + frac
             out.append(Occupancy(
-                center_hz=center_hz + (lo + hi) / 2,
+                center_hz=center_hz + (peak_bin - nfft / 2) * bin_hz,
                 bandwidth_hz=bw,
                 peak_db=float(seg.max()),
                 snr_db=float(seg.max() - nf),

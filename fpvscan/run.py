@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 """Точка входу. Однаково запускається на Windows і на Pi 5."""
+import os
+# До імпорту numpy: на Pi 5 чотири ядра — DSP + USB + BLAS. Без ліміту
+# hunt/decode роздувають OpenBLAS на всі ядра і LOCK падає до ~3 к/с.
+if not os.environ.get("OPENBLAS_NUM_THREADS") and not os.environ.get("OMP_NUM_THREADS"):
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "2")
+    os.environ.setdefault("OMP_NUM_THREADS", "2")
+    os.environ.setdefault("MKL_NUM_THREADS", "2")
+
 import argparse
 import queue
 import sys

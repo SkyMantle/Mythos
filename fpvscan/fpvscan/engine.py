@@ -25,7 +25,9 @@ import numpy as np
  
 from .bands import PRIORITY_BANDS, band_of, nearest_channel
 from .dsp import spectrum, demod, cvbs
-from . import paths
+from .dsp.field_blend import blend_same_field
+from . import paths, scan_hits, scan_view
+from .web.coalesce import enqueue_live_event
 from .recorder import VideoRecorder, FfmpegMissing
  
  
@@ -87,11 +89,27 @@ class Engine:
         self._hunt_th: threading.Thread | None = None
         self._hunt_out: float | None = None
         self._hunt_note: tuple[float, float, float] | None = None
+        self._lock_score_peak = 0.0                # hunt лише коли оцінка впала
         self._insp_dbg: list[dict] = []
         self._sweep_i = 0
         self._timings: dict[str, float] = {}   # ковзне середнє по етапах, мс
         self._frame_ts: float | None = None    # час минулого відданого кадру
         self._fps_ema = 0.0
+        self._last_video: dict | None = None
+        self._last_frame_ref: str | None = None
+        self._last_spectrum: dict | None = None
+        self._recent_hz: list[float] = []
+        self._acc_parity: int | None = None
+        self._spec_ts: float | None = None
+        self._spec_rate = 0.0
+        self._next_hz: float | None = None
+        self._dwell_ms = 0.0
+        self._afc_pegged = False
+        self._afc_nudge = False
+        self._afc_peg_n = 0
+        self._hunt_span = 0.25e6
+        self._dense_q: list[float] = []
+        self._dense_seen: set[int] = set()
  
     # ---------- зовнішнє API ----------
  
@@ -120,26 +138,11 @@ class Engine:
  
     def _emit(self, kind: str, payload):
         """Кладе подію в чергу до веб-шару.
- 
-        Черга обмежена, і без підключеного клієнта вона забивається
-        спектрами. Кадри при цьому губитись не мають, тому під них
-        місце звільняється за рахунок найстаріших подій.
+
+        Черга обмежена. Кадр і спектр завжди лишають останній знімок
+        (drop-to-latest); інакше LOCK-відео витісняє FFT і смуга замирає.
         """
-        ev = {"type": kind, "data": payload}
-        try:
-            self.events.put_nowait(ev)
-        except Exception:
-            if kind != "frame":
-                return
-            for _ in range(8):
-                try:
-                    self.events.get_nowait()
-                except Empty:
-                    break
-            try:
-                self.events.put_nowait(ev)
-            except Exception:
-                pass
+        enqueue_live_event(self.events, {"type": kind, "data": payload})
  
     def _drain_commands(self):
         while True:
@@ -157,22 +160,38 @@ class Engine:
     def _handle_command(self, name: str, kw: dict):
         if name == "lock":
             self._acc = None
+            self._acc_parity = None
             self._afc = 0.0
             self._last_err = 0.0
             self._hunt_out = None
             self._hunt_note = None
+            self._lock_score_peak = 0.0
             self._lock_tuned = None
             self._lock_n = 0
             self._lock_gen += 1
+            self._afc_pegged = False
+            self._afc_nudge = False
+            self._afc_peg_n = 0
             self.state.lock_target = float(kw["freq_hz"])
+            self.state.tuned_hz = float(kw["freq_hz"])
             self.state.mode = "LOCK"
             self.state.auto = False
+            self._last_spectrum = {
+                "bins": None,
+                "center_hz": float(kw["freq_hz"]),
+                "span_hz": float(self.cfg.get("video", {}).get("sample_rate") or 0),
+                "floor_db": None,
+                "peak_db": None,
+                "nfft": 2048,
+            }
+            self._emit("spectrum", self._spectrum_view())
         elif name == "sweep":
             self.state.lock_target = None
             self.state.mode = "SWEEP"
             self.state.auto = False
             self._afc = 0.0
             self._lock_gen += 1
+            self._lock_score_peak = 0.0
             self._stop_reader()
         elif name == "clear":
             self._peeked.clear()
@@ -221,6 +240,7 @@ class Engine:
             self._emit("notice", {"level": "error", "text": str(e)})
             return
         self._rec = r
+        self._last_frame_ref = f"out/video/{name}"
         self._emit("notice", {"level": "ok", "text": f"запис: {name}"})
  
     def _rec_stop(self):
@@ -228,6 +248,9 @@ class Engine:
             return
         st = self._rec.stop()
         self._rec = None
+        path = st.get("path")
+        if path:
+            self._last_frame_ref = f"out/video/{Path(path).name}"
         self._emit("notice", {"level": "ok", "text":
                    f"{Path(st['path']).name}: {st['bytes']/1e6:.2f} МБ, "
                    f"{st['seconds']} с, {st['kbps']} кбіт/с"})
@@ -253,6 +276,7 @@ class Engine:
         name = paths.stamped("shot", "webp", self.state.lock_target)
         dst = paths.ensure(paths.PHOTOS / name)
         dst.write_bytes(cvbs.encode(frame, "webp", 90, height=576))
+        self._last_frame_ref = f"out/photos/{name}"
         self._emit("notice", {"level": "ok", "text":
                    f"знімок: {name} ({dst.stat().st_size/1024:.1f} КБ)"})
  
@@ -313,32 +337,77 @@ class Engine:
     def _sweep_plan(self) -> list[float]:
         """Точки перебудови: суцільний прохід плюс повторний обхід
         пріоритетних діапазонів, щоб борти ловились швидше."""
-        scan = self.cfg["scan"]
-        fs = float(scan["sample_rate"])
         if getattr(self.src, "fixed_freq", False):
             return [self.src.center_freq]
- 
-        # Крок не можна брати рівним смузі: канал шириною 20 МГц, що
-        # ліг на стик двох кроків, у кожному з них видно лише наполовину
-        # і він може не набрати порогу. Тому від корисної смуги
-        # віднімаємо половину очікуваної ширини каналу.
-        ch_bw = float(scan.get("channel_bw_hz", 20e6))
-        step = float(scan.get("step_hz", 0)) or max(fs * 0.25,
-                                                    fs * 0.9 - ch_bw / 2)
-        pts = list(np.arange(float(scan["start_hz"]) + fs / 2,
-                             float(scan["stop_hz"]), step))
-        if scan.get("priority_bands", True):
-            prio = []
-            for b in PRIORITY_BANDS:
-                prio += list(np.arange(b.start_hz + fs / 2, b.stop_hz, step))
-            # чергуємо: 1 крок суцільного скану на 1 пріоритетний
-            merged = []
-            for i, p in enumerate(pts):
-                merged.append(p)
-                if prio:
-                    merged.append(prio[i % len(prio)])
-            return merged
-        return pts
+        scan = self.cfg["scan"]
+        prio = PRIORITY_BANDS if scan.get("priority_bands", True) else None
+        return scan_view.sweep_centers(scan, priority_bands=prio)
+
+    def _publish_spectrum(self, center_hz: float, span_hz: float,
+                          bins: list, floor_db: float, nfft: int) -> None:
+        peak = max(bins) if bins else None
+        now = time.perf_counter()
+        if self._spec_ts is not None:
+            dt = now - self._spec_ts
+            if dt > 0:
+                inst = 1.0 / dt
+                self._spec_rate = inst if self._spec_rate == 0 else (
+                    self._spec_rate * 0.7 + inst * 0.3)
+                self._dwell_ms = dt * 1000
+        self._spec_ts = now
+        self._last_spectrum = {
+            "bins": bins,
+            "center_hz": float(center_hz),
+            "span_hz": float(span_hz),
+            "floor_db": float(floor_db),
+            "peak_db": None if peak is None else round(float(peak), 1),
+            "nfft": int(nfft),
+            "rate_hz": round(self._spec_rate, 2) if self._spec_rate else None,
+            "t_mono_ms": scan_view.mono_ms(),
+        }
+        spec = self._spectrum_view()
+        spec["grid"] = self._grid_view()
+        self._emit("spectrum", spec)
+
+    def _spectrum_view(self, t_mono_ms: int | None = None) -> dict:
+        view = scan_view.spectrum_snapshot(
+            self.cfg,
+            mode=self.state.mode,
+            lock_target=self.state.lock_target,
+            tuned_hz=self.state.tuned_hz,
+            last=self._last_spectrum,
+            afc_hz=self._afc,
+            next_hz=self._next_hz,
+            dwell_ms=self._dwell_ms or None,
+            t_mono_ms=t_mono_ms,
+        )
+        view["afc_pegged"] = bool(self._afc_pegged)
+        view["freq_err_hz"] = round(self._last_err, 0)
+        view["afc_hz"] = round(self._afc, 0)
+        view["hunt_span_hz"] = float(self._hunt_span)
+        return view
+
+    def _grid_view(self, t_mono_ms: int | None = None) -> dict:
+        scan = self.cfg.get("scan") or {}
+        prio = PRIORITY_BANDS if scan.get("priority_bands", True) else None
+        if getattr(self.src, "fixed_freq", False):
+            prio = None
+        return scan_view.grid_snapshot(
+            self.cfg,
+            mode=self.state.mode,
+            sweep_i=self._sweep_i,
+            sweeps_done=self.state.sweeps_done,
+            sweep_pos_hz=self.state.sweep_pos_hz,
+            tuned_hz=self.state.tuned_hz,
+            lock_target=self.state.lock_target,
+            visiting_hz=list(self._recent_hz),
+            priority_bands=prio,
+            plan_len=1 if getattr(self.src, "fixed_freq", False) else None,
+            afc_hz=self._afc,
+            next_hz=self._next_hz,
+            dwell_ms=self._dwell_ms or None,
+            t_mono_ms=t_mono_ms,
+        )
  
     def _grab(self, f: float, n: int):
         fast = getattr(self.src, "retune_and_read_fast", None)
@@ -356,19 +425,29 @@ class Engine:
         need = nfft * avg
  
         plan = self._sweep_plan()
-        if self._sweep_i >= len(plan):
+        if self._sweep_i >= len(plan) and not self._dense_q:
             self._sweep_i = 0
             self.state.sweeps_done += 1
- 
-        while self._sweep_i < len(plan):
+            self._dense_seen.clear()
+
+        while self._dense_q or self._sweep_i < len(plan):
             if self._stop.is_set():
                 return
             self._drain_commands()
             if self.state.mode == "LOCK":
                 return
- 
-            f = plan[self._sweep_i]
-            self._sweep_i += 1
+
+            if self._dense_q:
+                f = float(self._dense_q.pop(0))
+            else:
+                f = plan[self._sweep_i]
+                self._sweep_i += 1
+            if self._dense_q:
+                self._next_hz = float(self._dense_q[0])
+            elif self._sweep_i < len(plan):
+                self._next_hz = float(plan[self._sweep_i])
+            else:
+                self._next_hz = float(plan[0]) if plan else None
             if self._stop.is_set():
                 return
             self._drain_commands()
@@ -380,26 +459,57 @@ class Engine:
             psd = spectrum.psd_db(iq, nfft, avg)
             self.state.tuned_hz = f
             self.state.sweep_pos_hz = f
+            self._recent_hz.append(float(f))
+            if len(self._recent_hz) > 8:
+                self._recent_hz = self._recent_hz[-8:]
  
-            self._emit("spectrum", {
-                "center_hz": f, "span_hz": fs,
-                "bins": spectrum.downsample_for_display(psd, 384),
-                "floor_db": round(spectrum.noise_floor_db(psd), 1),
-            })
+            self._publish_spectrum(
+                f, fs, spectrum.downsample_for_display(psd, 384),
+                round(spectrum.noise_floor_db(psd), 1), nfft,
+            )
  
             occ = spectrum.find_occupied(
                 psd, f, fs,
                 threshold_db=float(scan.get("threshold_db", 8)),
                 min_bw_hz=float(scan.get("min_bw_hz", 4e6)),
                 dc_notch_hz=float(scan.get("dc_notch_hz", 200e3)))
+            hit_tol = float(scan.get("hit_tol_hz", scan_view.SWEEP_HIT_TOL_HZ))
  
+            min_bw = float(scan.get("min_bw_hz", 5e6))
+            max_bw = float(scan.get("max_bw_hz", 25e6))
             for o in occ:
-                # Нижню межу тримаємо ~4 МГц: реальний передавач на
-                # стенді дав 4.3 МГц, а 2.7 МГц — типові шпори/гармоніки.
-                if not (6.0e6 <= o.bandwidth_hz <= 35e6):
-                    continue          # 4–5 МГц на 4 ГГц — шпори, не FPV
+                # Відео ~5–15 МГц; 2.7/4 МГц — шпори. Жорсткі 6 МГц
+                # ховали живий аналог ~5 МГц. Верх — ЧМ-розмазка, не весь крок.
+                near = abs(o.center_hz - f) <= hit_tol
+                self._queue_cluster_dense(o.center_hz, f, scan)
+                if not (min_bw <= o.bandwidth_hz <= max_bw):
+                    # 3487 vs 3489: keep a slightly narrow blob next to the dwell.
+                    if not (near and o.bandwidth_hz >= 0.6 * min_bw and o.snr_db >= 8):
+                        continue
                 self._inspect(iq, f, fs, o)
                 self._lock_tuned = None
+
+    def _queue_cluster_dense(self, peak_hz: float, dwell_hz: float, scan: dict) -> None:
+        """Insert 4 MHz extras around a cluster hit. No second full-band pass."""
+        if len(self._dense_q) >= 48:
+            return
+        bucket = int(round(float(peak_hz) / 4.0e6))
+        if bucket in self._dense_seen:
+            return
+        extras = scan_view.extras_for_hit(dwell_hz, peak_hz, scan)
+        if not extras:
+            return
+        self._dense_seen.add(bucket)
+        have = {int(round(h / 1e6)) for h in self._dense_q}
+        have.add(int(round(float(dwell_hz) / 1e6)))
+        for hz in extras:
+            key = int(round(hz / 1e6))
+            if key in have:
+                continue
+            have.add(key)
+            self._dense_q.append(hz)
+            if len(self._dense_q) >= 48:
+                break
  
  
  
@@ -412,6 +522,12 @@ class Engine:
         15.7 кГц, потрібні десятки її періодів, тобто ~20+ мс ефіру.
         Тому тут робиться окреме, довше захоплення.
         """
+        # Same bins, fresh stamp so the scan playhead can lerp through inspect.
+        stamp = scan_view.mono_ms()
+        self._emit("spectrum", {
+            **self._spectrum_view(t_mono_ms=stamp),
+            "grid": self._grid_view(t_mono_ms=stamp),
+        })
         insp_s = float(self.cfg["scan"].get("inspect_ms", 25)) / 1000
         sc = self.cfg["scan"]
         try:
@@ -440,14 +556,18 @@ class Engine:
         accepted = score.is_video
         pic = None
         best_off = 0.0
-        # Димова перевірка CVBS на кількох цифрових зсувах: центр
-        # зайнятості часто є спідницею/шпорою, а картинка — на 1–2 МГц
-        # осторонь. Обходу по spectral-впевненості немає (ним пролазив
-        # 5018). Шум відсікає кореляція рядків, не «чи є кадрова».
+        # Димова перевірка — м'який фільтр, не veto всього списку.
+        # Кадр на будь-якому цифровому зсуві = беремо. Інакше PAL/NTSC
+        # у смузі ~5–15 МГц, але не 12 МГц пляма лише з енергії (5018).
         if accepted and sc.get("inspect_decode", True):
             ok, pic, best_off = self._inspect_offsets(iq, fs, out_bw, occ, sc)
-            if not ok:
+            if ok:
+                pass
+            elif self._inspect_soft(score, occ, pic, sc):
+                best_off = 0.0
+            else:
                 accepted = False
+                best_off = 0.0
 
         # Кожен кандидат, що пройшов спектральний відбір, віддається
         # назовні разом із причиною рішення. Без цього неможливо
@@ -500,8 +620,9 @@ class Engine:
         """
         sc = self.cfg["scan"]
         vcfg = self.cfg.get("video", {})
+        # вужче за LOCK: INSPECT лише питає «чи є картинка», не OSD
         fr = cvbs.decode(demod.deemphasis(base, fs), fs,
-                         width=int(vcfg.get("width", 640)),
+                         width=min(320, int(vcfg.get("width", 640))),
                          state=None,
                          auto_levels=bool(vcfg.get("auto_levels", True)),
                          sharpen=0.0)
@@ -537,10 +658,38 @@ class Engine:
         })
         self._insp_dbg = self._insp_dbg[-12:]
 
-    def _inspect_offsets(self, iq, fs, out_bw, occ, sc):
-        """Шукає відео-кращий цифровий зсув у вже знятому INSPECT-IQ.
+    def _inspect_soft(self, score, occ, pic, sc) -> bool:
+        """Спектральний обхід, коли 40 мс не зібрали кадр.
 
-        Повертає (ok, pic, offset_hz). Без повторної перебудови приймача.
+        3080/4988: PAL/NTSC + підйом + смуга ~5–15 МГц.
+        5018: пляма ~12 МГц лише з енергії / заложений сніг — ні.
+        """
+        if score.standard not in ("PAL", "NTSC"):
+            return False
+        bw = float(occ.bandwidth_hz)
+        if not (5.0e6 <= bw <= 15.0e6):
+            return False
+        corr = 0.0 if pic is None else float(pic.row_corr)
+        # растр зібрався, але рядки — шум: спідниця 5018, не «decode не встиг»
+        min_lines = int(sc.get("inspect_min_lines", 80))
+        if pic is not None and pic.lines >= min_lines and corr < 0.06:
+            return False
+        insp_bw = float(sc.get("inspect_bw_hz", 12e6))
+        if bw >= 0.90 * insp_bw and corr < 0.08:
+            return False
+        prom = float(sc.get("line_prominence_db", 10))
+        if score.prominence_db < prom:
+            return False
+        bypass = float(sc.get("inspect_conf_bypass", 0.70))
+        if score.confidence >= bypass:
+            return True
+        return int(score.harmonics) >= 1
+
+    def _inspect_offsets(self, iq, fs, out_bw, occ, sc):
+        """Шукає відео на кількох цифрових зсувах у вже знятому IQ.
+
+        Беремо ПЕРШИЙ зсув із живим кадром; сніг (високий score через
+        кадрову без corr) не перебиває. Без повторної перебудови RF.
         """
         trials = [0.0]
         for m in sc.get("inspect_offsets_mhz") or [1.0, 2.0]:
@@ -552,10 +701,14 @@ class Engine:
             ch, fs2 = demod.channelize(iq, fs, mix, out_bw_hz=out_bw)
             base = demod.fm_demod(ch, fs2, deviation_hz=max(occ.bandwidth_hz, 8e6) / 5)
             ok, pic = self._decode_confirm(base, fs2)
-            if best_pic is None or pic.value > best_pic.value:
-                best_ok, best_pic, best_off = ok, pic, mix
-                if ok and pic.value >= 0.55:
-                    break
+            if ok:
+                if not best_ok or pic.value > best_pic.value:
+                    best_ok, best_pic, best_off = True, pic, mix
+                    if pic.value >= 0.40 or pic.row_corr >= 0.18:
+                        break
+                continue
+            if not best_ok and (best_pic is None or pic.value > best_pic.value):
+                best_pic, best_off = pic, mix
         return best_ok, best_pic, best_off
 
     MERGE_TOL_HZ = 8e6
@@ -618,7 +771,9 @@ class Engine:
         # Одноразовий спалах у шумі не показуємо: справжній передавач
         # нікуди не подінеться і підтвердиться наступним проходом.
         if det.hits >= int(self.cfg["scan"].get("confirm_hits", 2)):
-            self._emit("detection", asdict(det))
+            if any(abs(float(d["freq_hz"]) - det.freq_hz) < 1.0
+                   for d in self._published_detections()):
+                self._emit("detection", asdict(det))
             self._maybe_peek(det)
  
     def _maybe_peek(self, det: Detection):
@@ -641,9 +796,12 @@ class Engine:
             return
         self._peeked[key] = now
         self._lock_tuned = None
+        self._acc = None
+        self._acc_parity = None
         self._afc = 0.0
         self._lock_n = 0
         self._lock_gen += 1
+        self._lock_score_peak = 0.0
         self.state.lock_target = det.freq_hz
         self.state.mode = "LOCK"
         self.state.auto = True
@@ -728,8 +886,9 @@ class Engine:
                          vcfg: dict) -> float:
         """Стеля |цифрового AFC|: запас Найквіста. Далі — стоп, не RF."""
         lim = float(vcfg.get("afc_limit_hz", 20e6))
+        cap = float(vcfg.get("afc_digital_max_hz", 1.5e6))
         nyq = max(0.0, fs * 0.45 - abs(off) - ch_bw / 2)
-        return min(lim, nyq)
+        return min(lim, nyq, cap)
 
     def _video_ok_for_afc(self, frame: cvbs.Frame | None) -> bool:
         """AFC лише коли вже видно відео — на снігу freq_error бреше."""
@@ -749,15 +908,47 @@ class Engine:
         err = demod.freq_error_from_demod(base, deviation)
         self._last_err = err
         dead = float(vcfg.get("afc_deadband_hz", 80e3))
-        if abs(err) <= dead:
-            return
         dig_lim = self._digital_afc_lim(fs, off, ch_bw, vcfg)
-        if dig_lim < 50e3:
+        if abs(err) <= dead or dig_lim < 50e3:
+            self._update_afc_peg(vcfg, dig_lim)
             return
-        max_step = float(vcfg.get("afc_max_step_hz", 0.8e6))
-        gain = float(vcfg.get("afc_gain", 0.7))
+        max_step = float(vcfg.get("afc_max_step_hz", 0.25e6))
+        gain = float(vcfg.get("afc_gain", 0.5))
         step = float(np.clip(err * gain, -max_step, max_step))
         self._afc = max(-dig_lim, min(dig_lim, self._afc + step))
+        self._update_afc_peg(vcfg, dig_lim)
+
+    def _update_afc_peg(self, vcfg: dict, dig_lim: float) -> None:
+        self._afc_pegged = scan_view.afc_is_pegged(self._afc, dig_lim)
+        nudge = scan_view.afc_should_nudge(self._afc, self._last_err, dig_lim)
+        self._afc_nudge = nudge
+        offs = vcfg.get("hunt_offsets_mhz") or [0.25]
+        self._hunt_span = scan_view.hunt_span_hz(offs, pegged=nudge)
+        if nudge:
+            self._afc_peg_n += 1
+        else:
+            self._afc_peg_n = 0
+        need = max(4, int(vcfg.get("afc_peg_frames", 8)))
+        if nudge and self._afc_peg_n >= need and self.state.lock_target:
+            self._nudge_lock_for_peg()
+
+    def _nudge_lock_for_peg(self) -> None:
+        """RF step toward residual error when digital AFC cannot follow."""
+        span = float(self._hunt_span or 2e6)
+        delta = float(np.clip(self._last_err, -span, span))
+        if abs(delta) < 80e3:
+            return
+        self.state.lock_target = float(self.state.lock_target) + delta
+        self.state.tuned_hz = self.state.lock_target
+        self._afc = 0.0
+        self._lock_tuned = None
+        self._lock_gen += 1
+        self._afc_peg_n = 0
+        self._afc_pegged = False
+        self._afc_nudge = False
+        self._emit("notice", {"level": "ok", "text":
+            f"AFC у упорі — якір {delta/1e6:+.2f} МГц → "
+            f"{self.state.lock_target/1e6:.2f}"})
 
     def _take_hunt_result(self, fs: float, off: float, ch_bw: float):
         """Цифровий зсув з фонової нитки. lock_target — якір, не чіпаємо."""
@@ -778,25 +969,38 @@ class Engine:
 
     def _kick_hunt(self, iq: np.ndarray, fs: float, off: float,
                    ch_bw: float, vcfg: dict, frame: cvbs.Frame | None):
-        """Запустити цифровий пошук у фоні — не на гарячому кадрі.
+        """Фоновий ±0.25 МГц, не на нитці decode.
 
-        Повний перебір офсетів коштував 110–270 мс і вбивав fps.
-        Тут копіюємо короткий зріз і рахуємо в іншій нитці; LOCK
-        продовжує декодувати.
+        Лише коли картинка вже була і оцінка впала. Перші кадри LOCK
+        не чіпаємо — інакше hunt краде BLAS і трекінг не засідається.
         """
         if not vcfg.get("hunt", True):
             return
-        if frame is None:
+        # сніг / немає кадру — не смикаємо частоту і не крадемо BLAS
+        if frame is None or not frame.locked:
             return
         if self._hunt_th is not None and self._hunt_th.is_alive():
             return
-        skip = float(vcfg.get("hunt_skip_if_score", 0.60))
-        if cvbs.score_picture(frame).value >= skip:
+        # перші кадри LOCK — лише трекінг; hunt_after_lock раніше
+        # НАВПАКИ частішав пошук і садив fps до ~3
+        wait = int(vcfg.get("hunt_after_lock", 24))
+        if self._lock_n < max(8, wait):
             return
-        hunt_every = max(8, int(vcfg.get("hunt_every", 20)))
-        if self._lock_n <= int(vcfg.get("hunt_after_lock", 16)):
-            hunt_every = max(6, hunt_every // 2)
-        if self._lock_n < 3 or self._lock_n % hunt_every != 0:
+        pic = cvbs.score_picture(frame)
+        skip = float(vcfg.get("hunt_skip_if_score", 0.70))
+        peak = self._lock_score_peak
+        if pic.value > peak:
+            self._lock_score_peak = pic.value
+            peak = pic.value
+        if pic.value >= skip and not self._afc_nudge:
+            return
+        drop = float(vcfg.get("hunt_drop", 0.12))
+        if not self._afc_nudge and (peak < 0.35 or pic.value >= peak - drop):
+            return
+        hunt_every = max(12, int(vcfg.get("hunt_every", 20)))
+        if self._afc_nudge:
+            hunt_every = min(hunt_every, 8)
+        if self._lock_n % hunt_every != 0:
             return
         n_h = min(len(iq), max(int(fs * 0.018), 1))
         iq_h = np.array(iq[-n_h:], copy=True)
@@ -830,7 +1034,13 @@ class Engine:
         """
         skip = float(vcfg.get("hunt_skip_if_score", 0.60))
         need = float(vcfg.get("hunt_min_gain", 0.10))
-        offsets_mhz = vcfg.get("hunt_offsets_mhz") or [0.25]
+        offsets_mhz = list(vcfg.get("hunt_offsets_mhz") or [0.25])
+        lim = self._digital_afc_lim(fs, off, ch_bw, vcfg)
+        pegged = scan_view.afc_should_nudge(afc0, err, lim)
+        if pegged:
+            for extra in (0.5, 1.0, 2.0):
+                if extra not in offsets_mhz:
+                    offsets_mhz.append(extra)
         sign = 1.0 if err >= 0 else -1.0
         trials = []
         for m in offsets_mhz:
@@ -842,6 +1052,9 @@ class Engine:
         width = min(320, int(vcfg.get("width", 640)))
         auto_lv = bool(vcfg.get("auto_levels", True))
         safe = self._digital_afc_lim(fs, off, ch_bw, vcfg)
+        if pegged:
+            nyq = max(0.0, fs * 0.45 - abs(off) - ch_bw / 2)
+            safe = max(safe, min(nyq, 2.5e6))
 
         def score_mix(mix_hz: float) -> cvbs.PictureScore:
             ch, fs_ch = demod.channelize(iq_h, fs, mix_hz, ch_bw)
@@ -863,7 +1076,7 @@ class Engine:
                 best_off = trial
                 if pic.value >= skip:
                     break
-        if best_off != 0.0 and best.value >= cur.value + need:
+        if best_off != 0.0 and best.value >= cur.value + need and best.row_corr >= 0.10:
             return best_off, cur.value, best.value
         return 0.0, cur.value, best.value
 
@@ -872,7 +1085,7 @@ class Engine:
         fs = float(vcfg.get("sample_rate", 20e6))
         f = self.state.lock_target
  
-        if self.src.sample_rate != fs:
+        if abs(self.src.sample_rate - fs) > 1.0:
             self._stop_reader()          # нитка читала на старій fs — перезапуск
             self.src.set_sample_rate(fs)
  
@@ -917,41 +1130,42 @@ class Engine:
         t = time.perf_counter()
         self._lock_n += 1
  
-        every = max(1, int(vcfg.get("spectrum_every", 16)))
+        every = max(1, int(vcfg.get("spectrum_every", 1)))
+        if self._rec is not None:
+            every = max(every, int(vcfg.get("rec_spectrum_every", 6)))
         did_spec = False
-        if self._lock_n % every == 1:
+        if scan_view.lock_spectrum_due(self._lock_n, every):
             # LOCK-спектр лише індикація: короткий зріз, не повний знімок.
             nfft = 2048
             sl = iq[:nfft * 2] if len(iq) >= nfft * 2 else iq
             psd = spectrum.psd_db(sl, nfft, 2)
-            self._emit("spectrum", {
-                "center_hz": f + off, "span_hz": fs,
-                "bins": spectrum.downsample_for_display(psd, 384),
-                "floor_db": round(spectrum.noise_floor_db(psd), 1),
-            })
+            self._publish_spectrum(
+                f + off, fs, spectrum.downsample_for_display(psd, 384),
+                round(spectrum.noise_floor_db(psd), 1), nfft,
+            )
             did_spec = True
  
         iq = iq - np.mean(iq)
  
-        ch_bw = min(self._lock_bw(f, bw), fs * 0.9)
         # На ~20 Мвідл/с децимація 2× (вікно 8–10 МГц) ламає PAL-синхру
-        # у decode(), хоча рядкова лінія в спектрі ще є. Тримаємо не
-        # вужче 12 МГц — тоді dec=1 і поле збирається.
-        ch_bw = max(ch_bw, min(12e6, fs * 0.9))
-        # Запас Найквіста під цифрову AFC: інакше канал 12–18 МГц при
-        # 20 Мвідл/с зануляє safe_lim і підстройка вічно стоїть на 0.
+        # у decode(), хоча рядкова лінія в спектрі ще є. dec=2 заборонено:
+        # піднімаємо channel_bw до fs, щоб dec лишався 1 (30 Мвідл/с +
+        # 12 МГц IF інакше дає dec=2).
         headroom = float(vcfg.get("afc_digital_headroom_hz", 1.5e6))
-        max_bw = 2.0 * max(6e6, fs * 0.45 - abs(off) - headroom)
-        ch_bw = min(ch_bw, max_bw)
-        ch_bw = max(ch_bw, min(12e6, fs * 0.9))
+        ch_bw = scan_view.lock_channel_bw(
+            fs, self._lock_bw(f, bw),
+            off_hz=off, headroom_hz=headroom)
         # Цифрова AFC-корекція: зсуваємо вікно каналайзера на self._afc
         # замість перебудови приймача (див. коментар вище про want).
         base_iq, fs_ch = demod.channelize(iq, fs, -off + self._afc, ch_bw)
         t = self._mark("channelize", t)
  
-        dec = max(1, int(fs / ch_bw))
-        if self._lock_dec != dec:
-            self._lock_dec = dec
+        dec = scan_view.lock_decimation(fs, ch_bw)
+        # не обнуляти DecodeState щокадру: сліпий decode 56 мс ≈ 3 к/с
+        if self._lock_dec is not None and self._lock_dec != dec:
+            self._lock_state = cvbs.DecodeState()
+        self._lock_dec = dec
+        if self._lock_state is None:
             self._lock_state = cvbs.DecodeState()
         abs_start_ch = abs_start_iq / dec
  
@@ -966,7 +1180,12 @@ class Engine:
         frame = cvbs.decode(base, fs_ch, width=int(vcfg.get("width", 640)),
                             state=self._lock_state, abs_start=abs_start_ch + 1,
                             auto_levels=bool(vcfg.get("auto_levels", True)),
-                            sharpen=float(vcfg.get("sharpen", 0.0)))
+                            sharpen=float(vcfg.get("sharpen", 0.0)),
+                            h_phase_frac=float(vcfg.get("h_phase_frac", 0.0)),
+                            crop_left_frac=float(vcfg.get(
+                                "crop_left_frac", cvbs.CROP_LEFT_FRAC)),
+                            crop_bottom_lines=int(vcfg.get(
+                                "crop_bottom_lines", cvbs.CROP_BOTTOM_LINES)))
         t = self._mark("decode", t)
  
         if frame is not None:
@@ -974,7 +1193,8 @@ class Engine:
             # прохід), тож для NTSC це ~230-240 активних рядків, для
             # PAL — ~250-288. Поріг лишаємо низьким, щоб відсіювати лише
             # явний брак, а не коректні поля коротшого стандарту.
-            min_lines = int(vcfg.get("min_lines", 200))
+            need = {"PAL": 240, "NTSC": 210, "?": 200}.get(frame.standard, 200)
+            min_lines = int(vcfg.get("min_lines", need))
             if frame.lines < min_lines:
                 frame = None
 
@@ -989,26 +1209,12 @@ class Engine:
             k = float(vcfg.get("average", 0.0))
             if k > 0:
                 cur = frame.luma.astype(np.float32)
-                if self._acc is None or self._acc.shape != cur.shape:
-                    self._acc = cur
-                else:
-                    # Рухомо-адаптивне часове усереднення. Проста EMA
-                    # рівномірно змішувала кадри й давала два артефакти,
-                    # добре видні на реальних записах: змазування руху
-                    # (рухомий об'єкт лишає «хвіст») і роздвоєння по
-                    # вертикалі на нерухомому тексті (сусідні знімки —
-                    # це протилежні поля черезрядкового відео, зсунуті на
-                    # пів-рядка). Тому усереднюємо СИЛЬНО лише там, де
-                    # кадри збігаються (нерухомий фон — виграш С/Ш), і
-                    # майже не чіпаємо ділянки, що змінились (рух, краї
-                    # тексту лишаються різкими).
-                    a_static = 1.0 / max(1.0, k)
-                    thr = float(vcfg.get("motion_thresh", 24.0))
-                    diff = np.abs(cur - self._acc)
-                    w = np.minimum(diff / max(1.0, thr), 1.0)   # 0 нерухомо .. 1 рух
-                    a = a_static + w * (1.0 - a_static)
-                    self._acc = self._acc * (1 - a) + cur * a
-                frame.luma = np.clip(self._acc, 0, 255).astype(np.uint8)
+                blended, self._acc_parity = blend_same_field(
+                    self._acc, self._acc_parity, cur, frame.field_parity,
+                    k, float(vcfg.get("motion_thresh", 24.0)),
+                )
+                self._acc = blended
+                frame.luma = np.clip(blended, 0, 255).astype(np.uint8)
  
             if self._rec is not None:
                 self._rec.push(frame.luma)
@@ -1017,13 +1223,7 @@ class Engine:
                 self._snap = False
                 self._save_photo(frame)
  
-            img = cvbs.encode(frame, str(vcfg.get("stream_fmt", "webp")),
-                              int(vcfg.get("stream_quality", 75)),
-                              height=None,
-                              method=int(vcfg.get("stream_method", 0)))
-            t = self._mark("encode", t)
- 
-            self._emit("frame", {
+            self._last_video = {
                 "freq_hz": f,
                 "standard": frame.standard,
                 "line_rate": round(frame.line_rate, 1),
@@ -1031,8 +1231,16 @@ class Engine:
                 "locked": frame.locked,
                 "afc_hz": round(self._afc, 0),
                 "freq_err_hz": round(self._last_err, 0),
-                "img": img,
-            })
+            }
+            # Full WS queue already drop-to-latest; skip an encode that would be dumped.
+            # JPEG is ~10× faster than WebP on noisy luma; console sniffs MIME.
+            if not (getattr(self.events, "maxsize", 0) and self.events.full()):
+                img = cvbs.encode(frame, str(vcfg.get("stream_fmt", "jpeg")),
+                                  int(vcfg.get("stream_quality", 75)),
+                                  height=None,
+                                  method=int(vcfg.get("stream_method", 0)))
+                self._emit("frame", {**self._last_video, "img": img})
+            t = self._mark("encode", t)
 
             now = time.perf_counter()
             prev_ts = self._frame_ts
@@ -1058,10 +1266,38 @@ class Engine:
             self.state.lock_target = None
             self.state.mode = "SWEEP"
             self._acc = None
+            self._acc_parity = None
             self._afc = 0.0
             self._lock_gen += 1
+            self._lock_score_peak = 0.0
             self._stop_reader()        # звільняємо src перед _do_sweep()
  
+    def refresh_lock(self) -> None:
+        """Re-arm the LOCK reader/decoder on the same target.
+
+        Used after a live cfg write so sample_rate / LO / capture / decode
+        knobs take effect on the next IQ. Does not stop a recording and
+        does not bounce through sweep.
+        """
+        if self.state.mode != "LOCK" or not self.state.lock_target:
+            return
+        self._acc = None
+        self._acc_parity = None
+        self._lock_state = None
+        self._lock_dec = None
+        self._lock_tuned = None
+        self._lock_n = 0
+        self._lock_gen += 1
+        self._afc = 0.0
+        self._last_err = 0.0
+        self._afc_pegged = False
+        self._afc_nudge = False
+        self._afc_peg_n = 0
+        self._hunt_out = None
+        self._hunt_note = None
+        if abs(self.src.sample_rate - float(self.cfg.get("video", {}).get("sample_rate") or 0)) > 1.0:
+            self._stop_reader()
+
     def snapshot(self) -> dict:
         return {
             "mode": self.state.mode,
@@ -1080,14 +1316,33 @@ class Engine:
             "clip_frac": round(float(getattr(self.src, "clip_frac", 0.0)), 4),
             "afc_hz": round(self._afc, 0),
             "freq_err_hz": round(self._last_err, 0),
+            "afc_pegged": bool(self._afc_pegged),
+            "hunt_span_hz": float(self._hunt_span),
             "lock_tuned_hz": self._lock_tuned,
+            "video": self._last_video,
+            "last_frame_ref": self._last_frame_ref,
+            "sweep_pos_hz": self.state.sweep_pos_hz,
+            "spectrum": self._spectrum_view(),
+            "grid": self._grid_view(),
             "inspect_dbg": list(self._insp_dbg),
-            "detections": [asdict(d) for d in
-                        sorted(self.state.detections.values(),
-                        key=lambda x: -x.snr_db)
-                        if d.hits >= int(self.cfg["scan"].get(
-                        "confirm_hits", 2))],
+            "detections": self._published_detections(),
         }
+
+    def reset_sweep_plan(self) -> None:
+        """Drop queued cluster extras so the next dwell uses the new step."""
+        self._dense_q.clear()
+        self._dense_seen.clear()
+
+    def _published_detections(self) -> list[dict]:
+        need = int(self.cfg["scan"].get("confirm_hits", 2))
+        raw = [
+            asdict(d) for d in sorted(
+                self.state.detections.values(), key=lambda x: -x.snr_db)
+            if d.hits >= need
+        ]
+        return scan_hits.filter_published(
+            raw, self.cfg["scan"].get("hit_filter", scan_hits.HIT_FILTER_DEFAULT),
+        )
  
 
 

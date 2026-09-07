@@ -89,19 +89,46 @@ spic = cvbs.score_picture(snow_locked)
 print(f"   сніг із «синхрою»: score={spic.value:.2f} corr={spic.row_corr:.2f}")
 assert not spic.is_analog(min_corr=0.22, require_lock=True), \
     "залочений сніг не має проходити як відео"
+assert spic.value < pic.value - 0.15, "сніг не має вигравати hunt/inspect у живого кадру"
 
 print("7) оцінка зсуву частоти (те, чим полює hunt)")
 src.set_sample_rate(FS_VID)
 iq_h = src.retune_and_read(5800e6, int(FS_VID * 0.04))
-scores = {}
-for df, label in ((0.0, "0"), (8e6, "+8 МГц")):
-    ch, fs2 = demod.channelize(iq_h, FS_VID, df, 12e6)
-    b = demod.deemphasis(demod.fm_demod(ch, fs2, 3e6), fs2)
-    fr2 = cvbs.decode(b, fs2, width=320)
-    p2 = cvbs.score_picture(fr2)
-    scores[label] = p2
-    print(f"   {label}: score={p2.value:.2f} locked={p2.locked} corr={p2.row_corr:.2f}")
-assert scores["0"].is_analog(min_corr=0.25), "центр має збиратись як відео"
-assert scores["0"].value > scores["+8 МГц"].value + 0.05, "далеко від центру картинка гірша"
+ch, fs2 = demod.channelize(iq_h, FS_VID, 0.0, 12e6)
+b = demod.deemphasis(demod.fm_demod(ch, fs2, 3e6), fs2)
+fr0 = cvbs.decode(b, fs2, width=320)
+p0 = cvbs.score_picture(fr0)
+print(f"   центр: score={p0.value:.2f} locked={p0.locked} corr={p0.row_corr:.2f}")
+assert p0.is_analog(min_corr=0.25), "центр має збиратись як відео"
+noise_iq = (np.random.randn(len(iq_h)) + 1j * np.random.randn(len(iq_h))).astype(np.complex64)
+chn, fsn = demod.channelize(noise_iq, FS_VID, 0.0, 12e6)
+bn = demod.deemphasis(demod.fm_demod(chn, fsn, 3e6), fsn)
+frn = cvbs.decode(bn, fsn, width=320)
+pn = cvbs.score_picture(frn)
+print(f"   шум IQ: score={pn.value:.2f} locked={pn.locked} corr={pn.row_corr:.2f}")
+assert p0.value > pn.value + 0.05, "шум не має вигравати в hunt у живого кадру"
+
+print("8) м'який INSPECT: аналог без кадру — так, 12 МГц сніг — ні")
+from types import SimpleNamespace
+from queue import Queue
+from fpvscan.engine import Engine
+from fpvscan.dsp.spectrum import Occupancy
+
+class _Src:
+    name = "dummy"
+
+eng = Engine(_Src(), {"scan": {}, "video": {}, "sdr": {}}, Queue())
+sc = {"inspect_bw_hz": 12e6, "line_prominence_db": 10.0,
+      "inspect_conf_bypass": 0.70, "inspect_min_lines": 80}
+pal = SimpleNamespace(standard="PAL", prominence_db=12.0, confidence=0.8,
+                      harmonics=2, is_video=True)
+weak_pic = cvbs.PictureScore(0.08, False, 40, 0.02)
+ok3080 = eng._inspect_soft(pal, Occupancy(3080e6, 8.5e6, -20, 25), weak_pic, sc)
+print(f"   3080 8.5 МГц без кадру: soft={ok3080}")
+assert ok3080, "живий аналог без зібраного кадру має бути в списку"
+snow = cvbs.PictureScore(0.12, True, 220, 0.01)
+no5018 = eng._inspect_soft(pal, Occupancy(5018e6, 12e6, -10, 50), snow, sc)
+print(f"   5018 12 МГц сніг: soft={no5018}")
+assert not no5018, "12 МГц енергетична пляма/сніг не має потрапляти в список"
 
 print("\nOK — тракт працює")

@@ -4,743 +4,223 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Скан ефіру · 400 МГц – 6 ГГц</title>
-  <style>
-    :root {
-      --bg: #101413;
-      --panel: #171C1B;
-      --line: #262E2C;
-      --line2: #333D3A;
-      --text: #C8D3CF;
-      --dim: #6E7B77;
-      --sig: #5FE0A8;
-      --warn: #D2703F;
-      --cold: #3E7C8C;
-      --mono: ui-monospace, "JetBrains Mono", "Cascadia Mono", "DejaVu Sans Mono", Consolas, monospace;
-      --disp: "Oswald", "Haettenschweiler", "Arial Narrow", Impact, sans-serif;
-    }
-
-    * {
-      box-sizing: border-box
-    }
-
-    html,
-    body {
-      margin: 0;
-      height: 100%
-    }
-
-    body {
-      background: var(--bg);
-      color: var(--text);
-      font-family: var(--mono);
-      font-size: 12px;
-      display: grid;
-      grid-template-columns: 280px 1fr;
-      height: 100vh;
-      overflow: hidden;
-    }
-
-    h1,
-    h2,
-    h3 {
-      font-family: var(--disp);
-      font-weight: 500;
-      letter-spacing: .06em;
-      text-transform: uppercase;
-      margin: 0
-    }
-
-    /* ---------- ліва панель ---------- */
-    aside {
-      border-right: 1px solid var(--line);
-      display: flex;
-      flex-direction: column;
-      background: var(--panel);
-      min-height: 0
-    }
-
-    .brand {
-      padding: 14px 16px 12px;
-      border-bottom: 1px solid var(--line)
-    }
-
-    .brand h1 {
-      font-size: 19px;
-      line-height: 1
-    }
-
-    .brand span {
-      color: var(--dim);
-      font-size: 10px;
-      letter-spacing: .14em
-    }
-
-    .stat {
-      display: flex;
-      justify-content: space-between;
-      padding: 5px 16px;
-      border-bottom: 1px solid rgba(38, 46, 44, .5)
-    }
-
-    .stat b {
-      font-weight: 400;
-      color: var(--dim);
-      letter-spacing: .05em
-    }
-
-    .stat span {
-      color: var(--text)
-    }
-
-    .mode-SWEEP {
-      color: var(--cold)
-    }
-
-    .mode-LOCK {
-      color: var(--sig)
-    }
-
-    #s-ws.up {
-      color: var(--sig)
-    }
-
-    #s-ws.down {
-      color: var(--warn)
-    }
-
-    #s-clip.bad {
-      color: var(--warn)
-    }
-
-    .acts {
-      display: flex;
-      gap: 6px;
-      padding: 10px 16px;
-      border-bottom: 1px solid var(--line)
-    }
-
-    button {
-      flex: 1;
-      background: transparent;
-      border: 1px solid var(--line2);
-      color: var(--text);
-      font-family: var(--mono);
-      font-size: 11px;
-      padding: 6px 4px;
-      cursor: pointer;
-      letter-spacing: .06em
-    }
-
-    button:hover {
-      border-color: var(--sig);
-      color: var(--sig)
-    }
-
-    button:focus-visible {
-      outline: 2px solid var(--sig);
-      outline-offset: 1px
-    }
-
-    button.on {
-      border-color: var(--warn);
-      color: var(--warn)
-    }
-
-    #notice {
-      padding: 6px 16px 0;
-      font-size: 10px;
-      line-height: 1.5;
-      color: var(--dim);
-      max-height: 64px;
-      overflow: hidden
-    }
-
-    #notice .err {
-      color: var(--warn)
-    }
-
-    .hdr {
-      padding: 10px 16px 6px;
-      font-family: var(--disp);
-      font-size: 12px;
-      color: var(--dim);
-      letter-spacing: .12em
-    }
-
-    #hits {
-      overflow-y: auto;
-      flex: 1;
-      min-height: 0
-    }
-
-    .hit {
-      padding: 8px 16px;
-      border-bottom: 1px solid rgba(38, 46, 44, .6);
-      cursor: pointer;
-      border-left: 2px solid transparent
-    }
-
-    .hit:hover {
-      background: #1D2422
-    }
-
-    .hit.on {
-      border-left-color: var(--sig);
-      background: #1D2422
-    }
-
-    .hit .f {
-      font-size: 15px;
-      color: var(--sig);
-      letter-spacing: .02em
-    }
-
-    .hit .m {
-      color: var(--dim);
-      display: flex;
-      gap: 10px;
-      margin-top: 2px;
-      font-size: 10px
-    }
-
-    .empty {
-      padding: 14px 16px;
-      color: var(--dim);
-      line-height: 1.5
-    }
-
-    /* ---------- права частина ---------- */
-    main {
-      display: grid;
-      grid-template-rows: auto auto 1fr;
-      min-width: 0;
-      min-height: 0
-    }
-
-    /* У режимі утримання водоспад і стрічка ховаються — вся висота
-     віддається картинці, заради якої все й робиться. */
-    main.watching {
-      grid-template-rows: 1fr
-    }
-
-    main.watching #sec-ribbon,
-    main.watching #sec-fall {
-      display: none
-    }
-
-    section {
-      border-bottom: 1px solid var(--line);
-      padding: 10px 16px 12px;
-      min-width: 0
-    }
-
-    .cap {
-      display: flex;
-      justify-content: space-between;
-      align-items: baseline;
-      margin-bottom: 7px
-    }
-
-    .cap h2 {
-      font-size: 12px;
-      color: var(--dim)
-    }
-
-    .cap em {
-      font-style: normal;
-      color: var(--dim);
-      font-size: 10px;
-      letter-spacing: .08em
-    }
-
-    canvas {
-      display: block;
-      width: 100%;
-      image-rendering: pixelated
-    }
-
-    #ribbon {
-      height: 74px;
-      background: #0A0E0D;
-      border: 1px solid var(--line)
-    }
-
-    #ribticks {
-      height: 16px;
-      margin-top: 3px
-    }
-
-    #fall {
-      height: 190px;
-      background: #0A0E0D;
-      border: 1px solid var(--line)
-    }
-
-    .video {
-      display: grid;
-      grid-template-columns: 1fr 200px;
-      gap: 16px;
-      padding: 12px 16px;
-      min-height: 0
-    }
-
-    .screen {
-      background: #0A0E0D;
-      border: 1px solid var(--line);
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      min-height: 0;
-      position: relative
-    }
-
-    .screen img {
-      max-width: 100%;
-      max-height: 100%;
-      display: none
-    }
-
-    .screen p {
-      color: var(--dim);
-      text-align: center;
-      line-height: 1.6;
-      padding: 20px;
-      max-width: 340px
-    }
-
-    .meta div {
-      display: flex;
-      justify-content: space-between;
-      padding: 4px 0;
-      border-bottom: 1px solid rgba(38, 46, 44, .6)
-    }
-
-    .meta b {
-      font-weight: 400;
-      color: var(--dim)
-    }
-
-    .dot {
-      width: 6px;
-      height: 6px;
-      border-radius: 50%;
-      background: var(--warn);
-      display: inline-block;
-      margin-right: 6px;
-      vertical-align: middle
-    }
-
-    .dot.ok {
-      background: var(--sig)
-    }
-
-    @media (prefers-reduced-motion: reduce) {
-      * {
-        transition: none !important
-      }
-    }
-
-    @media (max-width:900px) {
-      body {
-        grid-template-columns: 1fr;
-        grid-template-rows: auto 1fr;
-        overflow: auto
-      }
-
-      aside {
-        border-right: none;
-        border-bottom: 1px solid var(--line)
-      }
-
-      #hits {
-        max-height: 200px;
-        flex: none
-      }
-
-      .video {
-        grid-template-columns: 1fr
-      }
-    }
-  </style>
+  <title>Скан ефіру · тест</title>
+  <link rel="stylesheet" href="/static/css/console.css">
 </head>
 
 <body>
+  <a class="skip" href="#main">До відео</a>
 
-  <aside>
+  <div class="grid-strip" id="grid-strip" aria-label="Проходження частотної сітки">
+    <label class="compact-field" for="sel-cluster">
+      <span>сітка</span>
+      <select id="sel-cluster" aria-label="Крок сітки кластерів">
+        <option value="off">вимк</option>
+        <option value="12">12 МГц</option>
+        <option value="8" selected>8 МГц</option>
+        <option value="4">4 МГц</option>
+      </select>
+    </label>
+    <div class="grid-meta">
+      <span id="grid-pass-label">прохід —</span>
+      <span id="grid-pos">—</span>
+      <span id="cov">покриття 0%</span>
+    </div>
+    <canvas id="grid-pass" width="1400" height="18"></canvas>
+  </div>
+
+  <aside class="rail" id="rail">
     <div class="brand">
-      <h1>Скан ефіру</h1>
-      <span>400 МГц — 6 ГГц · аналогове відео</span>
+      <button type="button" class="ghost icon" id="b-rail" aria-expanded="true" aria-controls="rail" title="Згорнути скан">‹</button>
+      <div class="brand-text">
+        <h1>Скан ефіру</h1>
+        <p>400 МГц — 6 ГГц · аналогове відео</p>
+      </div>
     </div>
 
-    <div class="stat"><b>Зв'язок</b><span id="s-ws">нема</span></div>
-    <div class="stat"><b>Приймач</b><span id="s-src">—</span></div>
-    <div class="stat"><b>Режим</b><span id="s-mode">—</span></div>
-    <div class="stat"><b>Настройка</b><span id="s-tuned">—</span></div>
-    <div class="stat"><b>Проходів</b><span id="s-sweeps">0</span></div>
-    <div class="stat"><b>Насичення АЦП</b><span id="s-clip">—</span></div>
-
-    <div class="acts">
-      <button id="b-sweep">Сканувати</button>
-      <button id="b-clear">Очистити</button>
+    <div class="status-block" id="status-block">
+      <button type="button" class="section-toggle" id="b-status" aria-expanded="true" aria-controls="stats">
+        <span>Стан</span>
+        <span class="chev" aria-hidden="true"></span>
+      </button>
+      <dl class="stats" id="stats">
+        <div class="stat"><dt>Зв'язок</dt><dd id="s-ws">нема</dd></div>
+        <div class="stat"><dt>Приймач</dt><dd id="s-src">—</dd></div>
+        <div class="stat"><dt>Режим</dt><dd id="s-mode">—</dd></div>
+        <div class="stat"><dt>Настройка</dt><dd id="s-tuned">—</dd></div>
+        <div class="stat"><dt>Проходів</dt><dd id="s-sweeps">0</dd></div>
+        <div class="stat"><dt>Насичення АЦП</dt><dd id="s-clip">—</dd></div>
+        <div class="stat"><dt>Підстройка</dt><dd id="v-afc">—</dd></div>
+        <div class="stat"><dt>Декод</dt><dd id="s-health">—</dd></div>
+      </dl>
     </div>
-    <div class="acts">
-      <button id="b-shot">Знімок</button>
-      <button id="b-rec">Запис</button>
-      <button id="b-bias">Bias-T</button>
-    </div>
-    <div><b>Підстройка</b><span id="v-afc">—</span></div>
-    <div id="notice"></div>
 
-    <div class="hdr">Знайдені передачі</div>
-    <div id="hits">
-      <p class="empty">Поки нічого. Кандидат потрапляє сюди
-        лише після підтвердження рядкової частоти.</p>
+    <div class="acts rail-only">
+      <button type="button" id="b-sweep" title="Клавіша S">Сканувати</button>
+      <button type="button" id="b-clear">Очистити</button>
+    </div>
+    <div class="acts rail-only">
+      <button type="button" id="b-shot">Знімок</button>
+      <button type="button" id="b-rec">Запис</button>
+      <button type="button" id="b-bias">Bias-T</button>
+    </div>
+    <div class="acts rail-only">
+      <button type="button" id="b-panel" aria-expanded="true" aria-controls="test-panel">Сховати</button>
+    </div>
+    <p class="media-path rail-only" id="media-path" hidden></p>
+    <div id="notice" class="rail-only" role="status"></div>
+
+    <div class="hits-block" id="hits-block">
+      <div class="hits-head">
+        <button type="button" class="section-toggle" id="b-hits" aria-expanded="true" aria-controls="hits">
+          <span>Знайдені передачі</span>
+          <span class="chev" aria-hidden="true"></span>
+        </button>
+        <label class="compact-field" for="sel-hit-filter">
+          <span>фільтр</span>
+          <select id="sel-hit-filter" aria-label="Фільтр знахідок">
+            <option value="all">усі</option>
+            <option value="hide_weak" selected>слабкі</option>
+            <option value="hide_no_video">без картинки</option>
+            <option value="hide_near_dup">сусіди</option>
+          </select>
+        </label>
+      </div>
+      <div id="hits">
+        <p class="empty">Поки нічого. Кандидат потрапляє сюди
+          лише після підтвердження рядкової частоти.</p>
+      </div>
     </div>
   </aside>
 
-  <main>
-    <section id="sec-ribbon">
-      <div class="cap">
-        <h2>Повний діапазон</h2>
-        <em id="cov">покриття 0%</em>
-      </div>
-      <canvas id="ribbon" width="1200" height="74"></canvas>
-      <canvas id="ribticks" width="1200" height="16"></canvas>
-    </section>
+  <main id="main">
+    <div class="stage-bar">
+      <div class="status" id="bar-mode"><i class="dot off"></i><span>режим: —</span></div>
+      <div class="status"><span id="bar-freq">—</span></div>
+      <div class="status grow" id="bar-health"><i class="dot off"></i><span>декод: —</span></div>
+    </div>
 
-    <section id="sec-fall">
-      <div class="cap">
-        <h2>Поточна ділянка</h2>
-        <em id="span">—</em>
+    <div class="stage">
+      <div class="view-col">
+        <div class="screen">
+          <img id="pic" alt="Декодований кадр з приймача" width="640" height="480">
+          <p class="hint" id="hint">Оберіть передачу зліва, щоб стати на її частоту.
+            Приймач перейде в режим утримання й почне декодувати кадри.
+            Панель тесту лишається відкритою праворуч.</p>
+        </div>
+        <div class="watch-strip" id="watch-strip" aria-live="polite">
+          <span id="w-fps">кадрів —/с</span>
+          <span id="w-lines">рядків —</span>
+          <span id="w-sync">синхро —</span>
+          <span id="w-spec">спектр —/с</span>
+          <span id="w-age">кадр — мс</span>
+          <span class="watch-afc" id="w-afc" hidden></span>
+          <span class="watch-note" id="w-note"></span>
+        </div>
       </div>
-      <canvas id="fall" width="384" height="190"></canvas>
-    </section>
+      <div class="side-col">
+        <div class="metrics">
+          <div class="metric"><span class="k">Частота</span><span class="v" id="v-f">—</span></div>
+          <div class="metric"><span class="k">Стандарт</span><span class="v" id="v-std">—</span></div>
+          <div class="metric"><span class="k">Рядкова</span><span class="v" id="v-line">—</span></div>
+          <div class="metric"><span class="k">Рядків</span><span class="v" id="v-lines">—</span></div>
+          <div class="metric"><span class="k">Синхро</span><span class="v" id="v-lock"><i class="dot"></i>нема</span></div>
+          <div class="metric"><span class="k">Кадрів</span><span class="v" id="v-fps">0</span></div>
+        </div>
 
-    <div class="video">
-      <div class="screen">
-        <img id="pic" alt="Декодований кадр">
-        <p id="hint">Оберіть передачу зліва, щоб стати на її частоту.
-          Приймач перейде в режим утримання й почне декодувати кадри.</p>
+        <aside class="fft-win" id="fft-win" hidden>
+          <button type="button" class="section-toggle" id="b-fft" aria-expanded="true" aria-controls="fft-body">
+            <span>Спектр</span>
+            <span class="chev" aria-hidden="true"></span>
+          </button>
+          <div class="fft-body" id="fft-body">
+            <div class="fft-steps" role="group" aria-label="Крок частоти">
+              <button type="button" data-mhz="-1">−1</button>
+              <button type="button" data-mhz="-0.1">−0.1</button>
+              <button type="button" data-mhz="0.1">+0.1</button>
+              <button type="button" data-mhz="1">+1</button>
+            </div>
+            <div class="fft-read">
+              <button type="button" data-mhz="-5">−5</button>
+              <div class="fft-mhz" aria-live="polite">
+                <span id="fft-num">—</span><span class="u">MHz</span>
+              </div>
+              <button type="button" data-mhz="5">+5</button>
+            </div>
+            <div class="fft-plot">
+              <canvas id="fft" width="320" height="88" aria-label="Спектр утримання"></canvas>
+            </div>
+          </div>
+        </aside>
       </div>
-      <div class="meta">
-        <div><b>Частота</b><span id="v-f">—</span></div>
-        <div><b>Стандарт</b><span id="v-std">—</span></div>
-        <div><b>Рядкова</b><span id="v-line">—</span></div>
-        <div><b>Рядків</b><span id="v-lines">—</span></div>
-        <div><b>Синхро</b><span id="v-lock"><i class="dot"></i>нема</span></div>
-        <div><b>Кадрів</b><span id="v-fps">0</span></div>
+    </div>
+
+    <div class="tune" id="tune-bar">
+      <input id="manual-freq" type="number" step="0.1" min="50" max="6000" placeholder="МГц, напр. 3480" aria-label="Частота, МГц">
+      <button type="button" id="b-manual-lock">Стати</button>
+    </div>
+
+    <div class="observe-dock" id="observe-dock">
+      <div class="session-bar" id="session-bar">
+        <div class="session-line">
+          <input id="sess-title" type="text" placeholder="Назва сесії" autocomplete="off">
+          <select id="sess-mode" aria-label="Режим сесії">
+            <option value="lock">утримання</option>
+            <option value="sweep">свіп</option>
+            <option value="manual">вручну</option>
+          </select>
+          <button type="button" class="primary" id="b-sess-start">Почати</button>
+          <button type="button" id="b-sess-pause" hidden>Пауза</button>
+          <button type="button" id="b-sess-resume" hidden>Продовжити</button>
+          <button type="button" id="b-sess-done" hidden>Завершити</button>
+          <span class="tp-meta" id="session-label">немає активної сесії</span>
+        </div>
       </div>
-      <div class="acts">
-        <input id="manual-freq" type="number" step="0.1" placeholder="МГц, напр. 3480" style="flex:1.6;background:transparent;border:1px solid var(--line2);color:var(--text);
-                font-family:var(--mono);font-size:11px;padding:6px 4px">
-        <button id="b-manual-lock">Стати</button>
-      </div>
-      <div class="acts">
-        <button id="b-nudge-dn">− 0.5 МГц</button>
-        <button id="b-nudge-up">+ 0.5 МГц</button>
-      </div>
+      <form class="quick-log" id="quick-form"></form>
+      <ul class="timeline" id="timeline"></ul>
     </div>
   </main>
 
-  <script>
-    const F0 = 400e6, F1 = 6000e6, RW = 1200
-    const rib = document.getElementById('ribbon'), rctx = rib.getContext('2d')
-    const fall = document.getElementById('fall'), fctx = fall.getContext('2d')
-    const tick = document.getElementById('ribticks'), tctx = tick.getContext('2d')
+  <aside class="test-panel" id="test-panel" aria-label="Панель тестування">
+    <div class="tp-head">
+      <h2>Тест</h2>
+      <button type="button" class="ghost" id="b-panel-close" aria-label="Сховати панель">×</button>
+    </div>
+    <p class="tp-meta" id="tp-api">каталог параметрів</p>
+    <p class="tp-meta apply-status" id="param-apply" role="status"></p>
 
-    let ribData = new Float32Array(RW).fill(-120)
-    let seen = new Uint8Array(RW)
-    let hits = new Map(), current = null, frames = 0, t0 = Date.now()
-    let recording = false
-    let lastWs = 0
-    let sock = null
-    let fpsHist = []
+    <div class="tabs" role="tablist">
+      <button type="button" role="tab" data-tab="params" aria-selected="true">Параметри</button>
+      <button type="button" role="tab" data-tab="schema" aria-selected="false">Схема</button>
+    </div>
 
-    const fmt = hz => hz >= 1e9 ? (hz / 1e9).toFixed(3) + ' ГГц' : (hz / 1e6).toFixed(1) + ' МГц'
-    function fmtAfc(hz) {
-      const a = Number(hz) || 0
-      if (Math.abs(a) >= 1e6) return (a / 1e6).toFixed(2) + ' МГц'
-      return (a / 1e3).toFixed(0) + ' кГц'
-    }
-
-    // холодна → сигнальна шкала, свідомо не «jet» і не «viridis»
-    function ramp(u) {
-      u = Math.max(0, Math.min(1, u))
-      const st = [[10, 14, 13], [22, 42, 70], [30, 110, 112], [95, 224, 168], [236, 255, 244]]
-      const x = u * (st.length - 1), i = Math.min(st.length - 2, Math.floor(x)), f = x - i
-      return [0, 1, 2].map(k => Math.round(st[i][k] + (st[i + 1][k] - st[i][k]) * f))
-    }
-
-    function drawTicks() {
-      tctx.clearRect(0, 0, RW, 16)
-      tctx.fillStyle = '#6E7B77'; tctx.font = '10px ui-monospace,monospace'
-      const marks = [[433e6, '433'], [915e6, '900'], [1280e6, '1G2'], [2440e6, '2G4'],
-      [3300e6, '3G3'], [5800e6, '5G8']]
-      for (const [f, l] of marks) {
-        const x = (f - F0) / (F1 - F0) * RW
-        tctx.fillRect(x, 0, 1, 5)
-        tctx.fillText(l, Math.min(RW - 24, x + 3), 13)
-      }
-    }
-
-    function drawRibbon() {
-      const H = rib.height
-      rctx.fillStyle = '#0A0E0D'; rctx.fillRect(0, 0, RW, H)
-      for (let x = 0; x < RW; x++) {
-        if (!seen[x]) continue
-        const u = (ribData[x] + 100) / 70          // -100..-30 дБ
-        const h = Math.max(1, Math.min(H, u * H))
-        const c = ramp(u)
-        rctx.fillStyle = `rgb(${c[0]},${c[1]},${c[2]})`
-        rctx.fillRect(x, H - h, 1, h)
-      }
-      for (const d of hits.values()) {
-        const x = (d.freq_hz - F0) / (F1 - F0) * RW
-        rctx.fillStyle = (current && Math.abs(current - d.freq_hz) < 2e6) ? '#ECFFF4' : '#5FE0A8'
-        rctx.fillRect(x - 1, 0, 2, H)
-        rctx.globalAlpha = 0.14; rctx.fillRect(x - 3, 0, 6, H); rctx.globalAlpha = 1
-      }
-      document.getElementById('cov').textContent =
-        'покриття ' + Math.round(seen.reduce((a, b) => a + b, 0) / RW * 100) + '%'
-    }
-
-    function pushSpectrum(d) {
-      const bins = d.bins, n = bins.length
-      const lo = d.center_hz - d.span_hz / 2, hi = d.center_hz + d.span_hz / 2
-      document.getElementById('span').textContent =
-        fmt(lo) + ' – ' + fmt(hi) + '   ·   підлога ' + d.floor_db + ' дБ'
-
-      // 1. стрічка повного діапазону (утримання максимуму + повільний спад)
-      for (let i = 0; i < n; i++) {
-        const f = lo + (i + 0.5) / n * (hi - lo)
-        if (f < F0 || f >= F1) continue
-        const x = Math.floor((f - F0) / (F1 - F0) * RW)
-        ribData[x] = seen[x] ? Math.max(bins[i], ribData[x] - 0.6) : bins[i]
-        seen[x] = 1
-      }
-      drawRibbon()
-
-      // 2. водоспад поточної ділянки
-      const W = fall.width, H = fall.height
-      const prev = fctx.getImageData(0, 0, W, H - 1)
-      fctx.putImageData(prev, 0, 1)
-      const row = fctx.createImageData(W, 1)
-      for (let x = 0; x < W; x++) {
-        const v = bins[Math.floor(x / W * n)]
-        const c = ramp((v - d.floor_db) / 45)
-        row.data[x * 4] = c[0]; row.data[x * 4 + 1] = c[1]; row.data[x * 4 + 2] = c[2]; row.data[x * 4 + 3] = 255
-      }
-      fctx.putImageData(row, 0, 0)
-    }
-
-    function renderHits() {
-      const el = document.getElementById('hits')
-      if (!hits.size) {
-        el.innerHTML = '<p class="empty">Поки нічого. Кандидат потрапляє сюди ' +
-          'лише після підтвердження рядкової частоти.</p>'
-        return
-      }
-      const list = [...hits.values()].sort((a, b) => b.snr_db - a.snr_db)
-      el.innerHTML = list.map(d => `
-    <div class="hit ${current && Math.abs(current - d.freq_hz) < 2e6 ? 'on' : ''}"
-         data-f="${d.freq_hz}">
-      <div class="f">${fmt(d.freq_hz)}</div>
-      <div class="m">
-        <span>${d.channel || d.band}</span>
-        <span>${d.standard}</span>
-        <span>${d.snr_db} дБ</span>
-        <span>${(d.bandwidth_hz / 1e6).toFixed(0)} МГц</span>
+    <div class="tp-body">
+      <div class="tp-pane" id="pane-params">
+        <div id="param-groups"></div>
+        <p class="help-keys">
+          <kbd>S</kbd> свіп ·
+          <kbd>[</kbd> <kbd>]</kbd> ±0.1 МГц ·
+          <kbd>,</kbd> <kbd>.</kbd> gain ·
+          <kbd>-</kbd> <kbd>=</kbd> поріг ·
+          <kbd>1</kbd> стан ·
+          <kbd>2</kbd> скан ·
+          <kbd>Space</kbd> записати ·
+          <kbd>F2</kbd> тест
+        </p>
       </div>
-    </div>`).join('')
-      el.querySelectorAll('.hit').forEach(n =>
-        n.onclick = () => lock(parseFloat(n.dataset.f)))
-    }
 
-    function note(text, err) {
-      const el = document.getElementById('notice')
-      const d = document.createElement('div')
-      if (err) d.className = 'err'
-      d.textContent = text
-      el.prepend(d)
-      while (el.childNodes.length > 3) el.removeChild(el.lastChild)
-    }
+      <div class="tp-pane" id="pane-schema" hidden>
+        <p class="tp-meta">Які поля збирати під час перегляду відео. Зберігається через PUT /api/test/observation-schema.</p>
+        <div id="schema-list"></div>
+        <div class="session-row">
+          <button type="button" id="b-schema-add">Додати поле</button>
+          <button type="button" class="primary" id="b-schema-save">Зберегти схему</button>
+        </div>
+      </div>
+    </div>
+  </aside>
 
-    function setWs(up, txt) {
-      const el = document.getElementById('s-ws')
-      if (!el) return
-      el.textContent = txt
-      el.className = up ? 'up' : 'down'
-    }
-
-    // Безпечне присвоєння: відсутній елемент більше не має валити
-    // весь showFrame. Тричі саме через це зникала картинка.
-    function put(id, text) {
-      const el = document.getElementById(id)
-      if (el) el.textContent = text
-    }
-
-    function showFrame(d) {
-      const img = document.getElementById('pic')
-      if (!img || !d.img) return
-      lastFrame = Date.now()
-      img.src = 'data:image/webp;base64,' + d.img
-      img.style.display = 'block'
-      const hint = document.getElementById('hint')
-      if (hint) hint.style.display = 'none'
-
-      put('v-f', fmt(d.freq_hz))
-      if (d.freq_hz) current = d.freq_hz
-      put('v-std', d.standard)
-      put('v-line', d.line_rate + ' Гц')
-      put('v-lines', d.lines)
-      put('v-afc', fmtAfc(d.afc_hz))
-      const lk = document.getElementById('v-lock')
-      if (lk) lk.innerHTML =
-        `<i class="dot ${d.locked ? 'ok' : ''}"></i>${d.locked ? 'є' : 'нема'}`
-
-      frames++
-      fpsHist.push(Date.now())
-      while (fpsHist.length && fpsHist[0] < Date.now() - 3000) fpsHist.shift()
-      put('v-fps', (fpsHist.length / 3).toFixed(1) + ' /с')
-    }
-
-    function applyState(s) {
-      recording = !!s.recording
-      const b = document.getElementById('b-rec')
-      b.classList.toggle('on', recording)
-      b.textContent = recording ? `Стоп ${s.rec_seconds | 0}с` : 'Запис'
-
-      const bt = document.getElementById('b-bias')
-      if (bt) bt.classList.toggle('on', !!s.bias_tee)
-
-      document.getElementById('b-manual-lock').onclick = () => {
-        const v = parseFloat(document.getElementById('manual-freq').value)
-        if (!isNaN(v) && v > 0) lock(v * 1e6)
-      }
-      document.getElementById('manual-freq').addEventListener('keydown', e => {
-        if (e.key === 'Enter') document.getElementById('b-manual-lock').click()
-      })
-
-      function nudge(deltaHz) {
-        if (!current) return   // ще ні на чому не стоїмо — спершу «Стати»
-        lock(current + deltaHz)
-      }
-      document.getElementById('b-nudge-dn').onclick = () => nudge(-0.5e6)
-      document.getElementById('b-nudge-up').onclick = () => nudge(0.5e6)
-
-      document.getElementById('s-src').textContent = s.source
-      const m = document.getElementById('s-mode')
-      curMode = s.mode
-      m.textContent = s.mode; m.className = 'mode-' + s.mode
-      document.getElementById('s-tuned').textContent = fmt(s.tuned_hz)
-      document.getElementById('s-sweeps').textContent = s.sweeps_done
-      if (s.afc_hz != null) put('v-afc', fmtAfc(s.afc_hz))
-      // Дивимось відео — прибираємо все інше з очей.
-      document.querySelector('main').classList.toggle('watching', s.mode === 'LOCK')
-
-      const cl = document.getElementById('s-clip')
-      const cf = (s.clip_frac || 0) * 100
-      cl.textContent = cf.toFixed(2) + '%'
-      // Понад 0.1% обрізаних відліків — приймач у насиченні, і знахідки
-      // нижче можуть виявитись продуктами інтермодуляції, а не ефіром.
-      cl.className = cf > 0.1 ? 'bad' : ''
-
-      if (s.detections) {
-        for (const d of s.detections) hits.set(Math.round(d.freq_hz / 1e6), d)
-        renderHits()
-      }
-    }
-
-    async function lock(f) {
-      current = f
-      await fetch('/api/lock/' + f, { method: 'POST' })
-      document.getElementById('v-f').textContent = fmt(f)
-      renderHits(); drawRibbon()
-    }
-
-    document.getElementById('b-sweep').onclick = async () => {
-      current = null
-      await fetch('/api/sweep', { method: 'POST' })
-      document.getElementById('pic').style.display = 'none'
-      document.getElementById('hint').style.display = 'block'
-      renderHits(); drawRibbon()
-    }
-
-    document.getElementById('b-clear').onclick = async () => {
-      await fetch('/api/clear', { method: 'POST' })
-      hits.clear(); ribData.fill(-120); seen.fill(0)
-      renderHits(); drawRibbon()
-    }
-
-    document.getElementById('b-shot').onclick = () =>
-      fetch('/api/snapshot', { method: 'POST' })
-
-    document.getElementById('b-rec').onclick = async () => {
-      await fetch('/api/record/' + (recording ? 'stop' : 'start'), { method: 'POST' })
-    }
-
-    document.getElementById('b-bias').onclick = async () => {
-      const on = !document.getElementById('b-bias').classList.contains('on')
-      await fetch('/api/bias_tee/' + (on ? 'on' : 'off'), { method: 'POST' })
-    }
-
-    function connect() {
-      sock = new WebSocket((location.protocol === 'https:' ? 'wss' : 'ws') + '://' + location.host + '/ws')
-      const ws = sock
-      ws.onopen = () => setWs(true, 'є')
-      ws.onerror = () => setWs(false, 'помилка')
-      ws.onclose = () => { setWs(false, 'нема'); setTimeout(connect, 1500) }
-      ws.onmessage = e => {
-        try {
-          lastWs = Date.now()
-          const m = JSON.parse(e.data)
-          if (m.type === 'spectrum') pushSpectrum(m.data)
-          else if (m.type === 'detection') {
-            hits.set(Math.round(m.data.freq_hz / 1e6), m.data)
-            renderHits(); drawRibbon()
-          }
-          else if (m.type === 'frame') showFrame(m.data)
-          else if (m.type === 'state') applyState(m.data)
-          else if (m.type === 'notice') note(m.data.text, m.data.level === 'error')
-        } catch (err) {
-          // Один зіпсований пакет не повинен глушити весь потік.
-          console.error('обробка повідомлення:', err, String(e.data).slice(0, 200))
-          note('помилка в браузері: ' + err.message, true)
-        }
-      }
-    }
-
-    // Запасний канал. Спектр і кадри йдуть тільки через веб-сокет, але
-    // стан і список знахідок можна тягнути звичайними запитами. Якщо
-    // сокет із будь-якої причини мовчить, інтерфейс лишається робочим,
-    // і одразу видно, що зламався саме він, а не сервер.
-    setInterval(async () => {
-      if (Date.now() - lastWs < 4000) return
-      try {
-        const r = await fetch('/api/state')
-        const s = await r.json()
-        if (s.error) { note('сервер: ' + s.error, true); return }
-        applyState(s)
-        setWs(false, 'опитування')
-      } catch (err) {
-        setWs(false, 'нема')
-      }
-    }, 1500)
-
-    let lastFrame = 0, curMode = ''
-    setInterval(() => {
-      if (curMode !== 'LOCK') return
-      if (Date.now() - lastFrame < 6000) return
-      lastFrame = Date.now()
-      note('потік кадрів мовчить — перепідключаюсь', true)
-      if (sock) { try { sock.close() } catch (e) { } }
-    }, 2000)
-
-    drawTicks()
-    drawRibbon()
-    connect();
-  </script>
+  <script type="module" src="/static/js/app.js"></script>
 </body>
 
 </html>
