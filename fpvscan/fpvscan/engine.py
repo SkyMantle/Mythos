@@ -26,7 +26,7 @@ import numpy as np
 from .bands import PRIORITY_BANDS, band_of, nearest_channel
 from .dsp import spectrum, demod, cvbs
 from .dsp.field_blend import blend_same_field
-from . import paths, scan_hits, scan_view
+from . import paths, scan_gate, scan_hits, scan_view
 from .web.coalesce import enqueue_live_event
 from .recorder import VideoRecorder, FfmpegMissing
  
@@ -437,6 +437,7 @@ class Engine:
             if self.state.mode == "LOCK":
                 return
 
+            from_extra = bool(self._dense_q)
             if self._dense_q:
                 f = float(self._dense_q.pop(0))
             else:
@@ -471,21 +472,21 @@ class Engine:
             occ = spectrum.find_occupied(
                 psd, f, fs,
                 threshold_db=float(scan.get("threshold_db", 8)),
-                min_bw_hz=float(scan.get("min_bw_hz", 4e6)),
+                min_bw_hz=scan_gate.fft_min_bw_hz(scan),
                 dc_notch_hz=float(scan.get("dc_notch_hz", 200e3)))
-            hit_tol = float(scan.get("hit_tol_hz", scan_view.SWEEP_HIT_TOL_HZ))
- 
-            min_bw = float(scan.get("min_bw_hz", 5e6))
-            max_bw = float(scan.get("max_bw_hz", 25e6))
+
             for o in occ:
-                # Відео ~5–15 МГц; 2.7/4 МГц — шпори. Жорсткі 6 МГц
-                # ховали живий аналог ~5 МГц. Верх — ЧМ-розмазка, не весь крок.
-                near = abs(o.center_hz - f) <= hit_tol
                 self._queue_cluster_dense(o.center_hz, f, scan)
-                if not (min_bw <= o.bandwidth_hz <= max_bw):
-                    # 3487 vs 3489: keep a slightly narrow blob next to the dwell.
-                    if not (near and o.bandwidth_hz >= 0.6 * min_bw and o.snr_db >= 8):
-                        continue
+                line_hint = (
+                    self._sweep_line_hint(iq, fs, f, o, scan)
+                    if from_extra else True
+                )
+                if not scan_gate.should_full_inspect(
+                    dwell_hz=f, center_hz=o.center_hz,
+                    bandwidth_hz=o.bandwidth_hz, snr_db=o.snr_db,
+                    from_extra=from_extra, scan=scan, line_hint=line_hint,
+                ):
+                    continue
                 self._inspect(iq, f, fs, o)
                 self._lock_tuned = None
 
@@ -528,14 +529,14 @@ class Engine:
             **self._spectrum_view(t_mono_ms=stamp),
             "grid": self._grid_view(t_mono_ms=stamp),
         })
-        insp_s = float(self.cfg["scan"].get("inspect_ms", 25)) / 1000
         sc = self.cfg["scan"]
+        insp_s = scan_gate.inspect_ms(sc, occ.center_hz) / 1000
         try:
             iq = self.src.retune_and_read(occ.center_hz, int(fs * insp_s))
             # Вікно класифікації = ширина зайнятості, з стелею inspect_bw.
             # Раніше додавали 2·MERGE_TOL (12 МГц) — шпора 12 МГц ставала
             # вікном 24 МГц і легше «бачила» рядкову лінію сусіда.
-            insp_bw = float(sc.get("inspect_bw_hz", 12e6))
+            insp_bw = scan_gate.inspect_bw_hz(sc, occ.center_hz)
             out_bw = min(max(occ.bandwidth_hz, 8e6), insp_bw, fs * 0.9)
             ch, fs2 = demod.channelize(
                 iq, fs, 0.0, out_bw_hz=out_bw,
@@ -658,32 +659,36 @@ class Engine:
         })
         self._insp_dbg = self._insp_dbg[-12:]
 
-    def _inspect_soft(self, score, occ, pic, sc) -> bool:
-        """Спектральний обхід, коли 40 мс не зібрали кадр.
+    def _sweep_line_hint(self, iq, fs, dwell_hz, occ, scan) -> bool:
+        """Cheap 15.7 kHz comb on extra-dwell IQ. No retune, no decode."""
+        try:
+            mix = float(occ.center_hz) - float(dwell_hz)
+            insp_bw = scan_gate.inspect_bw_hz(scan, occ.center_hz)
+            out_bw = min(max(float(occ.bandwidth_hz), 8e6), insp_bw, fs * 0.9)
+            ch, fs2 = demod.channelize(
+                iq, fs, mix, out_bw_hz=out_bw,
+                fast=bool(scan.get("fast_channelizer", False)))
+            base = demod.fm_demod(
+                ch, fs2, deviation_hz=max(float(occ.bandwidth_hz), 8e6) / 5)
+            return demod.line_comb_hint(base, fs2)
+        except Exception:
+            return False
 
-        3080/4988: PAL/NTSC + підйом + смуга ~5–15 МГц.
-        5018: пляма ~12 МГц лише з енергії / заложений сніг — ні.
-        """
-        if score.standard not in ("PAL", "NTSC"):
-            return False
-        bw = float(occ.bandwidth_hz)
-        if not (5.0e6 <= bw <= 15.0e6):
-            return False
+    def _inspect_soft(self, score, occ, pic, sc) -> bool:
+        """Спектральний обхід, коли decode не зібрав кадр."""
         corr = 0.0 if pic is None else float(pic.row_corr)
-        # растр зібрався, але рядки — шум: спідниця 5018, не «decode не встиг»
-        min_lines = int(sc.get("inspect_min_lines", 80))
-        if pic is not None and pic.lines >= min_lines and corr < 0.06:
-            return False
-        insp_bw = float(sc.get("inspect_bw_hz", 12e6))
-        if bw >= 0.90 * insp_bw and corr < 0.08:
-            return False
-        prom = float(sc.get("line_prominence_db", 10))
-        if score.prominence_db < prom:
-            return False
-        bypass = float(sc.get("inspect_conf_bypass", 0.70))
-        if score.confidence >= bypass:
-            return True
-        return int(score.harmonics) >= 1
+        lines = 0 if pic is None else int(pic.lines)
+        return scan_gate.inspect_soft_ok(
+            standard=score.standard,
+            bandwidth_hz=occ.bandwidth_hz,
+            prominence_db=score.prominence_db,
+            confidence=score.confidence,
+            harmonics=score.harmonics,
+            row_corr=corr,
+            pic_lines=lines,
+            scan=sc,
+            center_hz=occ.center_hz,
+        )
 
     def _inspect_offsets(self, iq, fs, out_bw, occ, sc):
         """Шукає відео на кількох цифрових зсувах у вже знятому IQ.
@@ -785,9 +790,7 @@ class Engine:
         відновлюється, доки не натиснуть «Сканувати».
         """
         sc = self.cfg["scan"]
-        if not sc.get("auto_peek", True) or self.state.mode == "LOCK":
-            return
-        if det.confidence < float(sc.get("auto_peek_min_conf", 0.6)):
+        if not scan_gate.auto_peek_allowed(det, sc) or self.state.mode == "LOCK":
             return
         key = int(det.freq_hz / 1e6)
         now = time.time()
@@ -1185,7 +1188,8 @@ class Engine:
                             crop_left_frac=float(vcfg.get(
                                 "crop_left_frac", cvbs.CROP_LEFT_FRAC)),
                             crop_bottom_lines=int(vcfg.get(
-                                "crop_bottom_lines", cvbs.CROP_BOTTOM_LINES)))
+                                "crop_bottom_lines", cvbs.CROP_BOTTOM_LINES)),
+                            h_pll=bool(vcfg.get("h_pll", False)))
         t = self._mark("decode", t)
  
         if frame is not None:

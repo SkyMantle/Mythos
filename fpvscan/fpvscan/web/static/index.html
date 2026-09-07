@@ -4,22 +4,23 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Скан ефіру · тест</title>
-  <link rel="stylesheet" href="/static/css/console.css">
+  <title>МІФ · скан</title>
+  <link rel="stylesheet" href="/static/css/console.css?v=11">
 </head>
 
 <body>
   <a class="skip" href="#main">До відео</a>
 
   <div class="grid-strip" id="grid-strip" aria-label="Проходження частотної сітки">
-    <label class="compact-field" for="sel-cluster">
-      <span>сітка</span>
-      <select id="sel-cluster" aria-label="Крок сітки кластерів">
+    <label class="compact-field compact-field-grid" for="sel-cluster">
+      <span class="sr-only">сітка</span>
+      <select id="sel-cluster" aria-label="Сітка, МГц">
         <option value="off">вимк</option>
-        <option value="12">12 МГц</option>
-        <option value="8" selected>8 МГц</option>
-        <option value="4">4 МГц</option>
+        <option value="12">12</option>
+        <option value="8" selected>8</option>
+        <option value="4">4</option>
       </select>
+      <span class="compact-unit" aria-hidden="true">МГц</span>
     </label>
     <div class="grid-meta">
       <span id="grid-pass-label">прохід —</span>
@@ -31,11 +32,10 @@
 
   <aside class="rail" id="rail">
     <div class="brand">
-      <button type="button" class="ghost icon" id="b-rail" aria-expanded="true" aria-controls="rail" title="Згорнути скан">‹</button>
-      <div class="brand-text">
-        <h1>Скан ефіру</h1>
-        <p>400 МГц — 6 ГГц · аналогове відео</p>
-      </div>
+      <h1 class="brand-mark">МІФ</h1>
+      <button type="button" class="ghost panel-hide" id="b-rail" aria-expanded="true" aria-controls="rail" title="Згорнути скан" aria-label="Згорнути скан">
+        <span class="chev-rail" aria-hidden="true"></span>
+      </button>
     </div>
 
     <div class="status-block" id="status-block">
@@ -56,32 +56,53 @@
     </div>
 
     <div class="acts rail-only">
-      <button type="button" id="b-sweep" title="Клавіша S">Сканувати</button>
-      <button type="button" id="b-clear">Очистити</button>
-    </div>
-    <div class="acts rail-only">
-      <button type="button" id="b-shot">Знімок</button>
-      <button type="button" id="b-rec">Запис</button>
-      <button type="button" id="b-bias">Bias-T</button>
-    </div>
-    <div class="acts rail-only">
-      <button type="button" id="b-panel" aria-expanded="true" aria-controls="test-panel">Сховати</button>
+      <button type="button" class="icon-act" id="b-sweep" title="Сканувати (S)" aria-label="Сканувати">
+        <svg class="ico" viewBox="0 0 24 24" aria-hidden="true" focusable="false" pointer-events="none">
+          <circle cx="12" cy="12" r="2.2" fill="currentColor"/>
+          <path d="M7.2 12a4.8 4.8 0 0 1 4.8-4.8M16.8 12A4.8 4.8 0 0 1 12 16.8" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round"/>
+          <path d="M4.4 12A7.6 7.6 0 0 1 12 4.4M19.6 12A7.6 7.6 0 0 1 12 19.6" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round"/>
+        </svg>
+      </button>
+      <button type="button" class="icon-act" id="b-clear" title="Очистити" aria-label="Очистити">
+        <svg class="ico" viewBox="0 0 24 24" aria-hidden="true" focusable="false" pointer-events="none">
+          <path d="M7 7l10 10M17 7 7 17" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round"/>
+          <circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="1.75"/>
+        </svg>
+      </button>
+      <button type="button" class="icon-act" id="b-shot" title="Знімок" aria-label="Знімок">
+        <svg class="ico" viewBox="0 0 24 24" aria-hidden="true" focusable="false" pointer-events="none">
+          <rect x="3.5" y="7" width="17" height="12.5" rx="2" fill="none" stroke="currentColor" stroke-width="1.75"/>
+          <circle cx="12" cy="13.2" r="3.2" fill="none" stroke="currentColor" stroke-width="1.75"/>
+          <path d="M9 7.2 10.2 4.8h3.6L15 7.2" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linejoin="round"/>
+        </svg>
+      </button>
+      <button type="button" class="icon-act" id="b-rec" title="Запис" aria-label="Запис">
+        <svg class="ico" viewBox="0 0 24 24" aria-hidden="true" focusable="false" pointer-events="none">
+          <circle cx="12" cy="12" r="6.2" fill="currentColor"/>
+        </svg>
+      </button>
     </div>
     <p class="media-path rail-only" id="media-path" hidden></p>
-    <div id="notice" class="rail-only" role="status"></div>
 
     <div class="hits-block" id="hits-block">
       <div class="hits-head">
-        <button type="button" class="section-toggle" id="b-hits" aria-expanded="true" aria-controls="hits">
-          <span>Знайдені передачі</span>
+        <button type="button" class="section-toggle hits-toggle" id="b-hits" aria-expanded="true" aria-controls="hits" title="Знайдені передачі" aria-label="Знайдені передачі">
+          <svg class="ico" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+            <path d="M12 3v11" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round"/>
+            <path d="M8.2 8.2a5.4 5.4 0 0 1 7.6 0M6 6a8 8 0 0 1 12 0" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round"/>
+            <path d="M12 14 8 21h8l-4-7z" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linejoin="round"/>
+          </svg>
           <span class="chev" aria-hidden="true"></span>
         </button>
-        <label class="compact-field" for="sel-hit-filter">
-          <span>фільтр</span>
+        <label class="compact-field compact-field-filter" for="sel-hit-filter">
+          <svg class="ico ico-sm" viewBox="0 0 24 24" aria-hidden="true" focusable="false" pointer-events="none">
+            <path d="M4 5h16l-6.2 7.4V19l-3.6 2v-8.6L4 5z" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linejoin="round"/>
+          </svg>
+          <span class="sr-only">фільтр</span>
           <select id="sel-hit-filter" aria-label="Фільтр знахідок">
             <option value="all">усі</option>
             <option value="hide_weak" selected>слабкі</option>
-            <option value="hide_no_video">без картинки</option>
+            <option value="hide_no_video">без відео</option>
             <option value="hide_near_dup">сусіди</option>
           </select>
         </label>
@@ -94,6 +115,9 @@
   </aside>
 
   <main id="main">
+    <button type="button" class="ghost panel-hide" id="b-panel-open" title="Показати панель" aria-label="Показати панель" aria-expanded="true" aria-controls="test-panel">
+      <span class="chev-show" aria-hidden="true"></span>
+    </button>
     <div class="stage-bar">
       <div class="status" id="bar-mode"><i class="dot off"></i><span>режим: —</span></div>
       <div class="status"><span id="bar-freq">—</span></div>
@@ -106,7 +130,7 @@
           <img id="pic" alt="Декодований кадр з приймача" width="640" height="480">
           <p class="hint" id="hint">Оберіть передачу зліва, щоб стати на її частоту.
             Приймач перейде в режим утримання й почне декодувати кадри.
-            Панель тесту лишається відкритою праворуч.</p>
+            Панель параметрів лишається відкритою праворуч.</p>
         </div>
         <div class="watch-strip" id="watch-strip" aria-live="polite">
           <span id="w-fps">кадрів —/с</span>
@@ -115,24 +139,11 @@
           <span id="w-spec">спектр —/с</span>
           <span id="w-age">кадр — мс</span>
           <span class="watch-afc" id="w-afc" hidden></span>
-          <span class="watch-note" id="w-note"></span>
         </div>
       </div>
       <div class="side-col">
-        <div class="metrics">
-          <div class="metric"><span class="k">Частота</span><span class="v" id="v-f">—</span></div>
-          <div class="metric"><span class="k">Стандарт</span><span class="v" id="v-std">—</span></div>
-          <div class="metric"><span class="k">Рядкова</span><span class="v" id="v-line">—</span></div>
-          <div class="metric"><span class="k">Рядків</span><span class="v" id="v-lines">—</span></div>
-          <div class="metric"><span class="k">Синхро</span><span class="v" id="v-lock"><i class="dot"></i>нема</span></div>
-          <div class="metric"><span class="k">Кадрів</span><span class="v" id="v-fps">0</span></div>
-        </div>
-
-        <aside class="fft-win" id="fft-win" hidden>
-          <button type="button" class="section-toggle" id="b-fft" aria-expanded="true" aria-controls="fft-body">
-            <span>Спектр</span>
-            <span class="chev" aria-hidden="true"></span>
-          </button>
+        <aside class="fft-win" id="fft-win">
+          <div class="fft-head">Спектр</div>
           <div class="fft-body" id="fft-body">
             <div class="fft-steps" role="group" aria-label="Крок частоти">
               <button type="button" data-mhz="-1">−1</button>
@@ -142,8 +153,14 @@
             </div>
             <div class="fft-read">
               <button type="button" data-mhz="-5">−5</button>
-              <div class="fft-mhz" aria-live="polite">
-                <span id="fft-num">—</span><span class="u">MHz</span>
+              <div class="fft-mhz" id="fft-mhz">
+                <button type="button" class="fft-freq-btn" id="b-fft-freq" aria-haspopup="dialog" aria-expanded="false" aria-controls="freq-pop" title="Ввести частоту" aria-label="Частота, натисніть щоб ввести">
+                  <span id="fft-num">—</span><span class="u">MHz</span>
+                </button>
+                <div class="freq-pop" id="freq-pop" hidden role="dialog" aria-label="Ввід частоти">
+                  <input id="manual-freq" type="text" inputmode="decimal" autocomplete="off" placeholder="МГц" aria-label="Частота, МГц">
+                  <button type="button" class="primary" id="b-manual-lock">Ввід</button>
+                </div>
               </div>
               <button type="button" data-mhz="5">+5</button>
             </div>
@@ -154,44 +171,13 @@
         </aside>
       </div>
     </div>
-
-    <div class="tune" id="tune-bar">
-      <input id="manual-freq" type="number" step="0.1" min="50" max="6000" placeholder="МГц, напр. 3480" aria-label="Частота, МГц">
-      <button type="button" id="b-manual-lock">Стати</button>
-    </div>
-
-    <div class="observe-dock" id="observe-dock">
-      <div class="session-bar" id="session-bar">
-        <div class="session-line">
-          <input id="sess-title" type="text" placeholder="Назва сесії" autocomplete="off">
-          <select id="sess-mode" aria-label="Режим сесії">
-            <option value="lock">утримання</option>
-            <option value="sweep">свіп</option>
-            <option value="manual">вручну</option>
-          </select>
-          <button type="button" class="primary" id="b-sess-start">Почати</button>
-          <button type="button" id="b-sess-pause" hidden>Пауза</button>
-          <button type="button" id="b-sess-resume" hidden>Продовжити</button>
-          <button type="button" id="b-sess-done" hidden>Завершити</button>
-          <span class="tp-meta" id="session-label">немає активної сесії</span>
-        </div>
-      </div>
-      <form class="quick-log" id="quick-form"></form>
-      <ul class="timeline" id="timeline"></ul>
-    </div>
   </main>
 
-  <aside class="test-panel" id="test-panel" aria-label="Панель тестування">
+  <aside class="test-panel" id="test-panel" aria-label="Панель параметрів">
     <div class="tp-head">
-      <h2>Тест</h2>
-      <button type="button" class="ghost" id="b-panel-close" aria-label="Сховати панель">×</button>
-    </div>
-    <p class="tp-meta" id="tp-api">каталог параметрів</p>
-    <p class="tp-meta apply-status" id="param-apply" role="status"></p>
-
-    <div class="tabs" role="tablist">
-      <button type="button" role="tab" data-tab="params" aria-selected="true">Параметри</button>
-      <button type="button" role="tab" data-tab="schema" aria-selected="false">Схема</button>
+      <button type="button" class="ghost panel-hide" id="b-panel-close" title="Приховати панель" aria-label="Приховати панель">
+        <span class="chev-panel" aria-hidden="true"></span>
+      </button>
     </div>
 
     <div class="tp-body">
@@ -204,23 +190,13 @@
           <kbd>-</kbd> <kbd>=</kbd> поріг ·
           <kbd>1</kbd> стан ·
           <kbd>2</kbd> скан ·
-          <kbd>Space</kbd> записати ·
-          <kbd>F2</kbd> тест
+          <kbd>F2</kbd> панель
         </p>
-      </div>
-
-      <div class="tp-pane" id="pane-schema" hidden>
-        <p class="tp-meta">Які поля збирати під час перегляду відео. Зберігається через PUT /api/test/observation-schema.</p>
-        <div id="schema-list"></div>
-        <div class="session-row">
-          <button type="button" id="b-schema-add">Додати поле</button>
-          <button type="button" class="primary" id="b-schema-save">Зберегти схему</button>
-        </div>
       </div>
     </div>
   </aside>
 
-  <script type="module" src="/static/js/app.js"></script>
+  <script type="module" src="/static/js/app.js?v=11"></script>
 </body>
 
 </html>

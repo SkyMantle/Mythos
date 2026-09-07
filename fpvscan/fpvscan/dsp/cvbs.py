@@ -701,12 +701,12 @@ def _attempt_tracked(v: np.ndarray, fs: float, width: int, max_lines: int,
                     state: DecodeState, abs_start: float,
                     tol_frac: float = 0.55,
                     auto_levels: bool = True, sharpen: float = 0.0,
-                    h_phase_frac: float = 0.0):
+                    h_phase_frac: float = 0.0, h_pll: bool = False):
     """Швидка спроба декодування зі знанням періоду й полярності.
 
     Шукає фронт кадрової синхри лише у вузькому вікні (±tol_frac·period)
-    навколо прогнозованої позиції. При успіху також повільно уточнює
-    state.period (вузькосмугова ФАПЧ за фазою) — див. коментар нижче.
+    навколо прогнозованої позиції. Якщо `h_pll`, повільно уточнює
+    state.period (вузькосмугова ФАПЧ за фазою поля). TBC ±15% завжди.
 
     Повертає (Frame, abs_t0) або None.
     """
@@ -788,15 +788,23 @@ def _attempt_tracked(v: np.ndarray, fs: float, width: int, max_lines: int,
     # як повний сліпий перерахунок; і тільки коли n_fields достатньо
     # велике, інакше похибка вимірювання самого t0 (одиниці відліків)
     # після ділення на малий n_fields дає нестабільно завищену поправку.
-    if n_fields >= 4:
-        phase_err = t0 - local_t0_pred
-        period_err_per_line = (phase_err / n_fields) / FIELD_LINES.get(standard, FIELD_LINES["?"])
-        alpha = 0.05
-        new_period = period + alpha * period_err_per_line
-        if 0.5 * period < new_period < 1.5 * period:   # запобіжник від викиду
-            state.period = new_period
+    if n_fields >= 4 and h_pll:
+        _pll_nudge_period(state, period, t0, local_t0_pred, n_fields, standard)
 
     return frame, abs_start + t0
+
+
+def _pll_nudge_period(state: DecodeState, period: float, t0: float,
+                      local_t0_pred: float, n_fields: int,
+                      standard: str) -> None:
+    """Slow H-line period PLL. Not a sample-by-sample loop."""
+    phase_err = t0 - local_t0_pred
+    period_err_per_line = (phase_err / n_fields) / FIELD_LINES.get(
+        standard, FIELD_LINES["?"])
+    alpha = 0.05
+    new_period = period + alpha * period_err_per_line
+    if 0.5 * period < new_period < 1.5 * period:
+        state.period = new_period
 
 
 def decode(base: np.ndarray, fs: float, width: int = 640,
@@ -807,7 +815,8 @@ def decode(base: np.ndarray, fs: float, width: int = 640,
         sharpen: float = 0.0,
         h_phase_frac: float = 0.0,
         crop_left_frac: float = CROP_LEFT_FRAC,
-        crop_bottom_lines: int = CROP_BOTTOM_LINES) -> Frame | None:
+        crop_bottom_lines: int = CROP_BOTTOM_LINES,
+        h_pll: bool = False) -> Frame | None:
     """Декодує напівкадр.
 
     Без `state` (або на першому виклику) — точнісінько як раніше:
@@ -827,7 +836,8 @@ def decode(base: np.ndarray, fs: float, width: int = 640,
             tracked = _attempt_tracked(v, fs, width, max_lines, state, abs_start,
                                        tol_frac, auto_levels=auto_levels,
                                        sharpen=sharpen,
-                                       h_phase_frac=h_phase_frac)
+                                       h_phase_frac=h_phase_frac,
+                                       h_pll=h_pll)
             if tracked is not None:
                 break
         if tracked is not None:

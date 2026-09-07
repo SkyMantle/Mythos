@@ -121,3 +121,15 @@ def test_tbc_footer_hold_bounds_last_line_delta() -> None:
     assert float(np.max(np.abs(tail))) <= 1e-6
     body = np.diff(held[:-TBC_FOOTER_HOLD]) - period
     assert float(np.max(np.abs(body))) <= TBC_DELTA_CLAMP + 1e-6
+
+
+def test_h_pll_nudge_updates_period_only_when_called() -> None:
+    from fpvscan.dsp.cvbs import DecodeState, _pll_nudge_period
+    state = DecodeState(period=64.0, standard="PAL")
+    frozen = 64.0
+    # Off path: helper is not called; period stays.
+    assert state.period == frozen
+    _pll_nudge_period(state, 64.0, t0=10.0, local_t0_pred=0.0, n_fields=8,
+                      standard="PAL")
+    assert state.period != frozen
+    assert 0.5 * frozen < float(state.period) < 1.5 * frozen

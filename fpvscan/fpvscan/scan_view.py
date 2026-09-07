@@ -130,14 +130,20 @@ def pending_for(
     return pending, {k: PENDING_REASONS[k] for k in pending}
 
 
+LOCK_LIVE_KEYS = frozenset({"video.h_pll"})
+
+
 def needs_lock_refresh(keys: Iterable[str]) -> bool:
-    return any(affect_of(k) == "picture" for k in keys)
+    """Restart reader/decode only when the picture path cannot pick up live."""
+    return any(
+        affect_of(k) == "picture" and k not in LOCK_LIVE_KEYS for k in keys
+    )
 
 
 # Coarse Nyquist tile (~26 MHz at 35 Msps). Cluster extras are
 # injected only around a coarse hit. Default spacing is 8 MHz.
 SWEEP_CLUSTER_STEP_DEFAULT_MHZ = 8.0
-SWEEP_HIT_TOL_HZ = 8.0e6
+SWEEP_HIT_TOL_HZ = 14.0e6
 SWEEP_HIT_SEE_HZ = 20.0e6
 SWEEP_DENSE_RADIUS_HZ = 20.0e6
 SWEEP_DENSE_ALIGN_HZ = 2.0e6
@@ -184,10 +190,10 @@ def _unique_hz(points: Iterable[float], tol_hz: float = 1.0e6) -> list[float]:
 
 
 def sweep_cluster_bands(priority_bands: Iterable[Any] | None) -> list[Any]:
-    """Dense ~4 MHz dwells: 433 / 900 / 1.2 / 3.3 / 5.8. Not the whole 400–2 GHz."""
+    """Dense extras: 433 / 900 / 1.2 / 2.4 / 3.3 / 5.8. Not a 400–2 GHz carpet."""
     from fpvscan.bands import PRIORITY_BANDS
     always = {b.name for b in PRIORITY_BANDS if b.name in {
-        "433", "900", "1G2", "3G3", "5G8",
+        "433", "900", "1G2", "2G4", "3G3", "5G8",
     }}
     extra = list(priority_bands or [])
     names = {getattr(b, "name", "") for b in extra}
@@ -202,7 +208,7 @@ def cluster_containing(
     freq_hz: float,
     priority_bands: Iterable[Any] | None = None,
 ) -> Any | None:
-    """433 / 900 / 1.2 / 3.3 / 5.8 band that holds freq, or None."""
+    """433 / 900 / 1.2 / 2.4 / 3.3 / 5.8 band that holds freq, or None."""
     hz = float(freq_hz)
     for band in sweep_cluster_bands(priority_bands):
         if float(band.start_hz) <= hz <= float(band.stop_hz):

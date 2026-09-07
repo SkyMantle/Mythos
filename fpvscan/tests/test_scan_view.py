@@ -76,7 +76,7 @@ def test_sweep_plan_visits_near_3489() -> None:
     assert abs(nearest_sweep_hz(extras, 3489e6) - 3489e6) <= 2.0e6
     assert len(extras) < 20
     assert extras_for_hit(near, float(near) + 25e6, full_scan) == []
-    assert extras_for_hit(2412e6, 2412e6, full_scan) == []
+    assert extras_for_hit(2412e6, 2412e6, full_scan)
 
 
 def test_cluster_step_8_vs_4_plan_size() -> None:
@@ -222,4 +222,5 @@ def test_pending_keys_only_retune_or_next_cycle() -> None:
     assert affect_of("scan.cluster_step_mhz") == "grid"
     assert affect_of("scan.hit_filter") == "detections"
     assert needs_lock_refresh(["video.sharpen"])
+    assert needs_lock_refresh(["video.h_pll"]) is False
     assert not needs_lock_refresh(["scan.start_hz"])

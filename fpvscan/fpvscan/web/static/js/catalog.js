@@ -44,8 +44,14 @@ export const TASK_TOOLS = {
         "video.afc", "video.afc_gain", "video.afc_deadband_hz",
         "video.afc_max_step_hz", "video.afc_digital_max_hz",
         "video.hunt", "video.hunt_every", "video.hunt_drop",
-        "sdr.gain_db", "sdr.settle_us", "video.capture_ms",
+        "sdr.gain_db", "sdr.bias_tee", "sdr.settle_us", "video.capture_ms",
       ],
+    },
+    {
+      id: "pll",
+      label: "ФАПЧ рядка",
+      tasks: ["pll"],
+      keys: ["video.h_pll"],
     },
     {
       id: "phase_tear",
@@ -107,7 +113,6 @@ export const PARAMETER_CATALOG = [
   // ---- shared: SDR, впливає на обидва режими ----
   n({
     key: "sdr.gain_db", group: "shared", label: "Підсилення",
-    help: "Почни з 30 і підбери, щоб АЦП не кліпало.",
     unit: "дБ", min: 0, max: 60, step: 1, default: 35,
   }),
   n({
@@ -127,7 +132,7 @@ export const PARAMETER_CATALOG = [
   }),
   b({
     key: "sdr.bias_tee", group: "shared", label: "Bias-T",
-    help: "Жвлення LNA на антенному порті.",
+    help: "4.5 В на RX для активної антени. Частина рядка gain, не окрема кнопка.",
     default: true,
   }),
   b({
@@ -402,6 +407,11 @@ export const PARAMETER_CATALOG = [
     key: "video.h_phase_frac", group: "lock", label: "Зсув H-фази · 0 = авто",
     help: "0 — авто-unwrap. Невеликий ненульовий зсув рухає гасіння; залиш 0, якщо смуга не посередині кадру. Великі значення ігноруються: смуга ховається обрізкою, не зсувом.",
     min: -0.5, max: 0.5, step: 0.01, default: 0,
+  }),
+  b({
+    key: "video.h_pll", group: "lock", label: "PLL",
+    help: "Повільно уточнює період рядка в DecodeState. Вимк — період заморожений після сліпого захоплення.",
+    default: false,
   }),
   e({
     key: "video.width", group: "lock", label: "Ширина кадру",

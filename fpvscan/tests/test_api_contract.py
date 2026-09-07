@@ -27,7 +27,12 @@ def test_parameter_and_session_http_contract() -> None:
     keys = {item["key"] for item in catalog.json()["items"]}
     assert "scan.threshold_db" in keys
     assert "video.afc" in keys
+    assert "sdr.gain_db" in keys
+    assert "sdr.bias_tee" in keys
     tagged = {item["key"]: item for item in catalog.json()["items"]}
+    assert tagged["video.h_pll"]["type"] == "bool"
+    assert tagged["video.h_pll"]["default"] is False
+    assert tagged["video.h_pll"]["task"] == "pll"
     assert tagged["scan.start_hz"]["task"] == "scan_width"
     assert tagged["scan.start_hz"]["modes"] == ["sweep"]
     assert tagged["scan.start_hz"]["affects"] == "grid"
@@ -56,12 +61,17 @@ def test_parameter_and_session_http_contract() -> None:
     assert "video.track_window_margin" in lock_keys
     assert "video.h_phase_frac" in lock_keys
     assert "video.average" in lock_keys
+    assert "video.h_pll" in lock_keys
+    assert "sdr.gain_db" in lock_keys
+    assert "sdr.bias_tee" in lock_keys
     assert "video.sample_rate" not in lock_keys
     assert "video.crop_left_frac" not in lock_keys
     assert "video.sharpen" not in lock_keys
     assert "scan.threshold_db" not in lock_keys
     tasks = {item["key"]: item["task"] for item in lock_items}
     assert tasks["sdr.gain_db"] == "picture_jump"
+    assert tasks["sdr.bias_tee"] == "picture_jump"
+    assert tasks["video.h_pll"] == "pll"
     assert tasks["video.track_window_margin"] == "phase_tear_h"
     assert tasks["video.motion_thresh"] == "phase_tear_v"
 
@@ -78,6 +88,14 @@ def test_parameter_and_session_http_contract() -> None:
     })
     assert applied.status_code == 200
     assert applied.json()["values"]["scan.threshold_db"] == 6.5
+
+    pll = client.put("/api/test/parameters", json={
+        "idempotency_key": str(uuid4()),
+        "values": {"video.h_pll": True},
+    })
+    assert pll.status_code == 200
+    assert pll.json()["values"]["video.h_pll"] is True
+    assert "video.h_pll" not in pll.json()["pending_keys"]
 
     created = client.post("/api/test/sessions", json={
         "idempotency_key": str(uuid4()),

@@ -70,6 +70,9 @@ _NAMED_ENUMS: dict[str, list[str]] = {
 _NAMED_LABELS: dict[str, str] = {
     "cluster_step_mhz": "Крок кластера",
     "hit_filter": "Фільтр знахідок",
+    "h_pll": "ФАПЧ рядка",
+    "gain_db": "Підсилення",
+    "bias_tee": "Bias-T",
 }
 _ENUM_LABELS: dict[str, dict[str, str]] = {
     "cluster_step_mhz": {

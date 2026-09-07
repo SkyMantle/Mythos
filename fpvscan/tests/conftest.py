@@ -50,6 +50,7 @@ class FakeEngine:
                 "motion_thresh": 24.0,
                 "track_window_margin": 1.45,
                 "h_phase_frac": 0.0,
+                "h_pll": False,
             },
             "sdr": {"gain_db": 35, "bias_tee": True, "settle_us": 500},
         }

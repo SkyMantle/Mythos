@@ -180,6 +180,67 @@ class VideoScore:
     reason: str = ""          # 0..1
 
 
+@dataclass(frozen=True)
+class _LineComb:
+    peak_f: float
+    prominence_db: float
+    harmonics: int
+
+
+def _decimate_for_line(base: np.ndarray, fs: float) -> tuple[np.ndarray, float]:
+    """ФНЧ + прорідження до ~400 кГц перед пошуком рядкової."""
+    dec = max(1, int(fs / 400e3))
+    x = base.astype(np.float32)
+    if dec > 1:
+        c = np.cumsum(np.concatenate(([0.0], x), dtype=np.float64))
+        x = ((c[dec:] - c[:-dec]) / dec)[::dec].astype(np.float32)
+    return x, fs / dec
+
+
+def _line_comb_spectrum(x: np.ndarray, fs2: float) -> _LineComb | None:
+    """Пік 15.0–16.2 кГц, підйом над фоном, 2–3 гармоніки."""
+    x = x - x.mean()
+    nfft = 1 << int(np.floor(np.log2(len(x))))
+    nfft = min(nfft, 1 << 16)
+    if nfft < 256:
+        return None
+    w = np.hanning(nfft).astype(np.float32)
+    sp = np.abs(np.fft.rfft(x[:nfft] * w)) ** 2
+    freqs = np.fft.rfftfreq(nfft, 1 / fs2)
+    sel = (freqs > 15.0e3) & (freqs < 16.2e3)
+    if not np.any(sel):
+        return None
+    idx = np.where(sel)[0]
+    peak_i = idx[np.argmax(sp[idx])]
+    peak_f = float(freqs[peak_i])
+    peak_p = float(sp[peak_i])
+    bg_sel = (freqs > 10e3) & (freqs < 25e3)
+    bg = float(np.median(sp[bg_sel])) + 1e-20
+    prominence_db = 10 * np.log10(peak_p / bg)
+    harm = 0
+    for h in (2, 3):
+        hf = peak_f * h
+        if hf >= freqs[-1]:
+            break
+        hi = int(hf / (fs2 / nfft))
+        win = sp[max(0, hi - 3):hi + 4]
+        if len(win) and 10 * np.log10(win.max() / bg) > 6:
+            harm += 1
+    return _LineComb(peak_f, prominence_db, harm)
+
+
+def line_comb_hint(base: np.ndarray, fs: float,
+                   min_prominence_db: float = 6.0) -> bool:
+    """Cheap 15.7 kHz comb on a short extra-dwell buffer. Not full classify."""
+    x, fs2 = _decimate_for_line(base, fs)
+    if len(x) < 256:
+        return False
+    comb = _line_comb_spectrum(x, fs2)
+    if comb is None:
+        return False
+    return bool(comb.prominence_db >= min_prominence_db)
+
+
 def classify_video(base: np.ndarray, fs: float,
                 tol_hz: float = 150.0,
                 min_prominence_db: float = 8.0,
@@ -190,46 +251,16 @@ def classify_video(base: np.ndarray, fs: float,
     # Просте прорідження тут неприпустиме: воно завернуло б увесь
     # спектр яскравості на ту саму ділянку. Ставимо перед ним
     # ковзне середнє — дешевий ФНЧ з нулями кратно частоті прорідження.
-    dec = max(1, int(fs / 400e3))
-    x = base.astype(np.float32)
-    if dec > 1:
-        c = np.cumsum(np.concatenate(([0.0], x), dtype=np.float64))
-        x = ((c[dec:] - c[:-dec]) / dec)[::dec].astype(np.float32)
-    fs2 = fs / dec
+    x, fs2 = _decimate_for_line(base, fs)
     if len(x) < 8192:      # менше ~20 мс ефіру — рядкову не виміряти
         return VideoScore(False, 0.0, "?", 0.0, reason="закороткий буфер")
 
-    x = x - x.mean()
-    nfft = 1 << int(np.floor(np.log2(len(x))))
-    nfft = min(nfft, 1 << 16)
-    w = np.hanning(nfft).astype(np.float32)
-    sp = np.abs(np.fft.rfft(x[:nfft] * w)) ** 2
-    freqs = np.fft.rfftfreq(nfft, 1 / fs2)
-
-    # шукаємо максимум у вікні 15.0–16.2 кГц
-    sel = (freqs > 15.0e3) & (freqs < 16.2e3)
-    if not np.any(sel):
+    comb = _line_comb_spectrum(x, fs2)
+    if comb is None:
         return VideoScore(False, 0.0, "?", 0.0, reason="нема лінії 15–16 кГц")
-    idx = np.where(sel)[0]
-    peak_i = idx[np.argmax(sp[idx])]
-    peak_f = float(freqs[peak_i])
-    peak_p = float(sp[peak_i])
-
-    # локальний фон: медіана в 10–25 кГц без самої лінії
-    bg_sel = (freqs > 10e3) & (freqs < 25e3)
-    bg = float(np.median(sp[bg_sel])) + 1e-20
-    prominence_db = 10 * np.log10(peak_p / bg)
-
-    # перевіряємо 2-у та 3-ю гармоніки — вони мають бути теж помітні
-    harm = 0
-    for h in (2, 3):
-        hf = peak_f * h
-        if hf >= freqs[-1]:
-            break
-        hi = int(hf / (fs2 / nfft))
-        win = sp[max(0, hi - 3):hi + 4]
-        if len(win) and 10 * np.log10(win.max() / bg) > 6:
-            harm += 1
+    peak_f = comb.peak_f
+    prominence_db = comb.prominence_db
+    harm = comb.harmonics
 
     std = "?"
     if abs(peak_f - LINE_PAL) < tol_hz:

@@ -56,6 +56,8 @@ def test_catalog_from_real_config_has_sweep_and_lock() -> None:
     assert LOCK_TASKS.keys() <= keys
     assert "video.sharpen" in keys
     assert LOCK_TASKS["video.h_phase_frac"] == "phase_tear_h"
+    assert LOCK_TASKS["video.h_pll"] == "pll"
+    assert LOCK_TASKS["sdr.bias_tee"] == "picture_jump"
     assert "video.sample_rate" not in LOCK_TASKS
     assert "video.crop_left_frac" not in LOCK_TASKS
     assert "video.crop_bottom_lines" not in LOCK_TASKS
@@ -63,6 +65,17 @@ def test_catalog_from_real_config_has_sweep_and_lock() -> None:
     hp = next(s for s in specs if s.key == "video.h_phase_frac")
     assert hp.task == "phase_tear_h"
     assert hp.min == -0.5 and hp.max == 0.5
+    pll = next(s for s in specs if s.key == "video.h_pll")
+    assert pll.type == "bool"
+    assert pll.default is False
+    assert pll.task == "pll"
+    assert pll.affects == "picture"
+    gain = next(s for s in specs if s.key == "sdr.gain_db")
+    assert gain.task == "picture_jump"
+    bias = next(s for s in specs if s.key == "sdr.bias_tee")
+    assert bias.type == "bool"
+    assert "gain" in bias.description.lower() or "Bias" in bias.description
+    assert "Bias-T" in gain.description or "bias" in gain.description.lower()
     dead = next(s for s in specs if s.key == "video.afc_deadband_hz")
     assert dead.max == 500_000
     dmax = next(s for s in specs if s.key == "video.afc_digital_max_hz")
@@ -98,6 +111,11 @@ def test_list_parameters_mode_returns_curated_tasks(engine, store) -> None:
         assert by_task["video.track_window_margin"] == "phase_tear_h"
         assert by_task["video.h_phase_frac"] == "phase_tear_h"
         assert by_task["video.average"] == "phase_tear_v"
+        assert by_task["video.h_pll"] == "pll"
+        assert by_task["sdr.bias_tee"] == "picture_jump"
+        pll = next(s for s in lock if s.key == "video.h_pll")
+        assert pll.type == "bool"
+        assert pll.default is False
         assert {s.key for s in full} > {s.key for s in sweep} | {s.key for s in lock}
         with pytest.raises(ValidationError, match="sweep or lock"):
             await svc.list_parameters("waterfall")
@@ -186,6 +204,20 @@ def test_lock_apply_refreshes_picture_knobs(engine, store) -> None:
         swept = await svc.apply_parameters(uuid4(), {"video.sample_rate": 20e6})
         assert "video.sample_rate" in swept.pending_keys
         assert swept.pending_reasons["video.sample_rate"] == "next lock retune"
+        assert ("refresh_lock", {}) not in engine.commands
+
+    import asyncio
+    asyncio.run(run())
+
+
+def test_apply_h_pll_live_on_lock(engine, store) -> None:
+    svc = ParameterService(engine, store)
+
+    async def run() -> None:
+        result = await svc.apply_parameters(uuid4(), {"video.h_pll": True})
+        assert result.values["video.h_pll"] is True
+        assert result.affects["video.h_pll"] == "picture"
+        assert "video.h_pll" not in result.pending_keys
         assert ("refresh_lock", {}) not in engine.commands
 
     import asyncio

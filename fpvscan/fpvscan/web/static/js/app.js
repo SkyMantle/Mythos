@@ -4,7 +4,7 @@ import {
 } from "./catalog.js"
 import {
   TestClient, engineLock, engineSweep, engineClear, engineSnapshot,
-  engineRecord, engineBias, engineState,
+  engineRecord, engineState,
 } from "./api.js"
 
 const F0 = 400e6, F1 = 6000e6
@@ -12,6 +12,16 @@ const UI_LS = "fpvscan.ui.v1"
 const client = new TestClient()
 
 const $ = id => document.getElementById(id)
+function on(id, ev, fn) {
+  const el = $(id)
+  if (!el) return
+  el.addEventListener(ev, fn)
+}
+function bindClick(id, fn) {
+  const el = $(id)
+  if (!el) return
+  el.onclick = fn
+}
 const live = {
   mode: "",
   freqHz: null,
@@ -89,7 +99,8 @@ const LOCK_RETUNE = new Set([
   "video.sample_rate", "video.capture_ms", "video.hunt",
   "video.hunt_every", "video.hunt_drop", "sdr.settle_us",
 ])
-const LOCK_HIDE = new Set(["video.sample_rate"])
+const LOCK_HIDE = new Set(["video.sample_rate", "sdr.gain_db", "video.h_pll", "video.pll_enable"])
+const PANEL_SKIP = new Set(["scan_grid", "hit_filter", "pll", "picture_jump", "phase_tear", "phase_tear_h", "phase_tear_v"])
 
 const dirty = { spec: false, grid: false, frame: false, hud: true }
 const motion = {
@@ -123,8 +134,10 @@ let picGen = 0
 const specStamps = []
 let lastHudAt = 0
 
-const gridCv = $("grid-pass"), gctx = gridCv.getContext("2d")
-const fftCv = $("fft"), fftx = fftCv.getContext("2d")
+const gridCv = $("grid-pass")
+const gctx = gridCv ? gridCv.getContext("2d") : null
+const fftCv = $("fft")
+const fftx = fftCv ? fftCv.getContext("2d") : null
 
 function reduceMotion() {
   return window.matchMedia("(prefers-reduced-motion: reduce)").matches
@@ -258,19 +271,9 @@ function updateWatchStrip() {
   put("w-sync", `синхро ${live.locked ? "є" : "нема"}`)
   put("w-spec", `спектр ${rate}/с`)
   put("w-age", age == null ? "кадр — мс" : `кадр ${age} мс`)
-  const notes = []
-  if (watching && age != null && age > 100) {
-    notes.push(`кадр запізнюється ${age} мс — картинка може стрибати`)
-  }
-  if (watching && fps > 0 && fps < 15) {
-    notes.push(`кадрів мало: ${fps.toFixed(1)}/с`)
-  }
-  if (watching && rate < 2) {
-    notes.push(`спектр рідко: ${rate}/с — смуга може замирати`)
-  }
   const noteEl = $("w-note")
-  if (noteEl) noteEl.textContent = notes.join(" · ")
-  el.classList.toggle("lag", notes.length > 0)
+  if (noteEl) noteEl.textContent = ""
+  el.classList.remove("lag")
   updateAfcLimitUi()
   applyLockAutofill()
 }
@@ -308,6 +311,46 @@ function startPaint() {
   rafStarted = true
   requestAnimationFrame(paint)
 }
+
+function connect() {
+  try {
+    sock = new WebSocket((location.protocol === "https:" ? "wss" : "ws") + "://" + location.host + "/ws")
+  } catch (err) {
+    setWs(false, "нема")
+    setTimeout(connect, 1500)
+    return
+  }
+  const ws = sock
+  ws.onopen = () => setWs(true, "є")
+  ws.onerror = () => setWs(false, "помилка")
+  ws.onclose = () => { setWs(false, "нема"); setTimeout(connect, 1500) }
+  ws.onmessage = e => {
+    try {
+      live.lastWs = Date.now()
+      const m = JSON.parse(e.data)
+      if (m.type === "spectrum") {
+        markSpectrumMsg()
+        applySpectrumPayload(m.data)
+      } else if (m.type === "detection") {
+        hits.set(Math.round(m.data.freq_hz / 1e6), m.data)
+        renderHits()
+        dirty.grid = true
+      } else if (m.type === "frame") queueFrame(m.data)
+      else if (m.type === "state") {
+        const d = m.data || {}
+        if (d.spectrum || Array.isArray(d.bins)) markSpectrumMsg()
+        applyState(d)
+      }
+      else if (m.type === "notice") note(m.data.text, m.data.level === "error")
+    } catch (err) {
+      console.error("обробка повідомлення:", err, String(e.data).slice(0, 200))
+      note("помилка в браузері: " + err.message, true)
+    }
+  }
+}
+
+startPaint()
+connect()
 
 const fmt = hz => {
   if (hz == null || !Number.isFinite(hz)) return "—"
@@ -427,14 +470,14 @@ function drawGridStrip() {
   const idx = grid.pass_index || 0
   const cnt = grid.pass_count || 0
   const done = grid.passes_done || 0
-  $("grid-pass-label").textContent = cnt
+  put("grid-pass-label", cnt
     ? `прохід ${idx} / ${cnt} · ${done} ок`
-    : "прохід —"
+    : "прохід —")
   const span = (grid.start_hz && grid.stop_hz)
     ? `${fmt(grid.start_hz)} – ${fmt(grid.stop_hz)}`
     : ""
-  $("grid-pos").textContent = [pos ? fmt(pos) : null, span].filter(Boolean).join(" · ") || "—"
-  $("cov").textContent = "покриття " + Math.round(p * 100) + "%"
+  put("grid-pos", [pos ? fmt(pos) : null, span].filter(Boolean).join(" · ") || "—")
+  put("cov", "покриття " + Math.round(p * 100) + "%")
 }
 
 function displayedFreqHz() {
@@ -540,9 +583,10 @@ function drawMiniSpectrum() {
 }
 
 function setWatching(on) {
-  document.querySelector("main").classList.toggle("watching", !!on)
+  const main = document.querySelector("main")
+  if (main) main.classList.toggle("watching", !!on)
   const win = $("fft-win")
-  if (win) win.hidden = !on
+  if (win) win.hidden = false
   if (on) {
     dirty.spec = true
     dirty.hud = true
@@ -551,6 +595,7 @@ function setWatching(on) {
 
 function renderHits() {
   const el = $("hits")
+  if (!el) return
   if (!hits.size) {
     el.innerHTML = "<p class=\"empty\">Поки нічого. Кандидат потрапляє сюди лише після підтвердження рядкової частоти.</p>"
     return
@@ -596,17 +641,12 @@ function rememberMediaPath(text) {
 
 function note(text, err) {
   rememberMediaPath(text)
-  const el = $("notice")
-  if (!el) return
-  const d = document.createElement("div")
-  if (err) d.className = "err"
-  d.textContent = text
-  el.prepend(d)
-  while (el.childNodes.length > 3) el.removeChild(el.lastChild)
+  if (err) console.warn("fpvscan:", text)
 }
 
 function setWs(up, txt) {
   const el = $("s-ws")
+  if (!el) return
   el.textContent = txt
   el.className = up ? "up" : "down"
 }
@@ -669,16 +709,24 @@ function applyState(s) {
   if (s.lock_target) live.freqHz = s.lock_target
   if (s.tuned_hz) current = current || s.tuned_hz
   const b = $("b-rec")
-  b.classList.toggle("on", live.recording)
-  b.textContent = live.recording ? `Стоп ${s.rec_seconds | 0}с` : "Запис"
-  const bt = $("b-bias")
-  if (bt) bt.classList.toggle("on", !!s.bias_tee)
-  $("s-src").textContent = s.source
+  if (b) {
+    b.classList.toggle("on", live.recording)
+    const recLabel = live.recording ? `Стоп запис ${s.rec_seconds | 0}с` : "Запис"
+    b.title = recLabel
+    b.setAttribute("aria-label", recLabel)
+  }
+  const biasInp = document.querySelector(".bias-toggle input")
+  if (biasInp) biasInp.checked = !!s.bias_tee
+  if (s.bias_tee != null) values["sdr.bias_tee"] = !!s.bias_tee
+  const srcEl = $("s-src")
+  if (srcEl) srcEl.textContent = s.source
   const m = $("s-mode")
-  m.textContent = s.mode
-  m.className = "mode-" + s.mode
-  $("s-tuned").textContent = fmt(s.tuned_hz)
-  $("s-sweeps").textContent = s.sweeps_done
+  if (m) {
+    m.textContent = s.mode
+    m.className = "mode-" + s.mode
+  }
+  put("s-tuned", fmt(s.tuned_hz))
+  put("s-sweeps", s.sweeps_done)
   ingestAfcLimit(s)
   if (live.afcHz != null) put("v-afc", fmtAfc(live.afcHz))
   if (s.last_frame_ref) live.lastShot = s.last_frame_ref
@@ -689,8 +737,10 @@ function applyState(s) {
   updateMediaPath()
   const cf = (s.clip_frac || 0) * 100
   const cl = $("s-clip")
-  cl.textContent = cf.toFixed(2) + "%"
-  cl.className = cf > 0.1 ? "bad" : ""
+  if (cl) {
+    cl.textContent = cf.toFixed(2) + "%"
+    cl.className = cf > 0.1 ? "bad" : ""
+  }
   if (s.fps != null) metric("v-fps", Number(s.fps).toFixed(1), " /с")
   const barMode = $("bar-mode")
   if (barMode) {
@@ -713,8 +763,9 @@ async function lock(f) {
   live.freqHz = f
   live.mode = "LOCK"
   await engineLock(f)
-  $("v-f").textContent = fmt(f)
-  $("manual-freq").value = (f / 1e6).toFixed(1)
+  put("v-f", fmt(f))
+  const mf = $("manual-freq")
+  if (mf) mf.value = (f / 1e6).toFixed(1)
   setWatching(true)
   renderHits()
   dirty.grid = true
@@ -773,37 +824,47 @@ async function commitScanMenu(key, value) {
   }
 }
 
-$("sel-cluster").onchange = () => {
-  commitScanMenu("scan.cluster_step_mhz", clusterPayload($("sel-cluster").value))
-}
-$("sel-hit-filter").onchange = () => {
-  commitScanMenu("scan.hit_filter", $("sel-hit-filter").value)
-}
-
-$("b-sweep").onclick = async () => {
-  current = null
-  live.freqHz = null
-  live.locked = false
-  live.mode = "SWEEP"
-  await engineSweep()
-  hideVideo()
-  setWatching(false)
-  renderHits()
-  dirty.grid = true
-  syncParamToolset()
-}
+on("sel-cluster", "change", () => {
+  const el = $("sel-cluster")
+  if (!el) return
+  commitScanMenu("scan.cluster_step_mhz", clusterPayload(el.value))
+})
+on("sel-hit-filter", "change", () => {
+  const el = $("sel-hit-filter")
+  if (!el) return
+  commitScanMenu("scan.hit_filter", el.value)
+})
 
 function hideVideo() {
   latestFrame = null
   dirty.frame = false
   revokePics()
   const img = $("pic")
-  img.removeAttribute("src")
-  img.style.display = "none"
-  $("hint").hidden = false
+  if (img) {
+    img.removeAttribute("src")
+    img.style.display = "none"
+  }
+  const hint = $("hint")
+  if (hint) hint.hidden = false
 }
 
-$("b-clear").onclick = async () => {
+function startSweep() {
+  current = null
+  live.freqHz = null
+  live.locked = false
+  live.mode = "SWEEP"
+  hideVideo()
+  setWatching(false)
+  renderHits()
+  dirty.grid = true
+  syncParamToolset()
+  return engineSweep()
+}
+
+bindClick("b-sweep", () => {
+  startSweep().catch(err => note(String(err && err.message || err), true))
+})
+bindClick("b-clear", async () => {
   await engineClear()
   hits.clear()
   grid.progress_01 = 0
@@ -811,12 +872,17 @@ $("b-clear").onclick = async () => {
   grid.visiting_hz = []
   renderHits()
   dirty.grid = true
-}
-$("b-shot").onclick = () => engineSnapshot()
-$("b-rec").onclick = async () => { await engineRecord(!live.recording) }
-$("b-bias").onclick = async () => {
-  const on = !$("b-bias").classList.contains("on")
-  await engineBias(on)
+})
+bindClick("b-shot", () => engineSnapshot())
+bindClick("b-rec", async () => { await engineRecord(!live.recording) })
+{
+  const el = $("b-bias")
+  if (el) {
+    el.onclick = async () => {
+      const inp = document.querySelector(".bias-toggle input")
+      if (inp) inp.click()
+    }
+  }
 }
 
 function nudge(deltaHz) {
@@ -827,54 +893,76 @@ function nudge(deltaHz) {
 function stepLock(mhz) {
   nudge(Number(mhz) * 1e6)
 }
+function parseMhz(raw) {
+  const v = parseFloat(String(raw || "").replace(",", ".").replace(/\s/g, ""))
+  return Number.isFinite(v) && v > 0 ? v : NaN
+}
+
+function closeFreqPop() {
+  const pop = $("freq-pop")
+  const btn = $("b-fft-freq")
+  if (pop) pop.hidden = true
+  if (btn) btn.setAttribute("aria-expanded", "false")
+}
+
+function openFreqPop() {
+  const pop = $("freq-pop")
+  const btn = $("b-fft-freq")
+  const inp = $("manual-freq")
+  if (!pop) return
+  pop.hidden = false
+  if (btn) btn.setAttribute("aria-expanded", "true")
+  const hz = displayedFreqHz()
+  if (inp) {
+    inp.value = hz ? (hz / 1e6).toFixed(1).replace(".", ",") : ""
+    inp.focus()
+    inp.select()
+  }
+}
+
+function commitManualFreq() {
+  const inp = $("manual-freq")
+  if (!inp) return
+  const v = parseMhz(inp.value)
+  if (isNaN(v)) return
+  closeFreqPop()
+  lock(v * 1e6)
+}
+
 document.querySelectorAll("#fft-win [data-mhz]").forEach(btn => {
   btn.addEventListener("click", () => stepLock(btn.dataset.mhz))
 })
-$("b-manual-lock").onclick = () => {
-  const v = parseFloat($("manual-freq").value)
-  if (!isNaN(v) && v > 0) lock(v * 1e6)
-}
-$("manual-freq").addEventListener("keydown", e => {
-  if (e.key === "Enter") $("b-manual-lock").click()
+on("b-fft-freq", "click", e => {
+  e.stopPropagation()
+  const pop = $("freq-pop")
+  if (pop && !pop.hidden) closeFreqPop()
+  else openFreqPop()
 })
-
-function connect() {
-  sock = new WebSocket((location.protocol === "https:" ? "wss" : "ws") + "://" + location.host + "/ws")
-  const ws = sock
-  ws.onopen = () => setWs(true, "є")
-  ws.onerror = () => setWs(false, "помилка")
-  ws.onclose = () => { setWs(false, "нема"); setTimeout(connect, 1500) }
-  ws.onmessage = e => {
-    try {
-      live.lastWs = Date.now()
-      const m = JSON.parse(e.data)
-      if (m.type === "spectrum") {
-        markSpectrumMsg()
-        applySpectrumPayload(m.data)
-      } else if (m.type === "detection") {
-        hits.set(Math.round(m.data.freq_hz / 1e6), m.data)
-        renderHits()
-        dirty.grid = true
-      } else if (m.type === "frame") queueFrame(m.data)
-      else if (m.type === "state") {
-        const d = m.data || {}
-        if (d.spectrum || Array.isArray(d.bins)) markSpectrumMsg()
-        applyState(d)
-      }
-      else if (m.type === "notice") note(m.data.text, m.data.level === "error")
-    } catch (err) {
-      console.error("обробка повідомлення:", err, String(e.data).slice(0, 200))
-      note("помилка в браузері: " + err.message, true)
-    }
+on("b-manual-lock", "click", () => commitManualFreq())
+on("manual-freq", "keydown", e => {
+  if (e.key === "Enter") {
+    e.preventDefault()
+    commitManualFreq()
   }
-}
+  if (e.key === "Escape") {
+    e.preventDefault()
+    closeFreqPop()
+  }
+})
+document.addEventListener("mousedown", e => {
+  const pop = $("freq-pop")
+  if (!pop || pop.hidden) return
+  const btn = $("b-fft-freq")
+  if (pop.contains(e.target) || (btn && btn.contains(e.target))) return
+  closeFreqPop()
+})
 
 setInterval(async () => {
   if (Date.now() - live.lastWs < 4000) return
   try {
     const s = await engineState()
     if (s.error) { note("сервер: " + s.error, true); return }
-    applyState(s)
+    try { applyState(s) } catch (err) { console.error("стан:", err) }
     setWs(false, "опитування")
   } catch {
     setWs(false, "нема")
@@ -884,7 +972,6 @@ setInterval(async () => {
 setInterval(() => {
   if (live.mode !== "LOCK") return
   if (Date.now() - live.lastFrameAt < 6000) return
-  note("потік кадрів мовчить — перепідключаюсь", true)
   if (sock) { try { sock.close() } catch { /* ignore */ } }
   dirty.hud = true
 }, 2000)
@@ -934,17 +1021,16 @@ setInterval(async () => {
 /* ---------------- testing panel ---------------- */
 
 function setTab(id) {
-  if (id === "observe" || id === "test") id = "params"
-  panelTab = id
+  if (id === "observe" || id === "test" || id === "schema") id = "params"
+  panelTab = "params"
   for (const btn of document.querySelectorAll(".tabs [role=tab]")) {
     btn.setAttribute("aria-selected", btn.dataset.tab === id ? "true" : "false")
   }
   for (const pane of document.querySelectorAll(".tp-pane")) {
-    pane.hidden = pane.id !== "pane-" + id
+    pane.hidden = pane.id !== "pane-params"
   }
   if (location.hash && location.hash.startsWith("#")) {
-    const want = id === "params" ? "#test" : "#" + id
-    if (location.hash !== want) history.replaceState(null, "", want)
+    if (location.hash !== "#test") history.replaceState(null, "", "#test")
   }
 }
 
@@ -961,14 +1047,34 @@ function applyCollapsed(key, collapsed, btn) {
   const cls = ({ rail: "rail-collapsed", status: "status-collapsed", hits: "hits-collapsed", fft: "fft-collapsed", panel: "panel-collapsed" })[key]
   document.body.classList.toggle(cls, !!collapsed)
   if (btn) btn.setAttribute("aria-expanded", collapsed ? "false" : "true")
-  if (key === "panel") $("b-panel").textContent = collapsed ? "Тест" : "Сховати"
-  if (key === "rail") $("b-rail").textContent = collapsed ? "›" : "‹"
+  if (key === "rail") {
+    const rail = $("b-rail")
+    if (rail) {
+      const label = collapsed ? "Розгорнути скан" : "Згорнути скан"
+      rail.title = label
+      rail.setAttribute("aria-label", label)
+    }
+  }
+  if (key === "panel") {
+    const hideBtn = $("b-panel-close")
+    if (hideBtn) {
+      hideBtn.title = "Приховати панель"
+      hideBtn.setAttribute("aria-label", "Приховати панель")
+      hideBtn.setAttribute("aria-expanded", collapsed ? "false" : "true")
+    }
+    const openBtn = $("b-panel-open")
+    if (openBtn) {
+      openBtn.title = "Показати панель"
+      openBtn.setAttribute("aria-label", "Показати панель")
+      openBtn.setAttribute("aria-expanded", collapsed ? "false" : "true")
+    }
+  }
 }
 
 function toggleUi(key, force) {
   const cls = ({ rail: "rail-collapsed", status: "status-collapsed", hits: "hits-collapsed", fft: "fft-collapsed", panel: "panel-collapsed" })[key]
   const hide = force == null ? !document.body.classList.contains(cls) : !force
-  const btn = ({ rail: $("b-rail"), status: $("b-status"), hits: $("b-hits"), fft: $("b-fft"), panel: $("b-panel") })[key]
+  const btn = ({ rail: $("b-rail"), status: $("b-status"), hits: $("b-hits"), fft: $("b-fft"), panel: $("b-panel-close") })[key]
   applyCollapsed(key, hide, btn)
   saveUi({ [key]: hide })
 }
@@ -979,8 +1085,8 @@ function restoreUi() {
   applyCollapsed("rail", !!u.rail, $("b-rail"))
   applyCollapsed("status", !!u.status, $("b-status"))
   applyCollapsed("hits", !!u.hits, $("b-hits"))
-  applyCollapsed("fft", !!u.fft, $("b-fft"))
-  applyCollapsed("panel", !!u.panel, $("b-panel"))
+  document.body.classList.remove("fft-collapsed")
+  applyCollapsed("panel", false, $("b-panel-close"))
 }
 
 function togglePanel(force) {
@@ -1071,8 +1177,8 @@ function specTask(spec) {
   return ""
 }
 
-function specsForSection(section) {
-  const hide = currentToolset() === "lock" ? LOCK_HIDE : null
+function specsForSection(section, toolset) {
+  const hide = toolset === "lock" ? LOCK_HIDE : null
   const tags = new Set(section.tasks || [section.id])
   const tagged = catalog.filter(p => tags.has(specTask(p)))
   const seen = new Set()
@@ -1111,36 +1217,73 @@ function appendGroupHead(root, section, extra) {
   root.appendChild(head)
 }
 
-function renderParams() {
-  const root = $("param-groups")
-  if (!root) return
-  root.innerHTML = ""
-  const mode = currentToolset()
-  const sections = TASK_TOOLS[mode] || []
-  if (mode === "lock") {
-    const bar = document.createElement("div")
-    bar.className = "group-head toolset-bar"
-    const hint = document.createElement("span")
-    hint.id = "lock-group-hint"
-    hint.className = "group-hint"
-    hint.hidden = ![...pendingNow].some(k => LOCK_RETUNE.has(k) || (k || "").startsWith("video."))
-    hint.textContent = "потрібен lock, щоб змінити картинку"
-    bar.appendChild(hint)
-    const tog = document.createElement("label")
-    tog.className = "auto-relock"
-    tog.innerHTML = `<input type="checkbox"${autoRelock ? " checked" : ""}> авто lock`
-    tog.querySelector("input").addEventListener("change", e => {
-      autoRelock = e.target.checked
-      saveUi({ autoRelock })
-    })
-    bar.appendChild(tog)
-    root.appendChild(bar)
+function pllKey() {
+  if (specByKey("video.pll_enable")) return "video.pll_enable"
+  return "video.h_pll"
+}
+
+function lockCompact() {
+  return currentToolset() === "lock" && autoRelock
+}
+
+function appendBoolChip(parent, spec, label) {
+  const key = spec.key
+  const on = !!(values[key] ?? spec.default)
+  const lab = document.createElement("label")
+  lab.className = "toggle auto-relock"
+  lab.innerHTML = `<input type="checkbox"${on ? " checked" : ""}> ${esc(label || spec.label)}`
+  lab.querySelector("input").addEventListener("change", e => {
+    commitParam(key, e.target.checked, true)
+  })
+  parent.appendChild(lab)
+}
+
+function appendGainBiasRow(root) {
+  const gain = specByKey("sdr.gain_db")
+  if (!gain) return
+  const wrap = paramRow(gain)
+  wrap.classList.add("gain-bias")
+  const bias = specByKey("sdr.bias_tee") || {
+    key: "sdr.bias_tee", type: "bool", label: "Bias-T", default: true,
   }
-  for (const section of sections) {
+  const ctrl = wrap.querySelector(".param-ctrl")
+  const lab = document.createElement("label")
+  lab.className = "toggle bias-toggle"
+  const on = !!(values[bias.key] ?? bias.default)
+  lab.innerHTML = `<input type="checkbox"${on ? " checked" : ""}> Bias-T`
+  lab.title = "Bias-T · живлення LNA"
+  lab.querySelector("input").addEventListener("change", e => {
+    commitParam(bias.key, e.target.checked, true)
+  })
+  ctrl.appendChild(lab)
+  root.appendChild(wrap)
+}
+
+function appendLockCore(root) {
+  const bar = document.createElement("div")
+  bar.className = "group-head toolset-bar"
+  const tog = document.createElement("label")
+  tog.className = "auto-relock"
+  tog.innerHTML = `<input type="checkbox"${autoRelock ? " checked" : ""}> авто lock`
+  tog.querySelector("input").addEventListener("change", e => {
+    autoRelock = e.target.checked
+    saveUi({ autoRelock })
+    applyToolsetEnabled()
+  })
+  bar.appendChild(tog)
+  const pll = specByKey(pllKey()) || { key: pllKey(), type: "bool", label: "PLL", default: false }
+  appendBoolChip(bar, pll, "PLL")
+  root.appendChild(bar)
+  appendGainBiasRow(root)
+}
+
+function appendTaskSections(root, mode) {
+  for (const section of TASK_TOOLS[mode] || []) {
+    if (PANEL_SKIP.has(section.id)) continue
     if (section.children) {
       appendGroupHead(root, section)
       for (const child of section.children) {
-        const items = specsForSection(child)
+        const items = specsForSection(child, mode)
         if (!items.length) continue
         const sub = document.createElement("h4")
         sub.className = "sub-head"
@@ -1150,29 +1293,63 @@ function renderParams() {
       }
       continue
     }
-    const items = specsForSection(section)
-    if (!items.length && section.id !== "picture_jump") continue
+    const items = specsForSection(section, mode)
+    if (!items.length) continue
     appendGroupHead(root, section)
-    if (section.id === "picture_jump") {
-      const note = document.createElement("p")
-      note.id = "afc-limit-note"
-      note.className = "afc-limit"
-      note.setAttribute("role", "status")
-      note.hidden = true
-      root.appendChild(note)
-    }
     for (const spec of items) root.appendChild(paramRow(spec))
   }
+}
+
+function applyToolsetEnabled() {
+  const root = $("param-groups")
+  if (!root) return
+  const mode = currentToolset()
+  for (const fs of root.querySelectorAll("fieldset.toolset")) {
+    const on = fs.dataset.toolset === mode
+    fs.disabled = !on
+    fs.classList.toggle("off", !on)
+  }
+  const extra = root.querySelector("fieldset.toolset-extra")
+  if (extra) {
+    const extraOn = mode === "lock" && !autoRelock
+    extra.disabled = !extraOn
+    extra.classList.toggle("off", !extraOn)
+  }
+}
+
+function renderParams() {
+  const root = $("param-groups")
+  if (!root) return
+  root.innerHTML = ""
+  const sweepBox = document.createElement("fieldset")
+  sweepBox.className = "toolset"
+  sweepBox.dataset.toolset = "sweep"
+  appendTaskSections(sweepBox, "sweep")
+  root.appendChild(sweepBox)
+  const lockBox = document.createElement("fieldset")
+  lockBox.className = "toolset"
+  lockBox.dataset.toolset = "lock"
+  appendLockCore(lockBox)
+  root.appendChild(lockBox)
+  applyToolsetEnabled()
   markPendingRows([...pendingNow], pendingWhy)
   updateAfcLimitUi()
 }
 
 async function syncParamToolset(force) {
   const next = currentToolset()
-  if (!force && next === toolsetMode) return
+  if (!force && toolsetKeys) {
+    toolsetMode = next
+    applyToolsetEnabled()
+    return
+  }
   toolsetMode = next
-  const items = await client.listParameters(next)
-  if (items && items.length) {
+  const lists = await Promise.all([
+    client.listParameters("sweep"),
+    client.listParameters("lock"),
+  ])
+  const items = lists.flatMap(list => list || [])
+  if (items.length) {
     toolsetKeys = new Set(items.map(p => p.key))
     const byKey = new Map(catalog.map(p => [p.key, p]))
     for (const p of items) byKey.set(p.key, p)
@@ -1190,11 +1367,12 @@ function paramRow(spec) {
   const stored = values[spec.key] ?? spec.default
   const dirty = !sameValue(stored, defaults[spec.key] ?? spec.default)
   if (dirty) wrap.classList.add("dirty")
-  const help = spec.help ? `<p class="param-help">${esc(spec.help)}</p>` : ""
+  const help = spec.key !== "sdr.gain_db" && spec.help
+    ? `<p class="param-help">${esc(spec.help)}</p>`
+    : ""
   wrap.innerHTML = `
     <div class="param-head">
       <label for="p-${cssId(spec.key)}">${esc(spec.label)}</label>
-      <span class="param-effect">${esc(effectLabel(spec))}</span>
       <span class="param-def">типово ${esc(formatDefault({ ...spec, default: defaults[spec.key] ?? spec.default }))}</span>
       <button type="button" class="param-reset ghost" data-reset="${esc(spec.key)}">скинути</button>
     </div>
@@ -1307,10 +1485,22 @@ function sectionById(gid) {
   return null
 }
 
+function sectionToolset(section) {
+  if (!section) return currentToolset()
+  for (const [mode, sections] of Object.entries(TASK_TOOLS)) {
+    for (const s of sections) {
+      if (s.id === section.id) return mode
+      if ((s.children || []).some(c => c.id === section.id)) return mode
+    }
+  }
+  return currentToolset()
+}
+
 async function resetGroup(gid) {
   const section = sectionById(gid)
+  const mode = sectionToolset(section)
   const items = section
-    ? [...specsForSection(section), ...(section.children || []).flatMap(specsForSection)]
+    ? [...specsForSection(section, mode), ...(section.children || []).flatMap(c => specsForSection(c, mode))]
     : catalog.filter(p => p.group === gid)
   const patch = {}
   for (const spec of items) {
@@ -1325,9 +1515,9 @@ async function resetGroup(gid) {
 }
 
 function setApiStatus(remote) {
-  $("tp-api").textContent = remote
+  put("tp-api", remote
     ? "параметри на сервері"
-    : "локальний каталог · /api/test ще не відповідає"
+    : "локальний каталог · /api/test ще не відповідає")
 }
 
 function activeSession() {
@@ -1338,6 +1528,7 @@ function activeSession() {
 }
 
 function renderSessionChrome() {
+  if (!$("observe-dock") && !$("quick-form") && !$("session-bar")) return
   const s = activeSession()
   if (s && !s.schema_snapshot && !s._schemaTried) {
     s._schemaTried = true
@@ -1350,19 +1541,20 @@ function renderSessionChrome() {
   }
   document.body.classList.toggle("session-on", !!(s && s.status === "active"))
   const label = $("session-label")
+  const hide = (id, on) => { const el = $(id); if (el) el.hidden = on }
   if (!s) {
-    label.textContent = "немає активної сесії"
-    $("b-sess-start").hidden = false
-    $("b-sess-pause").hidden = true
-    $("b-sess-resume").hidden = true
-    $("b-sess-done").hidden = true
+    if (label) label.textContent = "немає активної сесії"
+    hide("b-sess-start", false)
+    hide("b-sess-pause", true)
+    hide("b-sess-resume", true)
+    hide("b-sess-done", true)
   } else {
     const st = s.status === "paused" ? "пауза" : s.status === "completed" ? "завершено" : "записує"
-    label.textContent = `${s.title} · ${st}`
-    $("b-sess-start").hidden = s.status === "active" || s.status === "paused"
-    $("b-sess-pause").hidden = s.status !== "active"
-    $("b-sess-resume").hidden = s.status !== "paused"
-    $("b-sess-done").hidden = s.status === "completed"
+    if (label) label.textContent = `${s.title} · ${st}`
+    hide("b-sess-start", s.status === "active" || s.status === "paused")
+    hide("b-sess-pause", s.status !== "active")
+    hide("b-sess-resume", s.status !== "paused")
+    hide("b-sess-done", s.status === "completed")
   }
   renderObsForm($("quick-form"), true)
   renderTimeline()
@@ -1431,6 +1623,7 @@ function fieldHtml(f, compact) {
 
 function readForm(root, compact) {
   const out = {}
+  if (!root) return out
   for (const f of schemaFields()) {
     const el = root.querySelector(`#${CSS.escape((compact ? "q-" : "o-") + fieldKey(f))}`)
     if (!el) continue
@@ -1509,6 +1702,7 @@ function applyLockAutofill() {
 }
 
 function fillForm(root, data, compact) {
+  if (!root || !data) return
   for (const f of schemaFields()) {
     const el = root.querySelector(`#${CSS.escape((compact ? "q-" : "o-") + fieldKey(f))}`)
     if (!el || data[fieldKey(f)] == null) continue
@@ -1568,6 +1762,7 @@ async function submitObservation(fromQuick) {
     return
   }
   const root = $("quick-form")
+  if (!root) return
   const fields = fieldsForSession(readForm(root, true), s)
   const err = validateFields(fields)
   if (err) { note(err, true); return }
@@ -1596,6 +1791,7 @@ async function submitObservation(fromQuick) {
 async function renderTimeline() {
   const s = activeSession()
   const ul = $("timeline")
+  if (!ul) return
   if (!s) { ul.innerHTML = ""; return }
   const list = await client.listObservations(s.id)
   if (!list.length) {
@@ -1649,6 +1845,7 @@ async function delObs(sessionId, id) {
 
 function renderSchemaEditor() {
   const root = $("schema-list")
+  if (!root) return
   const fields = schemaFields()
   root.innerHTML = fields.map((f, i) => `
     <div class="schema-row" data-i="${i}">
@@ -1680,6 +1877,7 @@ function renderSchemaEditor() {
 
 function readSchemaEditor() {
   const root = $("schema-list")
+  if (!root) return []
   const rows = [...root.querySelectorAll(".schema-row[data-i]:not(.opts)")]
   return rows.map(row => {
     const i = row.dataset.i
@@ -1701,57 +1899,56 @@ function readSchemaEditor() {
   }).filter(f => f.key)
 }
 
-$("quick-form").addEventListener("submit", e => {
+on("quick-form", "submit", e => {
   e.preventDefault()
   submitObservation(true)
 })
 
-$("b-sess-start").onclick = async () => {
-  const title = $("sess-title").value.trim()
-  const mode = $("sess-mode").value
+on("b-sess-start", "click", async () => {
+  const titleEl = $("sess-title")
+  const modeEl = $("sess-mode")
+  if (!titleEl || !modeEl) return
+  const title = titleEl.value.trim()
+  const mode = modeEl.value
   await client.createSession({ title, mode })
   renderSessionChrome()
-}
-$("b-sess-pause").onclick = async () => {
+})
+on("b-sess-pause", "click", async () => {
   const s = activeSession(); if (!s) return
   await client.patchSession(s.id, { status: "paused" })
   renderSessionChrome()
-}
-$("b-sess-resume").onclick = async () => {
+})
+on("b-sess-resume", "click", async () => {
   const s = activeSession(); if (!s) return
   await client.patchSession(s.id, { status: "active" })
   renderSessionChrome()
-}
-$("b-sess-done").onclick = async () => {
+})
+on("b-sess-done", "click", async () => {
   const s = activeSession(); if (!s) return
   await client.completeSession(s.id)
   renderSessionChrome()
-}
+})
 
-$("b-schema-add").onclick = () => {
+bindClick("b-schema-add", () => {
   const fields = schemaFields()
   fields.push({ key: "field_" + (fields.length + 1), label: "Нове поле", type: "text", required: false })
   client.db.schema.fields = fields
   renderSchemaEditor()
-}
-$("b-schema-save").onclick = async () => {
+})
+bindClick("b-schema-save", async () => {
   const fields = readSchemaEditor()
   const r = await client.setSchema(fields)
   setApiStatus(r.remote || client.remote)
   renderSessionChrome()
   if (r.error) note(r.error, true)
   else note("схему збережено")
-}
-
-document.querySelectorAll(".tabs [role=tab]").forEach(btn => {
-  btn.addEventListener("click", () => setTab(btn.dataset.tab))
 })
-$("b-panel").onclick = () => togglePanel()
-$("b-panel-close").onclick = () => togglePanel(false)
-$("b-rail").onclick = () => toggleUi("rail")
-$("b-status").onclick = () => toggleUi("status")
-$("b-hits").onclick = () => toggleUi("hits")
-$("b-fft").onclick = () => toggleUi("fft")
+bindClick("b-hide", () => toggleUi("rail"))
+bindClick("b-panel-close", () => togglePanel(false))
+bindClick("b-panel-open", () => togglePanel(true))
+bindClick("b-rail", () => toggleUi("rail"))
+bindClick("b-status", () => toggleUi("status"))
+bindClick("b-hits", () => toggleUi("hits"))
 
 function isTyping(el) {
   if (!el) return false
@@ -1770,26 +1967,17 @@ document.addEventListener("keydown", e => {
     togglePanel(document.body.classList.contains("panel-collapsed"))
     return
   }
-  if (isTyping(e.target)) {
-    if (e.key === "Enter" && e.target.id && e.target.id.startsWith("q-") && e.target.tagName === "INPUT") {
-      e.preventDefault()
-      submitObservation(true)
-    }
-    return
-  }
-  if ((e.key === " " || e.key === "Enter") && e.target.tagName !== "BUTTON") {
-    const s = activeSession()
-    if (s && s.status === "active") {
-      e.preventDefault()
-      submitObservation(true)
-    }
-    return
-  }
+  if (isTyping(e.target)) return
   if (e.key === "[" || e.key === "ArrowLeft") { e.preventDefault(); nudge(e.shiftKey ? -1e6 : -0.1e6) }
   if (e.key === "]" || e.key === "ArrowRight") { e.preventDefault(); nudge(e.shiftKey ? 1e6 : 0.1e6) }
   if (e.key === "1") { e.preventDefault(); toggleUi("status") }
   if (e.key === "2") { e.preventDefault(); toggleUi("rail") }
-  if (e.key === "s" || e.key === "S") { e.preventDefault(); $("b-sweep").click() }
+  if (e.key === "s" || e.key === "S") {
+    e.preventDefault()
+    const sweep = $("b-sweep")
+    if (sweep) sweep.click()
+    else startSweep().catch(err => note(String(err && err.message || err), true))
+  }
   if (e.key === "-" || e.key === "_") tweak("scan.threshold_db", -0.5)
   if (e.key === "=" || e.key === "+") tweak("scan.threshold_db", 0.5)
   if (e.key === "," ) tweak("sdr.gain_db", -1)
@@ -1820,17 +2008,23 @@ function applyHash() {
   }
 }
 
-$("pic").addEventListener("error", () => {
+on("pic", "error", () => {
   if (latestFrame) return
   if (picPendingUrl) {
     URL.revokeObjectURL(picPendingUrl)
     picPendingUrl = null
   }
   if (picShownUrl) return
-  $("pic").removeAttribute("src")
-  $("pic").style.display = "none"
-  $("hint").hidden = false
-  $("hint").textContent = "Кадр не відкрився. Потік декодера ще не дав зображення."
+  const img = $("pic")
+  if (img) {
+    img.removeAttribute("src")
+    img.style.display = "none"
+  }
+  const hint = $("hint")
+  if (hint) {
+    hint.hidden = false
+    hint.textContent = "Кадр не відкрився. Потік декодера ще не дав зображення."
+  }
 })
 
 async function ensureSymptomFields() {
@@ -1864,6 +2058,4 @@ async function boot() {
 }
 
 window.addEventListener("hashchange", applyHash)
-startPaint()
-connect()
-boot()
+boot().catch(err => console.error("завантаження:", err))
