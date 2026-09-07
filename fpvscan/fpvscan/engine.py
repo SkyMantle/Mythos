@@ -507,16 +507,23 @@ class Engine:
  
     # ---------- LOCK ----------
  
+    # Запас навколо зміряної зайнятості. Не MERGE_TOL: той (6 МГц) —
+    # допуск злиття двох оцінок ОДНОГО борта, не ширина каналайзера.
+    # 2·MERGE_TOL на 10 МГц зайнятості давав 22 МГц; при fs=35 Мвідл/с
+    # dec=int(fs/ch_bw) ставав 1, фільтр вимикався, і сусід по Raceband
+    # (19 МГц) аліасився в дискримінатор — картинка змішувалась.
+    LOCK_BW_PAD_HZ = 1.5e6
+
     def _lock_bw(self, freq_hz: float, default_bw: float) -> float:
         """Ширина каналу для утримання.
- 
+
         Беремо зміряну під час свіпу — передавачі відрізняються
         девіацією в рази, і константа з конфігу тут або зріже сигнал,
         або впустить половину сусіднього діапазону.
         """
         for d in self.state.detections.values():
             if abs(d.freq_hz - freq_hz) < 6e6:
-                return max(8e6, d.bandwidth_hz +2 * self.MERGE_TOL_HZ)
+                return max(8e6, d.bandwidth_hz + self.LOCK_BW_PAD_HZ)
         return max(8e6, default_bw)
  
     def _start_reader(self, want: float, fs: float, ring_seconds: float):
