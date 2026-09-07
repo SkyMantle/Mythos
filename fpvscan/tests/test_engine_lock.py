@@ -11,7 +11,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from fpvscan.engine import Engine
+from fpvscan.engine import Detection, Engine
 
 
 class _Source:
@@ -136,6 +136,43 @@ def test_run_writes_actual_rate_into_cfg():
     assert cfg["video"]["sample_rate"] == actual
 
 
+def test_lock_bw_does_not_open_full_nyquist_for_typical_vtx():
+    """10 МГц зайнятості + 2·MERGE_TOL (12 МГц) = 22 МГц вікно.
+
+    При типових 35 Мвідл/с це int(fs/ch_bw)=1: каналайзер не децимує,
+    сусідній Raceband (19 МГц) аліаситься в ЧМ-дискримінатор і LOCK
+    показує суміш двох бортів.
+    """
+    fs = 35e6
+    src = _Source(fs, fs)
+    eng = Engine(src, _cfg(fs), Queue())
+    occupied = 10e6
+    neighbor = 19e6  # крок Raceband (R5=5806, R6=5843)
+    eng.state.detections[5806] = Detection(
+        freq_hz=5806e6, bandwidth_hz=occupied, snr_db=18.0, hits=2,
+    )
+    ch_bw = eng._lock_bw(5806e6, 10e6)
+    dec = max(1, int(fs / ch_bw))
+    assert ch_bw <= occupied + 2e6, (
+        f"канал утримання {ch_bw/1e6:.1f} МГц — заширокий для "
+        f"зайнятості {occupied/1e6:.0f} МГц (не можна додавати 2·MERGE_TOL)"
+    )
+    assert ch_bw >= occupied, "вікно не має бути вужчим за зміряну зайнятість"
+    assert dec >= 2, (
+        f"dec={dec} при ch_bw={ch_bw/1e6:.1f} МГц: каналайзер вимкнув "
+        f"фільтр і пропустить сусіда на 19 МГц"
+    )
+    # Без децимації сусід на 19 МГц при 35 Мвідл/с аліаситься в −16 МГц
+    # (всередині Найквіста ±17.5 МГц) і потрапляє в дискримінатор.
+    nyq = fs / 2
+    alias = neighbor - fs
+    assert abs(alias) < nyq, "передумова: аліас сусіда лежить у смузі ADC"
+    assert ch_bw < fs / 2, (
+        f"ch_bw={ch_bw/1e6:.1f} МГц ≥ fs/2 — dec=1, аліас {alias/1e6:.1f} МГц "
+        f"не відфільтровано"
+    )
+
+
 def test_manual_lock_listener_is_registered_once():
     """Heartbeat applyState() раніше вішав новий keydown щодва секунди."""
     html = (Path(__file__).resolve().parents[1]
@@ -151,5 +188,6 @@ if __name__ == "__main__":
     test_lock_keeps_reader_when_fs_off_by_fraction()
     test_lock_retunes_when_fs_really_changes()
     test_run_writes_actual_rate_into_cfg()
+    test_lock_bw_does_not_open_full_nyquist_for_typical_vtx()
     test_manual_lock_listener_is_registered_once()
     print("OK")
