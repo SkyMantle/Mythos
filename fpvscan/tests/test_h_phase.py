@@ -5,21 +5,28 @@ import numpy as np
 from fpvscan.dsp.cvbs import (
     CROP_BOTTOM_LINES,
     CROP_LEFT_FRAC,
+    DecodeState,
     _h_crop,
     _h_unwrap,
+    edge_col_stable,
     h_blank_col,
     h_phase_col,
     h_phase_manual_px,
+    h_phase_should_nudge,
     h_pit_in_mid_half,
     h_pit_unsafe,
+    h_roll_step,
     h_sync_edge_col,
 )
 from fpvscan.scan_view import (
+    RF_SNAP_COOLDOWN_S,
     afc_is_pegged,
     afc_should_nudge,
+    freeze_afc_hunt,
     hunt_span_hz,
     lock_channel_bw,
     lock_decimation,
+    rf_snap_due,
 )
 
 
@@ -113,3 +120,75 @@ def test_afc_pegged_independent_of_freq_err() -> None:
     assert afc_should_nudge(-1.5e6, -2.3e6, 1.5e6)
     assert hunt_span_hz([0.25], pegged=False) == 0.25e6
     assert hunt_span_hz([0.25], pegged=True) == 2e6
+
+
+def test_freeze_afc_hunt_when_pic_locked() -> None:
+    assert freeze_afc_hunt(pic_locked=True, pic_score=0.55)
+    assert not freeze_afc_hunt(pic_locked=True, pic_score=0.10)
+    assert not freeze_afc_hunt(pic_locked=False, pic_score=0.80)
+    assert not afc_should_nudge(-1.5e6, -2.3e6, 1.5e6, pic_locked=True)
+    assert afc_should_nudge(-1.5e6, -2.3e6, 1.5e6, pic_locked=False)
+    assert hunt_span_hz([0.25], pegged=False) == 0.25e6
+
+
+def test_rf_snap_due_pegged_locked_not_unlocked() -> None:
+    cap = 1.5e6
+    pegged = -0.95 * cap
+    assert rf_snap_due(
+        pic_locked=True, pic_score=0.55, afc_hz=pegged, digital_max_hz=cap,
+        last_snap_mono=0.0, now_mono=10.0)
+    assert not rf_snap_due(
+        pic_locked=False, pic_score=0.80, afc_hz=pegged, digital_max_hz=cap,
+        last_snap_mono=0.0, now_mono=10.0)
+    assert not rf_snap_due(
+        pic_locked=True, pic_score=0.10, afc_hz=pegged, digital_max_hz=cap,
+        last_snap_mono=0.0, now_mono=10.0)
+    assert not rf_snap_due(
+        pic_locked=True, pic_score=0.55, afc_hz=-0.4e6, digital_max_hz=cap,
+        last_snap_mono=0.0, now_mono=10.0)
+
+
+def test_rf_snap_due_cooldown_blocks_spam() -> None:
+    cap = 1.5e6
+    kw = dict(pic_locked=True, pic_score=0.55, afc_hz=-cap, digital_max_hz=cap)
+    assert not rf_snap_due(
+        **kw, last_snap_mono=1.0, now_mono=1.0 + RF_SNAP_COOLDOWN_S - 0.1)
+    assert rf_snap_due(
+        **kw, last_snap_mono=1.0, now_mono=1.0 + RF_SNAP_COOLDOWN_S + 0.1)
+
+
+def test_h_phase_deadzone_freeze_and_stable_edge() -> None:
+    # ±2° of a 64 µs line ≈ 0.0056 — inside the 0.01 dead zone.
+    assert not h_phase_should_nudge(0.0056)
+    assert not h_phase_should_nudge(0.009)
+    assert h_phase_should_nudge(0.02)
+    assert not h_phase_should_nudge(0.05, pic_locked=True)
+    assert not h_phase_should_nudge(0.05, edge_stable=False)
+    assert not edge_col_stable([10, 10])
+    assert edge_col_stable([10, 10, 11])
+    assert not edge_col_stable([10, 18, 4])
+    assert h_roll_step(None, 40, 80) == 40
+    assert h_roll_step(40, 41, 80) == 40
+    assert h_roll_step(40, 0, 80) == 0
+    assert h_roll_step(0, 50, 80, pic_locked=True) == 0
+    assert h_roll_step(0, 50, 80, edge_stable=False) == 0
+    stepped = h_roll_step(40, 50, 80, edge_stable=True)
+    assert stepped != 40
+    assert abs(stepped - 40) < abs(50 - 40)
+
+
+def test_h_unwrap_state_does_not_chase_one_px() -> None:
+    img = _mid_blank()
+    st = DecodeState()
+    out = _h_unwrap(img, st, h_phase_frac=0.0)
+    parked = int(st.h_roll or 0)
+    assert parked != 0
+    jitter = np.roll(out, 1, axis=1)
+    _h_unwrap(jitter, st, h_phase_frac=0.0)
+    # Parked raster + 1 px must not keep walking h_roll.
+    assert st.h_roll in (0, parked)
+    locked = DecodeState()
+    _h_unwrap(img, locked, h_phase_frac=0.0)
+    first = locked.h_roll
+    _h_unwrap(img, locked, h_phase_frac=0.0, pic_locked=True)
+    assert locked.h_roll == first

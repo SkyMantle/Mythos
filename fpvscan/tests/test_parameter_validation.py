@@ -23,6 +23,7 @@ def test_catalog_from_real_config_has_sweep_and_lock() -> None:
     assert "scan.threshold_db" in keys
     assert "video.afc" in keys
     assert "sdr.gain_db" in keys
+    assert "sdr.auto_gain" in keys
     assert "sdr.driver" not in keys
     thresh = next(s for s in specs if s.key == "scan.threshold_db")
     assert thresh.type == "float"
@@ -31,6 +32,15 @@ def test_catalog_from_real_config_has_sweep_and_lock() -> None:
     assert "підлог" in thresh.description
     assert thresh.task is None
     assert thresh.affects == "spectrum"
+    pin = next(s for s in specs if s.key == "video.spectrum_pin_center")
+    assert pin.type == "bool" and pin.default is True and pin.affects == "spectrum"
+    assert pin.task is None
+    ema = next(s for s in specs if s.key == "video.spectrum_ema")
+    assert ema.type == "bool" and ema.default is True and ema.affects == "spectrum"
+    sm3 = next(s for s in specs if s.key == "video.spectrum_smooth3")
+    assert sm3.type == "bool" and sm3.default is True and sm3.affects == "spectrum"
+    every4 = next(s for s in specs if s.key == "video.spectrum_every_4")
+    assert every4.type == "bool" and every4.default is False and every4.affects == "spectrum"
     start = next(s for s in specs if s.key == "scan.start_hz")
     assert start.task == "scan_width"
     assert start.modes == ["sweep"]
@@ -72,6 +82,10 @@ def test_catalog_from_real_config_has_sweep_and_lock() -> None:
     assert pll.affects == "picture"
     gain = next(s for s in specs if s.key == "sdr.gain_db")
     assert gain.task == "picture_jump"
+    auto_g = next(s for s in specs if s.key == "sdr.auto_gain")
+    assert auto_g.type == "bool"
+    assert auto_g.default is True
+    assert auto_g.task is None
     bias = next(s for s in specs if s.key == "sdr.bias_tee")
     assert bias.type == "bool"
     assert "gain" in bias.description.lower() or "Bias" in bias.description
@@ -106,6 +120,7 @@ def test_list_parameters_mode_returns_curated_tasks(engine, store) -> None:
         assert filt.enum_values == ["all", "hide_weak", "hide_no_video", "hide_near_dup"]
         assert filt.enum_labels["hide_weak"] == "ховати слабкі"
         assert {s.key for s in lock} == set(LOCK_TASKS)
+        assert "sdr.auto_gain" not in {s.key for s in lock}
         by_task = {s.key: s.task for s in lock}
         assert by_task["video.afc"] == "picture_jump"
         assert by_task["video.track_window_margin"] == "phase_tear_h"
@@ -218,6 +233,20 @@ def test_apply_h_pll_live_on_lock(engine, store) -> None:
         assert result.values["video.h_pll"] is True
         assert result.affects["video.h_pll"] == "picture"
         assert "video.h_pll" not in result.pending_keys
+        assert ("refresh_lock", {}) not in engine.commands
+
+    import asyncio
+    asyncio.run(run())
+
+
+def test_apply_spectrum_every_4_live_on_lock(engine, store) -> None:
+    svc = ParameterService(engine, store)
+
+    async def run() -> None:
+        result = await svc.apply_parameters(uuid4(), {"video.spectrum_every_4": True})
+        assert result.values["video.spectrum_every_4"] is True
+        assert result.affects["video.spectrum_every_4"] == "spectrum"
+        assert "video.spectrum_every_4" not in result.pending_keys
         assert ("refresh_lock", {}) not in engine.commands
 
     import asyncio

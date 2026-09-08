@@ -7,7 +7,8 @@ sdr:
   num_buffers: 32 # потік USB: більше буферів = стійкіше до зривів,
   buffer_size: 32768 # але більша затримка. buffer_size кратний 1024
   num_transfers: 16
-  gain_db: 35 # рядок gain: ручне MGC на платі. АРП (agc) окремо і для LOCK вимкнена. При Bias-T плата ріже gain на bias_tee_gain_offset_db, щоб LNA не кліпав АЦП
+  gain_db: 35 # рядок gain: ручне MGC на платі 0…60. АРП (agc) окремо і для LOCK вимкнена. При Bias-T плата ріже gain на bias_tee_gain_offset_db, щоб LNA не кліпав АЦП
+  auto_gain: true # програмне MGC у LOCK: hill-climb gain_db за картинкою. Повзунок gain вимикає авто; «авто» вмикає знову. Не АРП плати і не Bias-T
   bias_tee: true # 4.5 В на RX для активної антени; тримай на рядку gain, не окремою кнопкою. Команда bias_tee + компенсація gain
   agc: false # АРП зручна для пошуку, шкідлива для декодування
   settle_us: 500 # час установлення ФАПЧ після перебудови
@@ -80,10 +81,14 @@ video:
   width: 640
   spectrum_every: 1 # LOCK: спектр на кожен IQ; rec_spectrum_every лишає 6
   rec_spectrum_every: 6 # під записом не частіше за це
+  spectrum_every_4: false # LOCK: спектр кожен 4-й кадр; свіп не чіпаємо
+  spectrum_pin_center: true # LOCK: вісь і жовтий маркер на хіті, не на _afc
+  spectrum_ema: true # LOCK: EMA по бінах α=0.3; свіп не чіпаємо
+  spectrum_smooth3: true # LOCK: 3-бінове згладжування по частоті після EMA
   hunt: true # у LOCK дрібний цифровий пошук, де картинка краща
   hunt_every: 20 # кадрів між спробами; сам пошук — у фоновій нитці, не на decode
   hunt_after_lock: 24 # не шукати перші N кадрів — дати трекінгу засістись
-  hunt_offsets_mhz: [0.25] # база; у упорі AFC hunt розширюється до ±2 МГц
+  hunt_offsets_mhz: [0.25] # база; у упорі AFC hunt до ±2 МГц, але freeze коли pic_locked
   h_phase_frac: 0.0 # залишковий зсув ПІСЛЯ TBC; 0 / |x|<0.01 = немає; не ховає blank
   h_pll: false # ФАПЧ рядка: повільно уточнює period у DecodeState; вимк = заморожений період
   crop_left_frac: 0.07 # страховий зріз leftover porch на 4991; футер не чіпати

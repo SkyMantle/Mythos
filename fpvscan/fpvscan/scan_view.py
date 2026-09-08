@@ -22,6 +22,17 @@ def lock_spectrum_due(lock_n: int, every: int) -> bool:
     return lock_n >= 1 and (lock_n - 1) % n == 0
 
 
+def lock_spectrum_every(video: dict[str, Any] | None) -> int:
+    """LOCK FFT cadence from live catalog. Sweep occupancy FFT ignores this."""
+    v = video or {}
+    if bool(v.get("spectrum_every_4", False)):
+        return 4
+    try:
+        return max(1, int(v.get("spectrum_every", 1) or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
 def afc_is_pegged(afc_hz: float, digital_max_hz: float,
                  freq_err_hz: float | None = None) -> bool:
     """True when digital AFC sits on its stop (|afc| ≥ 0.95 × cap).
@@ -35,9 +46,52 @@ def afc_is_pegged(afc_hz: float, digital_max_hz: float,
     return abs(float(afc_hz)) >= 0.95 * cap
 
 
+# Locked raster with a usable score: do not slam ±2 MHz hunt/nudge.
+HUNT_HOLD_SCORE = 0.35
+# After a pegged-lock RF snap, wait before moving the LO again.
+RF_SNAP_COOLDOWN_S = 1.5
+
+
+def freeze_afc_hunt(*, pic_locked: bool, pic_score: float = 0.0,
+                    min_score: float = HUNT_HOLD_SCORE) -> bool:
+    """True when a locked picture is already on screen.
+
+    Digital AFC may still tick (80 kHz deadband). Wide hunt and the
+    RF ±2 MHz peg-nudge must not: they tear a good raster more than
+    they help frequency.
+    """
+    return bool(pic_locked) and float(pic_score) >= float(min_score)
+
+
+def rf_snap_due(*, pic_locked: bool, pic_score: float, afc_hz: float,
+                digital_max_hz: float, last_snap_mono: float = 0.0,
+                now_mono: float | None = None,
+                cooldown_s: float = RF_SNAP_COOLDOWN_S,
+                min_score: float = HUNT_HOLD_SCORE) -> bool:
+    """Once: real raster + digital AFC at stop. Not the ±2 MHz hunt.
+
+    No picture / weak score → False. Cooldown blocks back-to-back frames.
+    """
+    if not freeze_afc_hunt(pic_locked=pic_locked, pic_score=pic_score,
+                           min_score=min_score):
+        return False
+    if not afc_is_pegged(afc_hz, digital_max_hz):
+        return False
+    now = time.monotonic() if now_mono is None else float(now_mono)
+    if last_snap_mono and (now - float(last_snap_mono)) < float(cooldown_s):
+        return False
+    return True
+
+
 def afc_should_nudge(afc_hz: float, freq_err_hz: float, digital_max_hz: float,
-                     min_err_hz: float = 250e3) -> bool:
-    """Wide hunt / lock step only if pegged and residual error is still large."""
+                     min_err_hz: float = 250e3, *,
+                     pic_locked: bool = False) -> bool:
+    """Wide hunt / lock step only if pegged and residual error is still large.
+
+    `pic_locked` freezes the ±2 MHz hunt/nudge while a picture exists.
+    """
+    if pic_locked:
+        return False
     if not afc_is_pegged(afc_hz, digital_max_hz):
         return False
     return abs(float(freq_err_hz)) >= float(min_err_hz)
@@ -112,6 +166,9 @@ def affect_of(key: str) -> str:
     if key in {
         "scan.fft_size", "scan.averages", "scan.threshold_db",
         "scan.dc_notch_hz", "video.spectrum_every",
+        "video.spectrum_every_4",
+        "video.spectrum_pin_center", "video.spectrum_ema",
+        "video.spectrum_smooth3",
     }:
         return "spectrum"
     if key.startswith("scan."):
@@ -338,8 +395,13 @@ def spectrum_snapshot(
         off = float(video.get("lo_offset_hz") or 0)
         span = float(video.get("sample_rate") or 0) or None
         bw = float(video.get("channel_bw_hz") or 0) or None
-        cursor = float(lock_target) + float(afc_hz or 0)
-        center = float(lock_target) + off
+        hit = float(lock_target)
+        pin = True if "spectrum_pin_center" not in video else bool(
+            video.get("spectrum_pin_center"))
+        # Pin: axis + yellow marker on published hit. Digital AFC still
+        # mixes IQ; bins may sit off-center. Off: cursor tracks _afc.
+        cursor = hit if pin else hit + float(afc_hz or 0)
+        center = hit + off
         nfft = int(last.get("nfft") or 2048)
     else:
         span = float(scan.get("sample_rate") or 0) or None

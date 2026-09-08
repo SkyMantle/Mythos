@@ -5,7 +5,7 @@
 import {
   PARAMETER_CATALOG, CATALOG_DEFAULTS, DEFAULT_SCHEMA,
   clampToSpec, cloneValue,
-} from "./catalog.js"
+} from "./catalog.js?v=18"
 
 const UK_HINT = Object.fromEntries(PARAMETER_CATALOG.map(p => [p.key, p]))
 
@@ -536,8 +536,9 @@ function errText(r) {
   return `HTTP ${r.status}`
 }
 
-export function engineLock(freqHz) {
-  return fetch("/api/lock/" + freqHz, { method: "POST" })
+export function engineLock(freqHz, opts) {
+  const q = opts && opts.force ? "?force=1" : ""
+  return fetch("/api/lock/" + freqHz + q, { method: "POST" })
 }
 export function engineSweep() {
   return fetch("/api/sweep", { method: "POST" })

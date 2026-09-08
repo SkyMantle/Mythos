@@ -51,6 +51,13 @@ class EngineAdapter:
                 if not isinstance(block, dict) or name not in block:
                     raise ValidationError(f"unknown parameter: {key}", {key: "unknown"})
                 block[name] = value
+            if (
+                "sdr.gain_db" in values
+                and values.get("sdr.auto_gain") is not True
+            ):
+                sdr = self._engine.cfg.get("sdr")
+                if isinstance(sdr, dict):
+                    sdr["auto_gain"] = False
         if any(k in values for k in ("sdr.gain_db", "sdr.bias_tee_gain_offset_db")):
             apply_bt = getattr(self._engine, "_apply_bias_tee_gain", None)
             try:
@@ -62,6 +69,14 @@ class EngineAdapter:
                     ))
             except Exception as exc:
                 log.warning("gain apply failed: %s", exc)
+            if "sdr.gain_db" in values and values.get("sdr.auto_gain") is not True:
+                disable = getattr(self._engine, "disable_auto_mgc", None)
+                if disable:
+                    disable()
+        if values.get("sdr.auto_gain") is True:
+            reset = getattr(self._engine, "reset_auto_mgc", None)
+            if reset:
+                reset()
         if "sdr.bias_tee" in values:
             self._engine.command("bias_tee", on=bool(values["sdr.bias_tee"]))
         if "scan.cluster_step_mhz" in values:

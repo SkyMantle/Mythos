@@ -115,6 +115,11 @@ export const PARAMETER_CATALOG = [
     key: "sdr.gain_db", group: "shared", label: "Підсилення",
     unit: "дБ", min: 0, max: 60, step: 1, default: 35,
   }),
+  b({
+    key: "sdr.auto_gain", group: "shared", label: "Авто MGC",
+    help: "У LOCK крокує gain 0…60 за картинкою і clip_frac. Не АРП плати і не Bias-T.",
+    default: true,
+  }),
   n({
     key: "sdr.bias_tee_gain_offset_db", group: "shared", label: "Компенсація LNA",
     help: "На скільки зрізати gain, коли bias-tee увімкнено.",
@@ -421,6 +426,30 @@ export const PARAMETER_CATALOG = [
   i({
     key: "video.spectrum_every", group: "lock", label: "Спектр раз на N кадрів",
     min: 1, max: 64, step: 1, default: 16,
+  }),
+  b({
+    key: "video.spectrum_pin_center", group: "lock",
+    label: "Центр на хіт",
+    help: "Вісь і жовтий маркер на частоті хіта; AFC не зсуває графік.",
+    default: true,
+  }),
+  b({
+    key: "video.spectrum_ema", group: "lock",
+    label: "Згладити в часі",
+    help: "EMA по бінах, α=0.3. Свіп не чіпаємо.",
+    default: true,
+  }),
+  b({
+    key: "video.spectrum_smooth3", group: "lock",
+    label: "Згладити по частоті",
+    help: "3-бінове згладжування вздовж частоти після EMA.",
+    default: true,
+  }),
+  b({
+    key: "video.spectrum_every_4", group: "lock",
+    label: "Спектр рідше (кожен 4-й кадр)",
+    help: "LOCK FFT кожен 4-й кадр. Свіп не чіпаємо.",
+    default: false,
   }),
   b({
     key: "video.hunt", group: "lock", label: "Цифровий hunt",

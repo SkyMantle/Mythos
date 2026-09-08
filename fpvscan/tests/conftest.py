@@ -51,8 +51,13 @@ class FakeEngine:
                 "track_window_margin": 1.45,
                 "h_phase_frac": 0.0,
                 "h_pll": False,
+                "spectrum_every": 1,
+                "spectrum_every_4": False,
+                "spectrum_pin_center": True,
+                "spectrum_ema": True,
+                "spectrum_smooth3": True,
             },
-            "sdr": {"gain_db": 35, "bias_tee": True, "settle_us": 500},
+            "sdr": {"gain_db": 35, "auto_gain": True, "bias_tee": True, "settle_us": 500},
         }
         self._last_spectrum = {
             "bins": [-40.0, -20.0, -38.0],

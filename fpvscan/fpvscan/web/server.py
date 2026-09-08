@@ -32,8 +32,8 @@ def create_app(engine) -> FastAPI:
         return engine.snapshot()
 
     @app.post("/api/lock/{freq_hz}")
-    async def lock(freq_hz: float):
-        engine.command("lock", freq_hz=freq_hz)
+    async def lock(freq_hz: float, force: bool = False):
+        engine.command("lock", freq_hz=freq_hz, force=force)
         return {"ok": True}
 
     @app.post("/api/sweep")

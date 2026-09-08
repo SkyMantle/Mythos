@@ -1,11 +1,11 @@
 import {
   TASK_TOOLS, sameValue, displayOf, storedFromDisplay, formatDefault,
   clampToSpec, optValue, optLabel, formatList, displayUnit,
-} from "./catalog.js"
+} from "./catalog.js?v=18"
 import {
   TestClient, engineLock, engineSweep, engineClear, engineSnapshot,
   engineRecord, engineState,
-} from "./api.js"
+} from "./api.js?v=18"
 
 const F0 = 400e6, F1 = 6000e6
 const UI_LS = "fpvscan.ui.v1"
@@ -37,10 +37,15 @@ const live = {
   recording: false,
   lastFrameAt: 0,
   lastWs: 0,
+  picScore: null,
+  rowCorr: null,
   metrics: {},
   frame: null,
   lastShot: null,
   lastRec: null,
+  timingsMs: null,
+  overflows: null,
+  engineFps: null,
 }
 
 const specView = {
@@ -80,6 +85,33 @@ const autoFill = {
 
 let hits = new Map()
 let current = null
+const INSPECT_MIN_ROW_CORR = 0.12
+const INSPECT_MIN_PIC_SCORE = 0.20
+const MIN_RASTER_LINES = 80
+const FRAME_FRESH_MS = 2500
+const PRUNE_SETTLE_MS = 5000
+const HIT_SELECT_HZ = 2e6
+const MERGE_LOCK_HZ = HIT_SELECT_HZ
+const MERGE_CHANNEL_HZ = 1e5
+const HIT_KEY_HZ = 5e4
+const LOCK_SPURIOUS_HZ = 2e4
+const droppedHits = new Set()
+let lastHitsHtml = ""
+const SPEC_PIN = "video.spectrum_pin_center"
+const SPEC_EMA = "video.spectrum_ema"
+const SPEC_SMOOTH3 = "video.spectrum_smooth3"
+const SPEC_EVERY4 = "video.spectrum_every_4"
+const SPEC_EMA_ALPHA = 0.3
+const SPEC_EMA_RESET_HZ = 100e3
+const SPEC_KIT = [
+  { id: "b-spec-pin", key: SPEC_PIN },
+  { id: "b-spec-ema", key: SPEC_EMA },
+  { id: "b-spec-smooth3", key: SPEC_SMOOTH3 },
+  { id: "b-spec-every4", key: SPEC_EVERY4, defaultOn: false },
+]
+const specEma = { bins: null, hz: null }
+let emptyLockTimer = 0
+let emptyLockMhz = null
 let sock = null
 let fpsHist = []
 let values = {}
@@ -211,9 +243,32 @@ function revokePics() {
   }
 }
 
+function modeIsLock() {
+  return live.mode === "LOCK"
+}
+
+function blankPreview() {
+  latestFrame = null
+  dirty.frame = false
+  revokePics()
+  const img = $("pic")
+  if (img) {
+    img.onload = null
+    img.style.display = "none"
+    if (img.getAttribute("src")) {
+      try { img.removeAttribute("src") } catch { /* ignore */ }
+    }
+  }
+  updateAfcLimitUi()
+}
+
 function presentFrame(d) {
   const img = $("pic")
   if (!img || !d || !d.img) return
+  if (!modeIsLock()) {
+    blankPreview()
+    return
+  }
   let bytes
   try {
     bytes = b64ToBytes(d.img)
@@ -226,6 +281,10 @@ function presentFrame(d) {
   const gen = ++picGen
   img.onload = () => {
     if (gen !== picGen) return
+    if (!modeIsLock()) {
+      blankPreview()
+      return
+    }
     if (picShownUrl && picShownUrl !== url) URL.revokeObjectURL(picShownUrl)
     picShownUrl = url
     if (picPendingUrl === url) picPendingUrl = null
@@ -238,8 +297,14 @@ function presentFrame(d) {
 
 function applyFrameHud(d) {
   if (d.freq_hz) {
-    current = d.freq_hz
-    live.freqHz = d.freq_hz
+    const f = Number(d.freq_hz)
+    const held = Number(live.freqHz || current)
+    if (sameLockBird(f, held)) {
+      /* keep lock target — inspect/AFC residual is the same bird */
+    } else if (!Number.isFinite(held) || Math.abs(held - f) > MERGE_CHANNEL_HZ) {
+      current = f
+      live.freqHz = f
+    }
   }
   if (d.standard) live.standard = d.standard
   if (d.line_rate != null) live.lineRate = d.line_rate
@@ -265,16 +330,16 @@ function updateWatchStrip() {
   const watching = live.mode === "LOCK"
   const age = live.lastFrameAt ? Date.now() - live.lastFrameAt : null
   const rate = specRatePerSec()
-  const fps = live.fps
-  put("w-fps", watching ? `кадрів ${fps.toFixed(1)}/с` : "кадрів —/с")
+  const fps = Number(live.fps)
+  put("w-fps", watching && Number.isFinite(fps)
+    ? `кадрів ${fps.toFixed(1)}/с` : "кадрів —/с")
   put("w-lines", live.lines != null ? `рядків ${live.lines}` : "рядків —")
   put("w-sync", `синхро ${live.locked ? "є" : "нема"}`)
   put("w-spec", `спектр ${rate}/с`)
   put("w-age", age == null ? "кадр — мс" : `кадр ${age} мс`)
-  const noteEl = $("w-note")
-  if (noteEl) noteEl.textContent = ""
   el.classList.remove("lag")
   updateAfcLimitUi()
+  updateLockTimings()
   applyLockAutofill()
 }
 
@@ -285,8 +350,12 @@ function paint(now) {
       const d = latestFrame
       latestFrame = null
       dirty.frame = false
-      presentFrame(d)
-      applyFrameHud(d)
+      if (modeIsLock()) {
+        presentFrame(d)
+        applyFrameHud(d)
+      } else {
+        blankPreview()
+      }
     }
     dirty.spec = false
     drawMiniSpectrum()
@@ -299,6 +368,7 @@ function paint(now) {
       updateHealth()
       updateFftReadout()
       updateMediaPath()
+      paintHitVideoClasses()
     }
   } catch (err) {
     console.error("малювання:", err)
@@ -332,7 +402,7 @@ function connect() {
         markSpectrumMsg()
         applySpectrumPayload(m.data)
       } else if (m.type === "detection") {
-        hits.set(Math.round(m.data.freq_hz / 1e6), m.data)
+        ingestHit(m.data)
         renderHits()
         dirty.grid = true
       } else if (m.type === "frame") queueFrame(m.data)
@@ -376,27 +446,84 @@ function ingestAfcLimit(src) {
 }
 
 function afcAtLimit() {
-  return !!live.afcPegged
-}
-
-function afcLimitText() {
-  if (!afcAtLimit()) return ""
-  const err = Math.abs(Number(live.freqErrHz) || 0)
-  return `AFC на межі · помилка ${(err / 1e6).toFixed(2)} МГц`
+  if (live.afcPegged) return true
+  const cap = Math.abs(Number(values["video.afc_digital_max_hz"]) || 0)
+  const afc = Number(live.afcHz)
+  if (!(cap >= 1) || !Number.isFinite(afc)) return false
+  return Math.abs(afc) >= 0.95 * cap
 }
 
 function updateAfcLimitUi() {
-  const text = live.mode === "LOCK" && afcAtLimit() ? afcLimitText() : ""
-  const watch = $("w-afc")
-  if (watch) {
-    watch.textContent = text
-    watch.hidden = !text
+  const el = $("w-afc")
+  if (!el) return
+  el.textContent = "AFC"
+  if (!modeIsLock()) {
+    el.hidden = true
+    el.classList.remove("ok", "limit")
+    el.removeAttribute("title")
+    el.removeAttribute("aria-label")
+    return
   }
-  const jump = $("afc-limit-note")
-  if (jump) {
-    jump.textContent = text
-    jump.hidden = !text
+  const pegged = afcAtLimit()
+  el.hidden = false
+  el.classList.toggle("ok", !pegged)
+  el.classList.toggle("limit", pegged)
+  const label = pegged ? "AFC на межі" : "AFC норма"
+  el.title = label
+  el.setAttribute("aria-label", label)
+}
+
+function ingestLockStats(src) {
+  if (!src || typeof src !== "object") return
+  const vm = src.video_metrics && typeof src.video_metrics === "object" ? src.video_metrics : {}
+  const timings = src.timings_ms ?? vm.timings_ms
+  if (timings && typeof timings === "object" && !Array.isArray(timings)) {
+    live.timingsMs = timings
   }
+  const ov = src.overflows ?? vm.overflows
+  if (ov != null && Number.isFinite(Number(ov))) live.overflows = Number(ov)
+  const fps = src.fps ?? vm.fps
+  if (fps != null && Number.isFinite(Number(fps))) live.engineFps = Number(fps)
+}
+
+function fmtLockMs(v) {
+  const n = Number(v)
+  if (!Number.isFinite(n)) return null
+  return n >= 10 ? n.toFixed(0) : n.toFixed(1)
+}
+
+function updateLockTimings() {
+  const el = $("fft-lock-ms")
+  if (!el) return
+  if (live.mode !== "LOCK") {
+    el.hidden = true
+    el.textContent = ""
+    return
+  }
+  const parts = []
+  const fps = (Number.isFinite(Number(live.fps)) && live.fps > 0)
+    ? live.fps
+    : live.engineFps
+  if (fps != null && Number.isFinite(Number(fps))) {
+    parts.push(`${Number(fps).toFixed(1)}/с`)
+  }
+  if (live.overflows != null && Number.isFinite(Number(live.overflows))) {
+    parts.push(`зривів ${Number(live.overflows) | 0}`)
+  }
+  const t = live.timingsMs
+  if (t && typeof t === "object") {
+    for (const [key, label] of [["demod_fm", "fm"], ["decode", "dec"], ["encode", "enc"]]) {
+      const ms = fmtLockMs(t[key])
+      if (ms != null) parts.push(`${label} ${ms}`)
+    }
+  }
+  if (!parts.length) {
+    el.hidden = true
+    el.textContent = ""
+    return
+  }
+  el.hidden = false
+  el.textContent = parts.join(" · ")
 }
 
 function gridRange() {
@@ -455,9 +582,15 @@ function drawGridStrip() {
   }
 
   for (const d of hits.values()) {
-    const x = hzToX(d.freq_hz, W)
-    const on = current && Math.abs(current - d.freq_hz) < 2e6
-    gctx.fillStyle = on ? "#e6ece9" : "#3e9a72"
+    const shown = hitDisplayHz(d)
+    if (!d || !Number.isFinite(shown)) continue
+    const x = hzToX(shown, W)
+    const on = current && Math.abs(current - shown) < HIT_SELECT_HZ
+    const video = hitIsVideoGreen(d)
+    if (on && video) gctx.fillStyle = "#e6ece9"
+    else if (video) gctx.fillStyle = "#3e9a72"
+    else if (on) gctx.fillStyle = "#9aa39f"
+    else gctx.fillStyle = "#6a7370"
     gctx.fillRect(x - 1, 2, 2, H - 4)
   }
 
@@ -484,6 +617,85 @@ function displayedFreqHz() {
   return live.freqHz || current || live.metrics.lock_target || live.metrics.frequency_hz || live.metrics.tuned_hz || null
 }
 
+function specFlagOn(key, defaultOn = true) {
+  const v = values[key]
+  if (v == null) return defaultOn
+  return !!v
+}
+
+function resetSpecEma() {
+  specEma.bins = null
+  specEma.hz = null
+}
+
+function lockHitHz() {
+  const hz = Number(displayedFreqHz())
+  return Number.isFinite(hz) && hz > 0 ? hz : null
+}
+
+function pinLockCursor(hz) {
+  if (live.mode !== "LOCK" || !specFlagOn(SPEC_PIN)) return hz
+  const hit = lockHitHz()
+  return hit == null ? hz : hit
+}
+
+function syncSpecKit() {
+  for (const { id, key, defaultOn = true } of SPEC_KIT) {
+    const el = $(id)
+    if (!el) continue
+    const on = specFlagOn(key, defaultOn)
+    el.setAttribute("aria-pressed", on ? "true" : "false")
+    el.classList.toggle("ghost", !on)
+  }
+}
+
+function plotSpectrumBins(raw) {
+  if (!raw || !raw.length) return raw
+  if (live.mode !== "LOCK") {
+    resetSpecEma()
+    return raw
+  }
+  let y = raw
+  if (specFlagOn(SPEC_EMA)) {
+    const hit = lockHitHz()
+    const hz = hit != null ? hit : Number(specView.center_hz)
+    const moved = specEma.bins && specEma.bins.length === raw.length
+      && Number.isFinite(hz) && Number.isFinite(specEma.hz)
+      && Math.abs(hz - specEma.hz) > SPEC_EMA_RESET_HZ
+    if (moved || !specEma.bins || specEma.bins.length !== raw.length) {
+      specEma.bins = raw.slice()
+    } else {
+      const out = new Array(raw.length)
+      for (let i = 0; i < raw.length; i++) {
+        const prev = Number(specEma.bins[i])
+        const cur = Number(raw[i])
+        out[i] = Number.isFinite(prev) && Number.isFinite(cur)
+          ? SPEC_EMA_ALPHA * cur + (1 - SPEC_EMA_ALPHA) * prev
+          : (Number.isFinite(cur) ? cur : prev)
+      }
+      specEma.bins = out
+    }
+    if (Number.isFinite(hz)) specEma.hz = hz
+    y = specEma.bins
+  } else {
+    resetSpecEma()
+  }
+  if (!specFlagOn(SPEC_SMOOTH3) || !y || !y.length) return y
+  const n = y.length
+  const out = new Array(n)
+  for (let i = 0; i < n; i++) {
+    const a = Number(y[i > 0 ? i - 1 : i])
+    const b = Number(y[i])
+    const c = Number(y[i + 1 < n ? i + 1 : i])
+    let s = 0, k = 0
+    if (Number.isFinite(a)) { s += a; k++ }
+    if (Number.isFinite(b)) { s += b; k++ }
+    if (Number.isFinite(c)) { s += c; k++ }
+    out[i] = k ? s / k : b
+  }
+  return out
+}
+
 function currentBwHz() {
   if (specView.bw_hz) return specView.bw_hz
   return Number(values["video.channel_bw_hz"]) || 10e6
@@ -502,11 +714,11 @@ function applySpectrumPayload(d) {
   if (src.floor_db != null) specView.floor_db = Number(src.floor_db)
   if (src.bw_hz != null) specView.bw_hz = Number(src.bw_hz)
   if (src.cursor_hz != null) {
-    specView.cursor_hz = Number(src.cursor_hz)
+    specView.cursor_hz = pinLockCursor(Number(src.cursor_hz))
     retargetHz("cursor", specView.cursor_hz)
     if (live.mode === "LOCK") retargetHz("play", specView.cursor_hz)
   } else if (src.center_hz != null) {
-    retargetHz("cursor", Number(src.center_hz))
+    retargetHz("cursor", pinLockCursor(Number(src.center_hz)))
   }
   if (src.peak_db != null) specView.peak_db = Number(src.peak_db)
   if (src.nfft != null) specView.nfft = Number(src.nfft)
@@ -531,13 +743,14 @@ function drawMiniSpectrum() {
   const center = specView.center_hz || displayedFreqHz()
   const span = currentSpanHz()
   const bw = currentBwHz()
-  const cursor = motion.cursorHz ?? specView.cursor_hz ?? displayedFreqHz()
+  const cursor = pinLockCursor(motion.cursorHz ?? specView.cursor_hz ?? displayedFreqHz())
   const floor = specView.floor_db ?? -90
   const thresh = Number(values["scan.threshold_db"])
   const scale = 45 + (Number.isFinite(thresh) ? Math.max(0, 8 - thresh) : 0)
+  const bins = plotSpectrumBins(specView.bins)
 
-  if (specView.bins && specView.bins.length) {
-    const n = specView.bins.length
+  if (bins && bins.length) {
+    const n = bins.length
     const g = fftx.createLinearGradient(0, H, 0, 0)
     g.addColorStop(0, "#1a5558")
     g.addColorStop(0.4, "#2f8a48")
@@ -546,7 +759,7 @@ function drawMiniSpectrum() {
     fftx.fillStyle = g
     const barW = Math.max(1, W / n)
     for (let i = 0; i < n; i++) {
-      const u = Math.max(0, Math.min(1, (specView.bins[i] - floor) / scale))
+      const u = Math.max(0, Math.min(1, (bins[i] - floor) / scale))
       const h = Math.max(1, u * (H - 4))
       fftx.fillRect(Math.floor(i * barW), H - h, Math.max(1, Math.ceil(barW) - 0.4), h)
     }
@@ -591,29 +804,262 @@ function setWatching(on) {
     dirty.spec = true
     dirty.hud = true
   }
+  updateLockTimings()
+}
+
+function hitKey(d) {
+  const hz = Number(d && (typeof d === "number" ? d : d.freq_hz))
+  if (!Number.isFinite(hz) || hz <= 0) return null
+  return Math.round(hz / HIT_KEY_HZ)
+}
+
+function nearestHitKey(hz, map = hits, tol = MERGE_CHANNEL_HZ) {
+  const f = Number(hz)
+  if (!Number.isFinite(f) || f <= 0) return null
+  let best = null
+  let bestD = Number(tol)
+  for (const [k, d] of map) {
+    const df = Math.abs(Number(d && d.freq_hz) - f)
+    if (df <= bestD) {
+      bestD = df
+      best = k
+    }
+  }
+  return best
+}
+
+function sameLockBird(hz, lockHz = Number(live.freqHz)) {
+  return live.mode === "LOCK" && Number.isFinite(lockHz) && Number.isFinite(hz)
+    && Math.abs(hz - lockHz) <= MERGE_LOCK_HZ
+}
+
+function hitMergeTol(hz) {
+  return sameLockBird(hz) ? MERGE_LOCK_HZ : MERGE_CHANNEL_HZ
+}
+
+function nearestDroppedKey(hz, tol = MERGE_LOCK_HZ) {
+  const f = Number(hz)
+  if (!Number.isFinite(f) || f <= 0) return null
+  let best = null
+  let bestD = Number(tol)
+  for (const k of droppedHits) {
+    const kf = Number(k) * HIT_KEY_HZ
+    if (!Number.isFinite(kf)) continue
+    const df = Math.abs(kf - f)
+    if (df <= bestD) {
+      bestD = df
+      best = k
+    }
+  }
+  return best
+}
+
+function analogStandard(std) {
+  const s = String(std || "").trim().toUpperCase()
+  return s === "PAL" || s === "NTSC"
+}
+
+function hitLockOverlay(d) {
+  const hz = Number(d && d.freq_hz)
+  if (!Number.isFinite(hz) || live.mode !== "LOCK") return null
+  const cur = current || live.freqHz
+  if (!cur || Math.abs(cur - hz) >= HIT_SELECT_HZ) return null
+  return {
+    standard: live.standard,
+    pic_locked: live.locked,
+    pic_score: live.picScore,
+    row_corr: live.rowCorr,
+    pic_lines: live.lines,
+  }
+}
+
+function hitVideoConfirmed(d) {
+  if (!d) return false
+  const over = hitLockOverlay(d)
+  const std = (over && over.standard) || d.standard
+  if (!analogStandard(std)) return false
+  const locked = (over && over.pic_locked) || d.pic_locked
+  if (locked) return true
+  const corr = Number((over && over.row_corr) ?? d.row_corr) || 0
+  const pic = Number((over && over.pic_score) ?? d.pic_score) || 0
+  return corr >= INSPECT_MIN_ROW_CORR || pic >= INSPECT_MIN_PIC_SCORE
+}
+
+function hitFramesFlowing(d) {
+  const now = Date.now()
+  const hz = Number(d && d.freq_hz)
+  const cur = current || live.freqHz
+  const isCurrent = Number.isFinite(hz) && cur && Math.abs(cur - hz) < HIT_SELECT_HZ
+  if (isCurrent && live.mode === "LOCK" && live.lastFrameAt && (now - live.lastFrameAt) <= FRAME_FRESH_MS) {
+    return true
+  }
+  if (d && d._lastPictureAt && (now - d._lastPictureAt) <= FRAME_FRESH_MS) return true
+  const last = Number(d && d.last_picture_at) || 0
+  return last > 0 && (now - last * 1000) <= FRAME_FRESH_MS
+}
+
+function hitIsVideoGreen(d) {
+  return hitVideoConfirmed(d) && hitFramesFlowing(d)
+}
+
+function hitEmptyPicture(d) {
+  const over = hitLockOverlay(d) || {}
+  if (over.pic_locked || d.pic_locked) return false
+  const pic = Number(over.pic_score ?? d.pic_score) || 0
+  if (pic >= INSPECT_MIN_PIC_SCORE) return false
+  const lines = Number(over.pic_lines ?? d.pic_lines ?? d.lines) || 0
+  const corr = Number(over.row_corr ?? d.row_corr) || 0
+  if (lines >= MIN_RASTER_LINES && corr >= INSPECT_MIN_ROW_CORR) return false
+  return true
+}
+
+function selectedHitKey(hz) {
+  return nearestHitKey(hz, hits, HIT_SELECT_HZ)
+}
+
+function cancelEmptyLockPrune() {
+  emptyLockMhz = null
+  if (emptyLockTimer) {
+    clearTimeout(emptyLockTimer)
+    emptyLockTimer = 0
+  }
+}
+
+function armEmptyLockPrune(hz) {
+  const key = selectedHitKey(hz)
+  if (key == null) {
+    cancelEmptyLockPrune()
+    return
+  }
+  if (emptyLockMhz === key) return
+  cancelEmptyLockPrune()
+  emptyLockMhz = key
+  emptyLockTimer = setTimeout(() => maybePruneEmptyLock(key), PRUNE_SETTLE_MS)
+}
+
+function maybePruneEmptyLock(key) {
+  if (emptyLockMhz !== key) return
+  if (live.mode !== "LOCK") return
+  const d = hits.get(key)
+  if (!d) return
+  if (hitIsVideoGreen(d) || !hitEmptyPicture(d)) return
+  droppedHits.add(key)
+  hits.delete(key)
+  renderHits()
+}
+
+function paintHitVideoClasses() {
+  const el = $("hits")
+  if (!el) return
+  el.querySelectorAll(".hit").forEach(n => {
+    const hz = parseFloat(n && n.dataset && n.dataset.f)
+    if (!Number.isFinite(hz)) return
+    const d = hits.get(nearestHitKey(hz, hits, HIT_SELECT_HZ))
+    const on = current && Number.isFinite(hz) && Math.abs(current - hz) < HIT_SELECT_HZ
+    const video = hitIsVideoGreen(d)
+    n.classList.toggle("on", !!on)
+    n.classList.toggle("video", !!video)
+    if (on) n.setAttribute("aria-current", "true")
+    else n.removeAttribute("aria-current")
+  })
+}
+
+function hitStamp(v) {
+  const n = Number(v)
+  return Number.isFinite(n) && n > 0 ? n : 0
+}
+
+function hitSortKey(d) {
+  if (!d) return 0
+  return hitStamp(d.first_seen) || hitStamp(d._seenAt)
+}
+
+function hitDisplayHz(d) {
+  const hz = Number(d && d.freq_hz)
+  const lockHz = Number(live.freqHz)
+  if (sameLockBird(hz, lockHz)) return lockHz
+  return hz
+}
+
+function mergeHit(prev, d) {
+  const now = Date.now() / 1000
+  const merged = prev ? { ...prev, ...d } : { ...d }
+  merged.first_seen = hitStamp(prev && prev.first_seen) || hitStamp(d && d.first_seen)
+    || hitStamp(prev && prev._seenAt) || now
+  merged.last_seen = hitStamp(d && (d.last_seen ?? d.last_updated)) || hitStamp(prev && prev.last_seen) || now
+  merged._seenAt = hitStamp(prev && prev._seenAt) || now
+  const prevHz = Number(prev && prev.freq_hz)
+  const nextHz = Number(d && d.freq_hz)
+  const lockHz = Number(live.freqHz)
+  const lockedBird = sameLockBird(nextHz, lockHz) || sameLockBird(prevHz, lockHz)
+  if (lockedBird) merged.freq_hz = lockHz
+  else if (Number.isFinite(prevHz) && Number.isFinite(nextHz) && Math.abs(prevHz - nextHz) <= MERGE_CHANNEL_HZ) {
+    merged.freq_hz = prevHz
+  }
+  return merged
+}
+
+function ingestHit(d) {
+  const hz = Number(d && d.freq_hz)
+  if (!Number.isFinite(hz) || hz <= 0) return
+  const existing = nearestHitKey(hz, hits, hitMergeTol(hz))
+  const key = existing != null ? existing : hitKey(d)
+  if (key == null) return
+  const merged = mergeHit(hits.get(key), d)
+  const dropKey = nearestDroppedKey(hz) ?? (sameLockBird(hz) ? nearestDroppedKey(Number(live.freqHz)) : null)
+  if ((droppedHits.has(key) || dropKey != null) && !hitIsVideoGreen(merged)) return
+  if (droppedHits.has(key) && hitIsVideoGreen(merged)) droppedHits.delete(key)
+  if (dropKey != null && hitIsVideoGreen(merged)) droppedHits.delete(dropKey)
+  hits.set(key, merged)
 }
 
 function renderHits() {
   const el = $("hits")
   if (!el) return
   if (!hits.size) {
+    lastHitsHtml = ""
     el.innerHTML = "<p class=\"empty\">Поки нічого. Кандидат потрапляє сюди лише після підтвердження рядкової частоти.</p>"
     return
   }
-  const list = [...hits.values()].sort((a, b) => b.snr_db - a.snr_db)
-  el.innerHTML = list.map(d => `
-    <div class="hit ${current && Math.abs(current - d.freq_hz) < 2e6 ? "on" : ""}"
-         data-f="${d.freq_hz}" role="button" tabindex="0">
-      <div class="f">${fmt(d.freq_hz)}</div>
+  const list = [...hits.values()].sort((a, b) => {
+    const dk = hitSortKey(b) - hitSortKey(a)
+    if (dk) return dk
+    return (Number(b && b.freq_hz) || 0) - (Number(a && a.freq_hz) || 0)
+  })
+  const html = list.map(d => {
+    if (!d) return ""
+    const shown = hitDisplayHz(d)
+    const on = current && Number.isFinite(Number(shown)) && Math.abs(current - shown) < HIT_SELECT_HZ
+    const video = hitIsVideoGreen(d)
+    const bw = Number(d.bandwidth_hz)
+    const bwTxt = Number.isFinite(bw) && bw > 0 ? (bw / 1e6).toFixed(0) + " МГц" : "—"
+    const snr = d.snr_db
+    const snrTxt = snr == null || snr === "" ? "—" : snr + " дБ"
+    const cls = ["hit", on ? "on" : "", video ? "video" : ""].filter(Boolean).join(" ")
+    return `
+    <div class="${cls}"
+         data-f="${shown}" role="button" tabindex="0"${on ? " aria-current=\"true\"" : ""}>
+      <div class="f">${fmt(shown)}</div>
       <div class="m">
-        <span>${d.channel || d.band}</span>
-        <span>${d.standard}</span>
-        <span>${d.snr_db} дБ</span>
-        <span>${(d.bandwidth_hz / 1e6).toFixed(0)} МГц</span>
+        <span>${d.channel || d.band || "—"}</span>
+        <span>${d.standard || "—"}</span>
+        <span>${snrTxt}</span>
+        <span>${bwTxt}</span>
       </div>
-    </div>`).join("")
+    </div>`
+  }).join("")
+  if (html === lastHitsHtml) {
+    paintHitVideoClasses()
+    return
+  }
+  lastHitsHtml = html
+  el.innerHTML = html
   el.querySelectorAll(".hit").forEach(n => {
-    const go = () => lock(parseFloat(n.dataset.f))
+    const go = () => {
+      const hz = parseFloat(n && n.dataset && n.dataset.f)
+      if (!Number.isFinite(hz) || hz <= 0) return
+      lock(hz).catch(err => note(String(err && err.message || err), true))
+    }
     n.onclick = go
     n.onkeydown = e => { if (e.key === "Enter") go() }
   })
@@ -664,12 +1110,36 @@ function metric(id, num, unit) {
 
 function queueFrame(d) {
   if (!d || !d.img) return
+  if (!modeIsLock()) {
+    blankPreview()
+    return
+  }
   latestFrame = d
   live.frame = d
   live.lastFrameAt = Date.now()
+  if (d.pic_score != null) live.picScore = Number(d.pic_score)
+  if (d.row_corr != null) live.rowCorr = Number(d.row_corr)
   if (d.freq_hz) {
-    current = d.freq_hz
-    live.freqHz = d.freq_hz
+    const f = Number(d.freq_hz)
+    if (sameLockBird(f)) {
+      /* keep lock target */
+    } else {
+      if (!Number.isFinite(current) || Math.abs(current - f) > MERGE_CHANNEL_HZ) current = f
+      if (!Number.isFinite(live.freqHz) || Math.abs(live.freqHz - f) > MERGE_CHANNEL_HZ) live.freqHz = f
+    }
+    const key = nearestHitKey(f, hits, HIT_SELECT_HZ)
+    if (key != null && hits.has(key)) {
+      const prev = hits.get(key)
+      prev._lastPictureAt = live.lastFrameAt
+      if (d.standard) prev.standard = d.standard
+      if (d.locked != null) prev.pic_locked = !!d.locked
+      if (d.lines != null) prev.pic_lines = d.lines
+      if (d.pic_score != null) prev.pic_score = Number(d.pic_score)
+      if (d.row_corr != null) prev.row_corr = Number(d.row_corr)
+      if (droppedHits.has(key) && hitIsVideoGreen(prev)) {
+        droppedHits.delete(key)
+      }
+    }
   }
   if (d.standard) live.standard = d.standard
   if (d.line_rate != null) live.lineRate = d.line_rate
@@ -704,6 +1174,7 @@ function applyState(s) {
   const prevMode = live.mode
   live.recording = !!s.recording
   live.mode = s.mode
+  if (!modeIsLock()) blankPreview()
   live.clipFrac = s.clip_frac || 0
   live.metrics = s
   if (s.lock_target) live.freqHz = s.lock_target
@@ -718,6 +1189,17 @@ function applyState(s) {
   const biasInp = document.querySelector(".bias-toggle input")
   if (biasInp) biasInp.checked = !!s.bias_tee
   if (s.bias_tee != null) values["sdr.bias_tee"] = !!s.bias_tee
+  if (s.gain_db != null && Number.isFinite(Number(s.gain_db))) {
+    const g = Number(s.gain_db)
+    values["sdr.gain_db"] = g
+    if (!pendingPatch["sdr.gain_db"]) {
+      const spec = specByKey("sdr.gain_db")
+      const shown = spec ? displayOf(spec, g) : g
+      document.querySelectorAll('.param[data-key="sdr.gain_db"] input[type="range"], .param[data-key="sdr.gain_db"] input[type="number"]').forEach(inp => {
+        if (document.activeElement !== inp) inp.value = shown
+      })
+    }
+  }
   const srcEl = $("s-src")
   if (srcEl) srcEl.textContent = s.source
   const m = $("s-mode")
@@ -728,6 +1210,8 @@ function applyState(s) {
   put("s-tuned", fmt(s.tuned_hz))
   put("s-sweeps", s.sweeps_done)
   ingestAfcLimit(s)
+  ingestLockStats(s)
+  updateAfcLimitUi()
   if (live.afcHz != null) put("v-afc", fmtAfc(live.afcHz))
   if (s.last_frame_ref) live.lastShot = s.last_frame_ref
   ingestGrid(s)
@@ -750,28 +1234,71 @@ function applyState(s) {
   const barF = $("bar-freq")
   if (barF) barF.textContent = fmt(s.lock_target || s.tuned_hz)
   if (Array.isArray(s.detections)) {
-    hits.clear()
-    for (const d of s.detections) hits.set(Math.round(d.freq_hz / 1e6), d)
+    const prevHits = hits
+    const next = new Map()
+    for (const d of s.detections) {
+      const hz = Number(d && d.freq_hz)
+      if (!Number.isFinite(hz) || hz <= 0) continue
+      const existing = nearestHitKey(hz, next, hitMergeTol(hz)) ?? nearestHitKey(hz, prevHits, hitMergeTol(hz))
+      const key = existing != null ? existing : hitKey(d)
+      if (key == null) continue
+      const merged = mergeHit(next.get(key) || prevHits.get(key), d)
+      const dropKey = nearestDroppedKey(hz) ?? (sameLockBird(hz) ? nearestDroppedKey(Number(live.freqHz)) : null)
+      if ((droppedHits.has(key) || dropKey != null) && !hitIsVideoGreen(merged)) continue
+      if (droppedHits.has(key) && hitIsVideoGreen(merged)) droppedHits.delete(key)
+      if (dropKey != null && hitIsVideoGreen(merged)) droppedHits.delete(dropKey)
+      next.set(key, merged)
+    }
+    hits = next
     renderHits()
   }
   updateHealth()
   if (s.mode && s.mode !== prevMode) syncParamToolset()
 }
 
-async function lock(f) {
-  current = f
-  live.freqHz = f
+async function lock(f, opts) {
+  const hz = Number(f)
+  if (!Number.isFinite(hz) || hz <= 0) return
+  const force = !!(opts && opts.force)
+  const held = Number(live.freqHz || current)
+  if (!force && live.mode === "LOCK" && Number.isFinite(held)) {
+    if (Math.abs(held - hz) <= MERGE_LOCK_HZ) return
+  }
+  const target = hz
+  const prevKey = Number.isFinite(held) ? selectedHitKey(held) : null
+  current = target
+  live.freqHz = target
   live.mode = "LOCK"
-  await engineLock(f)
-  put("v-f", fmt(f))
-  const mf = $("manual-freq")
-  if (mf) mf.value = (f / 1e6).toFixed(1)
-  setWatching(true)
-  renderHits()
-  dirty.grid = true
-  dirty.spec = true
-  syncParamToolset()
-  refreshLiveSpectrum()
+  live.locked = false
+  live.lastFrameAt = 0
+  live.picScore = null
+  live.rowCorr = null
+  live.standard = "—"
+  live.lines = null
+  const rowKey = prevKey ?? nearestHitKey(target, hits, MERGE_LOCK_HZ)
+  if (rowKey != null && hits.has(rowKey)) hits.get(rowKey).freq_hz = target
+  armEmptyLockPrune(target)
+  try {
+    await engineLock(target, force ? { force: true } : undefined)
+  } catch (err) {
+    note(String(err && err.message || err), true)
+    return
+  }
+  try {
+    put("v-f", fmt(target))
+    const mf = $("manual-freq")
+    if (mf) mf.value = (target / 1e6).toFixed(1)
+    setWatching(true)
+    renderHits()
+    dirty.grid = true
+    dirty.spec = true
+    dirty.hud = true
+    syncParamToolset()
+    refreshLiveSpectrum({ keepLock: true })
+  } catch (err) {
+    console.error("lock ui:", err)
+    note(String(err && err.message || err), true)
+  }
 }
 
 function clusterPayload(raw) {
@@ -794,6 +1321,7 @@ function syncScanMenus() {
     const allowed = new Set(["all", "hide_weak", "hide_no_video", "hide_near_dup"])
     filt.value = allowed.has(v) ? v : "hide_weak"
   }
+  syncSpecKit()
 }
 
 async function commitScanMenu(key, value) {
@@ -836,16 +1364,7 @@ on("sel-hit-filter", "change", () => {
 })
 
 function hideVideo() {
-  latestFrame = null
-  dirty.frame = false
-  revokePics()
-  const img = $("pic")
-  if (img) {
-    img.removeAttribute("src")
-    img.style.display = "none"
-  }
-  const hint = $("hint")
-  if (hint) hint.hidden = false
+  blankPreview()
 }
 
 function startSweep() {
@@ -853,6 +1372,9 @@ function startSweep() {
   live.freqHz = null
   live.locked = false
   live.mode = "SWEEP"
+  live.picScore = null
+  live.rowCorr = null
+  cancelEmptyLockPrune()
   hideVideo()
   setWatching(false)
   renderHits()
@@ -867,6 +1389,9 @@ bindClick("b-sweep", () => {
 bindClick("b-clear", async () => {
   await engineClear()
   hits.clear()
+  droppedHits.clear()
+  lastHitsHtml = ""
+  cancelEmptyLockPrune()
   grid.progress_01 = 0
   grid.current_hz = null
   grid.visiting_hz = []
@@ -888,7 +1413,7 @@ bindClick("b-rec", async () => { await engineRecord(!live.recording) })
 function nudge(deltaHz) {
   const base = displayedFreqHz()
   if (!base) return
-  lock(base + deltaHz)
+  lock(base + deltaHz, { force: true }).catch(err => note(String(err && err.message || err), true))
 }
 function stepLock(mhz) {
   nudge(Number(mhz) * 1e6)
@@ -926,12 +1451,33 @@ function commitManualFreq() {
   const v = parseMhz(inp.value)
   if (isNaN(v)) return
   closeFreqPop()
-  lock(v * 1e6)
+  lock(v * 1e6, { force: true })
 }
 
 document.querySelectorAll("#fft-win [data-mhz]").forEach(btn => {
   btn.addEventListener("click", () => stepLock(btn.dataset.mhz))
 })
+for (const { id, key, defaultOn = true } of SPEC_KIT) {
+  const el = $(id)
+  if (!el) continue
+  el.addEventListener("click", () => {
+    const next = !specFlagOn(key, defaultOn)
+    if (key === SPEC_EMA) resetSpecEma()
+    values[key] = next
+    if (key === SPEC_PIN) {
+      const hit = lockHitHz()
+      if (hit) {
+        const cur = next ? hit : hit + (Number(live.afcHz) || 0)
+        specView.cursor_hz = cur
+        retargetHz("cursor", cur)
+        if (live.mode === "LOCK") retargetHz("play", cur)
+      }
+    }
+    syncSpecKit()
+    dirty.spec = true
+    commitParam(key, next, true)
+  })
+}
 on("b-fft-freq", "click", e => {
   e.stopPropagation()
   const pop = $("freq-pop")
@@ -979,20 +1525,23 @@ setInterval(() => {
 function applyLiveExtra(extra, opts = {}) {
   if (!extra || typeof extra !== "object") return
   const prevMode = live.mode
-  if (extra.mode) live.mode = extra.mode
+  if (extra.mode && !(opts.keepLock && extra.mode !== "LOCK")) live.mode = extra.mode
   if (extra.frequency_hz != null) live.freqHz = extra.frequency_hz
   if (extra.lock_target_hz != null) live.freqHz = extra.lock_target_hz
   if (extra.lock_state != null) live.locked = extra.lock_state
   if (extra.video_metrics) {
     const vm = extra.video_metrics
     if (vm.locked != null) live.locked = vm.locked
-    if (vm.fps != null && Date.now() - live.lastFrameAt > 1500) live.fps = vm.fps
+    if (vm.fps != null && Number.isFinite(Number(vm.fps)) && Date.now() - live.lastFrameAt > 1500) {
+      live.fps = Number(vm.fps)
+    }
     if (vm.standard) live.standard = vm.standard
     if (vm.line_rate != null) live.lineRate = vm.line_rate
     if (vm.lines != null) live.lines = vm.lines
     if (vm.clip_frac != null) live.clipFrac = vm.clip_frac
   }
   ingestAfcLimit(extra)
+  ingestLockStats(extra)
   if (opts.mergeParams && extra.parameters && typeof extra.parameters === "object") {
     Object.assign(values, extra.parameters)
     syncScanMenus()
@@ -1002,13 +1551,15 @@ function applyLiveExtra(extra, opts = {}) {
   ingestGrid(extra)
   applySpectrumPayload(extra)
   setWatching(live.mode === "LOCK")
+  if (!modeIsLock()) blankPreview()
+  else updateAfcLimitUi()
   dirty.hud = true
   if (live.mode !== prevMode) syncParamToolset()
 }
 
-async function refreshLiveSpectrum() {
+async function refreshLiveSpectrum(opts = {}) {
   const extra = await client.live()
-  applyLiveExtra(extra, { mergeParams: true })
+  applyLiveExtra(extra, { mergeParams: true, ...opts })
 }
 
 setInterval(async () => {
@@ -1148,7 +1699,7 @@ async function afterParamsApplied(r, patchKeys) {
   const canRelock = autoRelock && inLock && freq && pending.length
   if (canRelock) {
     try {
-      const res = await engineLock(freq)
+      const res = await engineLock(freq, { force: true })
       if (res && res.ok === false) throw new Error("lock")
       markPendingRows([], {})
       setApplyStatus("застосовано зараз", pending)
@@ -1247,6 +1798,18 @@ function appendGainBiasRow(root) {
     key: "sdr.bias_tee", type: "bool", label: "Bias-T", default: true,
   }
   const ctrl = wrap.querySelector(".param-ctrl")
+  const autoG = specByKey("sdr.auto_gain")
+  if (autoG) {
+    const autoLab = document.createElement("label")
+    autoLab.className = "toggle auto-mgc-toggle"
+    const autoOn = !!(values[autoG.key] ?? autoG.default)
+    autoLab.innerHTML = `<input type="checkbox"${autoOn ? " checked" : ""}> авто`
+    autoLab.title = "Авто MGC · програмне підсилення 0…60"
+    autoLab.querySelector("input").addEventListener("change", e => {
+      commitParam(autoG.key, e.target.checked, true)
+    })
+    ctrl.appendChild(autoLab)
+  }
   const lab = document.createElement("label")
   lab.className = "toggle bias-toggle"
   const on = !!(values[bias.key] ?? bias.default)
@@ -2009,6 +2572,10 @@ function applyHash() {
 }
 
 on("pic", "error", () => {
+  if (!modeIsLock()) {
+    blankPreview()
+    return
+  }
   if (latestFrame) return
   if (picPendingUrl) {
     URL.revokeObjectURL(picPendingUrl)

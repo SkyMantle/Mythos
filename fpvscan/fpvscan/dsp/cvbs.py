@@ -29,6 +29,8 @@ from io import BytesIO
 import numpy as np
 from PIL import Image
 
+from fpvscan.dsp.demod import standard_from_line_rate
+
 SYNC_US = 4.7e-6
 # BACK_PORCH_US = 9.4e-6
 # FRONT_PORCH_US = 1.5e-6
@@ -155,6 +157,7 @@ class DecodeState:
     target_lines: int | None = None
     t0_err: float | None = None
     h_roll: int | None = None        # зсув розгортки, якщо H-синхра в кадрі
+    h_edge_hist: tuple[int, ...] = ()
 
 
 def _sync_edges(v: np.ndarray, thr: float):
@@ -215,6 +218,10 @@ TBC_SMOOTH_EMA = 0.35
 TBC_WEAK_FOUND = 0.70
 TBC_FOOTER_HOLD = 8
 H_PHASE_DEADBAND = 0.01
+H_ROLL_DEAD_PX = 1
+H_ROLL_ALPHA = 0.15
+H_EDGE_STABLE_N = 3
+H_EDGE_STABLE_SPREAD = 1
 H_PORCH_FRAC = 0.08
 H_PORCH_OK = 0.15
 CROP_LEFT_FRAC = 0.07
@@ -420,6 +427,50 @@ def h_auto_roll(pit: int, width: int) -> int:
     return roll
 
 
+def edge_col_stable(cols: list | tuple, *, need: int = H_EDGE_STABLE_N,
+                    max_spread: int = H_EDGE_STABLE_SPREAD) -> bool:
+    """True when recent H-sync edge columns agree within 1 px."""
+    seq = [int(c) for c in cols]
+    if len(seq) < int(need):
+        return False
+    recent = seq[-int(need):]
+    return max(recent) - min(recent) <= int(max_spread)
+
+
+def h_phase_should_nudge(frac: float, *, pic_locked: bool = False,
+                         edge_stable: bool = True,
+                         deadband: float = H_PHASE_DEADBAND) -> bool:
+    """Residual H-phase after TBC. |frac|<0.01 (~1 sample / ~3.6°) is idle."""
+    if pic_locked or not edge_stable:
+        return False
+    return abs(float(frac)) >= float(deadband)
+
+
+def h_roll_step(prev: int | None, auto: int, width: int, *,
+                pic_locked: bool = False,
+                edge_stable: bool = True,
+                dead_px: int = H_ROLL_DEAD_PX,
+                alpha: float = H_ROLL_ALPHA) -> int:
+    """Slow H-roll. Dead zone 1 px; freeze when locked or the edge is noisy.
+
+    First park (prev is None) still applies so a mid-frame pit can land
+    on the porch. `auto==0` means this raster is already parked — drop
+    a stale roll rather than EMA back through the picture. After that,
+    |Δ| ≤ 1 px and pic_locked leave the raster.
+    """
+    w = max(1, int(width))
+    auto_i = int(auto) % w
+    if prev is None:
+        return auto_i
+    if auto_i == 0:
+        return 0
+    prev_i = int(prev) % w
+    delta = (auto_i - prev_i + w // 2) % w - w // 2
+    if pic_locked or not edge_stable or abs(delta) <= int(dead_px):
+        return prev_i
+    return int(prev_i + float(alpha) * delta) % w
+
+
 def h_phase_manual_px(frac: float, width: int) -> int:
     """Extra roll after auto park. |frac| < 0.01 is slider noise → 0.
 
@@ -434,12 +485,15 @@ def h_phase_manual_px(frac: float, width: int) -> int:
 
 
 def _h_unwrap(luma: np.ndarray, state: DecodeState | None,
-              h_phase_frac: float = 0.0) -> np.ndarray:
+              h_phase_frac: float = 0.0,
+              pic_locked: bool = False) -> np.ndarray:
     """Park H-blank on the left porch, then a deadbanded manual nudge.
 
     Phase only — crop is a later slice, never a roll into the middle.
     A large h_phase_frac that would land mid-frame is ignored (auto
     park stays); we do not pretend the slider applied.
+    Auto-roll after the first park is slow, 1 px dead-zoned, and frozen
+    when `pic_locked` or `h_sync_edge_col` jitters across lines.
     """
     if luma is None or luma.ndim != 2:
         return luma
@@ -447,13 +501,13 @@ def _h_unwrap(luma: np.ndarray, state: DecodeState | None,
     pit = h_phase_col(luma)
     auto = h_auto_roll(pit, w)
     if state is not None:
-        if state.h_roll is None:
-            state.h_roll = auto
-        else:
-            prev = int(state.h_roll)
-            d = (auto - prev + w // 2) % w - w // 2
-            state.h_roll = int(prev + 0.75 * d) % w
-        auto = int(state.h_roll)
+        hist = tuple(state.h_edge_hist) + (int(pit),)
+        state.h_edge_hist = hist[-5:]
+        stable = True if state.h_roll is None else edge_col_stable(state.h_edge_hist)
+        auto = h_roll_step(
+            state.h_roll, auto, w,
+            pic_locked=pic_locked, edge_stable=stable)
+        state.h_roll = auto
         dest = (pit - auto) % w
         if auto and h_pit_unsafe(dest, w):
             auto = 0
@@ -620,8 +674,9 @@ def _attempt(v: np.ndarray, fs: float, width: int, max_lines: int,
     line_rate = fs / period
     if not (14000 < line_rate < 17500):
         return 0.0, None, None
-    standard = ("PAL" if abs(line_rate - 15625) < 120 else
-                "NTSC" if abs(line_rate - 15734) < 120 else "?")
+    # No Hz cap here: 14–17.5 kHz already proved analog. '?' geometry
+    # (287.5 lines) breaks PAL tracking when the camera is >100 Hz off.
+    standard = standard_from_line_rate(line_rate, max_err_hz=None)
     a0_frac, a1_frac, vblank = STD_GEOM[standard]
 
     # --- кадрова синхра: вікно в один рядок, де низького рівня > 55% ---
@@ -874,6 +929,7 @@ def decode(base: np.ndarray, fs: float, width: int = 640,
         state.lost = 0
         state.t0_err = None
         state.h_roll = None
+        state.h_edge_hist = ()
         if state.target_lines is None:
             state.target_lines = max_lines
         best_f.luma = _fit_height(best_f.luma, state.target_lines)

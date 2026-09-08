@@ -12,8 +12,39 @@ from dataclasses import dataclass
 import numpy as np
 from scipy import signal
 
+try:
+    from numba import njit
+    _HAVE_NUMBA = True
+except ImportError:  # pragma: no cover - optional runtime
+    njit = None
+    _HAVE_NUMBA = False
+
 LINE_PAL = 15625.0
 LINE_NTSC = 15734.264
+# Farther than this from both standards → "?"; PAL−NTSC is 109 Hz, so
+# a PAL-first window of 150 Hz used to swallow NTSC.
+LINE_MAX_ERR_HZ = 100.0
+
+
+def standard_from_line_rate(hz: float,
+                            max_err_hz: float | None = LINE_MAX_ERR_HZ) -> str:
+    """Nearest of PAL vs NTSC by absolute error; '?' if both are too far.
+
+    Pass max_err_hz=None for raster geometry: analog cameras often sit
+    100–300 Hz off 15625, and '?' field timing (287.5 lines) cannot hold
+    PAL/NTSC lock. Classify still passes its own tol as the cap.
+    """
+    try:
+        f = float(hz)
+    except (TypeError, ValueError):
+        return "?"
+    if f != f:  # NaN
+        return "?"
+    err_pal = abs(f - LINE_PAL)
+    err_ntsc = abs(f - LINE_NTSC)
+    if max_err_hz is not None and min(err_pal, err_ntsc) > max_err_hz:
+        return "?"
+    return "PAL" if err_pal <= err_ntsc else "NTSC"
 
 
 def shift(iq: np.ndarray, offset_hz: float, fs: float) -> np.ndarray:
@@ -89,15 +120,43 @@ def channelize(iq: np.ndarray, fs: float, offset_hz: float,
     return (y / dec).astype(np.complex64), fs / dec
 
 
-def fm_demod(iq: np.ndarray, fs: float, deviation_hz: float = 4e6) -> np.ndarray:
-    """Квадратурний частотний дискримінатор.
-
-    Найгарячіша петля всього проєкту. У numpy це arctan2 по всьому
-    масиву; на Pi 5 саме звідси беруться основні мілісекунди.
-    """
+def _fm_demod_numpy(iq: np.ndarray, fs: float, deviation_hz: float) -> np.ndarray:
+    """Vector arctan2 discriminator. Fallback when numba is missing."""
     d = iq[1:] * np.conj(iq[:-1])
     inst = np.arctan2(d.imag, d.real).astype(np.float32)
     return inst * (fs / (2 * np.pi * deviation_hz))
+
+
+if _HAVE_NUMBA:
+    @njit(cache=True)
+    def _fm_demod_phase(i: np.ndarray, q: np.ndarray) -> np.ndarray:
+        n = i.size - 1
+        out = np.empty(n, dtype=np.float32)
+        for k in range(n):
+            re = i[k + 1] * i[k] + q[k + 1] * q[k]
+            im = q[k + 1] * i[k] - i[k + 1] * q[k]
+            out[k] = np.float32(np.arctan2(im, re))
+        return out
+else:  # pragma: no cover
+    _fm_demod_phase = None
+
+
+def fm_demod(iq: np.ndarray, fs: float, deviation_hz: float = 4e6) -> np.ndarray:
+    """Квадратурний частотний дискримінатор.
+
+    Найгарячіша петля всього проєкту. Numba JIT на arctan2; без
+    пакета — той самий numpy шлях.
+    """
+    x = np.asarray(iq)
+    if x.size < 2:
+        return np.empty(0, dtype=np.float32)
+    if _HAVE_NUMBA and _fm_demod_phase is not None:
+        inst = _fm_demod_phase(
+            np.ascontiguousarray(x.real),
+            np.ascontiguousarray(x.imag),
+        )
+        return inst * (fs / (2 * np.pi * deviation_hz))
+    return _fm_demod_numpy(x, fs, deviation_hz)
 
 def inst_freq_hz(iq: np.ndarray, fs: float) -> np.ndarray:
     """Миттєва частота у герцах відносно нуля смуги."""
@@ -262,11 +321,7 @@ def classify_video(base: np.ndarray, fs: float,
     prominence_db = comb.prominence_db
     harm = comb.harmonics
 
-    std = "?"
-    if abs(peak_f - LINE_PAL) < tol_hz:
-        std = "PAL"
-    elif abs(peak_f - LINE_NTSC) < tol_hz:
-        std = "NTSC"
+    std = standard_from_line_rate(peak_f, max_err_hz=tol_hz)
 
     conf = min(1.0, max(0.0,
                (prominence_db - min_prominence_db) / 18)) * (0.6 + 0.2 * harm)

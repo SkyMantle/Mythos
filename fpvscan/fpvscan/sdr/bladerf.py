@@ -332,6 +332,7 @@ class BladeRF(SdrSource):
         self.io_errors = 0
         self.overflows = 0
         self.clip_frac = 0.0
+        self.adc_rms = 0.0
         self._quick: dict[int, C.Array] = {}     # частота(Гц) -> профіль
 
     # ---------- життєвий цикл ----------
@@ -592,8 +593,12 @@ class BladeRF(SdrSource):
         # Контроль насичення АЦП. Обрізаний сигнал у спектрі виглядає
         # нормально, а на виході дискримінатора дає сміття замість
         # відео — тому міряємо це на кожному читанні.
-        self.clip_frac = float(np.mean(np.abs(raw) > 2000))
-        return (raw.astype(np.float32) / SC16_SCALE).view(np.complex64)
+        abs_raw = np.abs(raw)
+        self.clip_frac = float(np.mean(abs_raw > 2000))
+        scaled = raw.astype(np.float32) * (1.0 / SC16_SCALE)
+        iq = scaled.view(np.complex64)
+        self.adc_rms = float(np.sqrt(np.mean(iq.real * iq.real + iq.imag * iq.imag)))
+        return iq
 
     def retune_and_read(self, hz: float, n: int) -> np.ndarray:
         self.set_center_freq(hz)

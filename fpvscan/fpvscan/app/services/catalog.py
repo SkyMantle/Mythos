@@ -72,7 +72,12 @@ _NAMED_LABELS: dict[str, str] = {
     "hit_filter": "Фільтр знахідок",
     "h_pll": "ФАПЧ рядка",
     "gain_db": "Підсилення",
+    "auto_gain": "Авто MGC",
     "bias_tee": "Bias-T",
+    "spectrum_pin_center": "Центр на хіт",
+    "spectrum_ema": "Згладити в часі",
+    "spectrum_smooth3": "Згладити по частоті",
+    "spectrum_every_4": "Спектр рідше (кожен 4-й кадр)",
 }
 _ENUM_LABELS: dict[str, dict[str, str]] = {
     "cluster_step_mhz": {

@@ -26,7 +26,7 @@ import numpy as np
 from .bands import PRIORITY_BANDS, band_of, nearest_channel
 from .dsp import spectrum, demod, cvbs
 from .dsp.field_blend import blend_same_field
-from . import paths, scan_gate, scan_hits, scan_view
+from . import auto_mgc, paths, scan_gate, scan_hits, scan_view
 from .web.coalesce import enqueue_live_event
 from .recorder import VideoRecorder, FfmpegMissing
  
@@ -47,6 +47,8 @@ class Detection:
     line_rate: float = 0.0
     row_corr: float = 0.0
     pic_locked: bool = False
+    pic_lines: int = 0
+    last_picture_at: float = 0.0
  
  
  
@@ -107,9 +109,18 @@ class Engine:
         self._afc_pegged = False
         self._afc_nudge = False
         self._afc_peg_n = 0
+        self._rf_snap_at = 0.0
         self._hunt_span = 0.25e6
         self._dense_q: list[float] = []
         self._dense_seen: set[int] = set()
+        self._mgc_last_mono = 0.0
+        self._mgc_hold_until = 0.0
+        self._mgc_state = auto_mgc.MgcState()
+        self._mgc_auto_was = True
+        self._empty_drops: set[int] = set()
+        self._empty_drop_saved: dict[int, Detection] = {}
+        self._operator_lock_at: float = 0.0
+        self._operator_lock_hit_mhz: int | None = None
  
     # ---------- зовнішнє API ----------
  
@@ -159,6 +170,19 @@ class Engine:
  
     def _handle_command(self, name: str, kw: dict):
         if name == "lock":
+            want = float(kw["freq_hz"])
+            force = bool(kw.get("force"))
+            # Never snap want onto a nearby published center: that made
+            # ±0.1 MHz (= MERGE_CHANNEL_HZ) look like the same bird.
+            target, skip = scan_hits.lock_retune(
+                want,
+                self.state.lock_target,
+                force=force,
+                locked=self.state.mode == "LOCK",
+            )
+            if skip:
+                self._arm_operator_lock(self.state.lock_target)
+                return
             self._acc = None
             self._acc_parity = None
             self._afc = 0.0
@@ -169,22 +193,26 @@ class Engine:
             self._lock_tuned = None
             self._lock_n = 0
             self._lock_gen += 1
+            self._reset_auto_mgc()
             self._afc_pegged = False
             self._afc_nudge = False
             self._afc_peg_n = 0
-            self.state.lock_target = float(kw["freq_hz"])
-            self.state.tuned_hz = float(kw["freq_hz"])
+            self._rf_snap_at = 0.0
+            self.state.lock_target = target
+            self.state.tuned_hz = target
             self.state.mode = "LOCK"
             self.state.auto = False
+            self._arm_operator_lock(target)
             self._last_spectrum = {
                 "bins": None,
-                "center_hz": float(kw["freq_hz"]),
+                "center_hz": target,
                 "span_hz": float(self.cfg.get("video", {}).get("sample_rate") or 0),
                 "floor_db": None,
                 "peak_db": None,
                 "nfft": 2048,
             }
             self._emit("spectrum", self._spectrum_view())
+            self._emit("state", self.snapshot())
         elif name == "sweep":
             self.state.lock_target = None
             self.state.mode = "SWEEP"
@@ -192,11 +220,17 @@ class Engine:
             self._afc = 0.0
             self._lock_gen += 1
             self._lock_score_peak = 0.0
+            self._operator_lock_hit_mhz = None
+            self._operator_lock_at = 0.0
             self._stop_reader()
         elif name == "clear":
             self._peeked.clear()
             self._sweep_i = 0
             self.state.detections.clear()
+            self._empty_drops.clear()
+            self._empty_drop_saved.clear()
+            self._operator_lock_hit_mhz = None
+            self._operator_lock_at = 0.0
         elif name == "snapshot":
             self._snap = True
         elif name == "rec_start":
@@ -271,6 +305,76 @@ class Engine:
             self.src.set_gain(target)
         except Exception as e:
             self._emit("notice", {"level": "error", "text": f"gain при bias-tee: {e}"})
+
+    def hold_auto_mgc(self, seconds: float | None = None) -> None:
+        """Pause software MGC after the operator moved the gain slider."""
+        hold = auto_mgc.HOLD_S if seconds is None else float(seconds)
+        if seconds is None:
+            try:
+                hold = float(self.cfg.get("sdr", {}).get("auto_gain_hold_s", auto_mgc.HOLD_S))
+            except (TypeError, ValueError):
+                hold = auto_mgc.HOLD_S
+        self._mgc_hold_until = time.monotonic() + max(0.0, hold)
+
+    def disable_auto_mgc(self) -> None:
+        """Operator gain write: stop software MGC until they click авто."""
+        self.cfg.setdefault("sdr", {})["auto_gain"] = False
+        self._mgc_auto_was = False
+        self._mgc_state = auto_mgc.MgcState()
+
+    def reset_auto_mgc(self) -> None:
+        """Resume hill-climb from the current catalog gain (авто on)."""
+        self._reset_auto_mgc()
+        self._mgc_auto_was = True
+
+    def _reset_auto_mgc(self) -> None:
+        self._mgc_state = auto_mgc.MgcState()
+        self._mgc_last_mono = time.monotonic()
+
+    def _maybe_auto_mgc(self, frame, iq=None) -> None:
+        """LOCK software MGC: step catalog gain_db. BladeRF AGC stays off."""
+        sdr = self.cfg.get("sdr") or {}
+        enabled = bool(sdr.get("auto_gain", True))
+        if enabled and not self._mgc_auto_was:
+            self._reset_auto_mgc()
+        self._mgc_auto_was = enabled
+        if not enabled:
+            return
+        now = time.monotonic()
+        try:
+            interval = float(sdr.get("auto_gain_interval_s", auto_mgc.INTERVAL_S))
+        except (TypeError, ValueError):
+            interval = auto_mgc.INTERVAL_S
+        if not auto_mgc.due(now, self._mgc_last_mono, interval):
+            return
+        self._mgc_last_mono = now
+        pic = cvbs.score_picture(frame)
+        luma = None if frame is None else getattr(frame, "luma", None)
+        src_rms = float(getattr(self.src, "adc_rms", 0.0) or 0.0)
+        sample = auto_mgc.MgcSample(
+            gain_db=float(sdr.get("gain_db", 30)),
+            pic_locked=bool(pic.locked),
+            pic_score=float(pic.value),
+            pic_lines=int(pic.lines),
+            row_corr=float(pic.row_corr),
+            clip_frac=float(getattr(self.src, "clip_frac", 0.0) or 0.0),
+            operator_hold=now < self._mgc_hold_until,
+            now_s=now,
+            adc_rms=max(src_rms, auto_mgc.iq_rms(iq)),
+            sat_frac=auto_mgc.luma_sat_frac(luma),
+            frame_sig=auto_mgc.luma_signature(luma),
+            min_db=float(sdr.get("auto_gain_min_db", auto_mgc.MIN_DB)),
+            max_db=float(sdr.get("auto_gain_max_db", auto_mgc.MAX_DB)),
+            step_db=float(sdr.get("auto_gain_step_db", auto_mgc.STEP_DB)),
+            clip_thresh=float(sdr.get("auto_gain_clip_frac", auto_mgc.CLIP_FRAC)),
+        )
+        nxt = int(round(auto_mgc.step(sample, self._mgc_state)))
+        if nxt == int(round(sample.gain_db)):
+            return
+        block = self.cfg.setdefault("sdr", {})
+        block["gain_db"] = nxt
+        self._apply_bias_tee_gain(bool(sdr.get("bias_tee", False)))
+        self._emit("state", self.snapshot())
  
     def _save_photo(self, frame):
         name = paths.stamped("shot", "webp", self.state.lock_target)
@@ -610,6 +714,7 @@ class Engine:
             line_rate=score.line_rate,
             row_corr=0.0 if pic is None else round(pic.row_corr, 3),
             pic_locked=False if pic is None else bool(pic.locked),
+            pic_lines=0 if pic is None else int(pic.lines),
         )
         self._merge(det)
 
@@ -743,21 +848,34 @@ class Engine:
         Центр лишаємо відео-кращий (pic_score), не найсильніший SNR:
         інакше шпора 5018 (61 дБ) перебивала живий 4988.
         """
+        if self._is_empty_dropped(det.freq_hz):
+            if scan_hits.video_confirmed(asdict(det)):
+                self._clear_empty_drop_near(det.freq_hz)
+            else:
+                return
+        lock_hz = self.state.lock_target if self.state.mode == "LOCK" else None
         for k, old in list(self.state.detections.items()):
-            if not self._same_tx(old, det):
+            if lock_hz is not None:
+                old_lock = abs(old.freq_hz - lock_hz) <= scan_hits.MERGE_LOCK_HZ
+                new_lock = abs(det.freq_hz - lock_hz) <= scan_hits.MERGE_LOCK_HZ
+                if old_lock != new_lock:
+                    continue
+            lock_pair = (
+                lock_hz is not None
+                and abs(old.freq_hz - lock_hz) <= scan_hits.MERGE_LOCK_HZ
+                and abs(det.freq_hz - lock_hz) <= scan_hits.MERGE_LOCK_HZ
+            )
+            if not lock_pair and not self._same_tx(old, det):
                 continue
             det.first_seen = old.first_seen
             det.hits = old.hits + 1
-            keep_old = False
-            if old.pic_score > det.pic_score + 0.04:
-                keep_old = True
-            elif abs(old.pic_score - det.pic_score) <= 0.04:
-                if old.confidence > det.confidence + 0.05:
-                    keep_old = True
-                elif abs(old.confidence - det.confidence) <= 0.05 and old.snr_db > det.snr_db:
-                    keep_old = True
-            if keep_old:
-                det.freq_hz = old.freq_hz
+            if lock_pair or abs(old.freq_hz - det.freq_hz) <= scan_hits.MERGE_CHANNEL_HZ:
+                # Same bird: sticky published center. Update SNR/pic in place.
+                det.freq_hz = scan_hits.sticky_published_hz(
+                    old.freq_hz, det.freq_hz,
+                    lock_target=self.state.lock_target,
+                    locked=self.state.mode == "LOCK",
+                )
                 det.bandwidth_hz = old.bandwidth_hz
                 det.snr_db = max(old.snr_db, det.snr_db)
                 det.pic_score = max(old.pic_score, det.pic_score)
@@ -765,18 +883,52 @@ class Engine:
                 det.line_rate = old.line_rate or det.line_rate
                 det.row_corr = max(old.row_corr, det.row_corr)
                 det.pic_locked = old.pic_locked or det.pic_locked
+                det.pic_lines = max(old.pic_lines, det.pic_lines)
+                det.last_picture_at = max(old.last_picture_at, det.last_picture_at)
                 det.standard = old.standard if old.pic_score >= det.pic_score else det.standard
                 det.channel = old.channel or det.channel
                 det.band = old.band or det.band
             else:
-                det.snr_db = max(old.snr_db, det.snr_db)
+                keep_old = False
+                if old.pic_score > det.pic_score + 0.04:
+                    keep_old = True
+                elif abs(old.pic_score - det.pic_score) <= 0.04:
+                    if old.confidence > det.confidence + 0.05:
+                        keep_old = True
+                    elif abs(old.confidence - det.confidence) <= 0.05 and old.snr_db > det.snr_db:
+                        keep_old = True
+                if keep_old:
+                    det.freq_hz = scan_hits.sticky_published_hz(
+                        old.freq_hz, det.freq_hz,
+                        lock_target=self.state.lock_target,
+                        locked=self.state.mode == "LOCK",
+                    )
+                    det.bandwidth_hz = old.bandwidth_hz
+                    det.snr_db = max(old.snr_db, det.snr_db)
+                    det.pic_score = max(old.pic_score, det.pic_score)
+                    det.confidence = max(old.confidence, det.confidence)
+                    det.line_rate = old.line_rate or det.line_rate
+                    det.row_corr = max(old.row_corr, det.row_corr)
+                    det.pic_locked = old.pic_locked or det.pic_locked
+                    det.pic_lines = max(old.pic_lines, det.pic_lines)
+                    det.last_picture_at = max(old.last_picture_at, det.last_picture_at)
+                    det.standard = old.standard if old.pic_score >= det.pic_score else det.standard
+                    det.channel = old.channel or det.channel
+                    det.band = old.band or det.band
+                else:
+                    det.snr_db = max(old.snr_db, det.snr_db)
             del self.state.detections[k]
+            key = k
             break
-        self.state.detections[int(det.freq_hz / 1e6)] = det
+        else:
+            if lock_hz is not None and abs(det.freq_hz - lock_hz) <= scan_hits.MERGE_LOCK_HZ:
+                det.freq_hz = float(lock_hz)
+            key = scan_hits.hit_key(det.freq_hz)
+        self.state.detections[key] = det
         # Одноразовий спалах у шумі не показуємо: справжній передавач
         # нікуди не подінеться і підтвердиться наступним проходом.
         if det.hits >= int(self.cfg["scan"].get("confirm_hits", 2)):
-            if any(abs(float(d["freq_hz"]) - det.freq_hz) < 1.0
+            if any(scan_hits.same_channel(float(d["freq_hz"]), det.freq_hz)
                    for d in self._published_detections()):
                 self._emit("detection", asdict(det))
             self._maybe_peek(det)
@@ -792,7 +944,7 @@ class Engine:
         sc = self.cfg["scan"]
         if not scan_gate.auto_peek_allowed(det, sc) or self.state.mode == "LOCK":
             return
-        key = int(det.freq_hz / 1e6)
+        key = scan_hits.hit_key(det.freq_hz)
         now = time.time()
         # Не повертатись на той самий канал щопроходу.
         if now - self._peeked.get(key, 0) < float(sc.get("auto_peek_cooldown_s", 60)):
@@ -804,7 +956,10 @@ class Engine:
         self._afc = 0.0
         self._lock_n = 0
         self._lock_gen += 1
+        self._reset_auto_mgc()
         self._lock_score_peak = 0.0
+        self._operator_lock_hit_mhz = None
+        self._operator_lock_at = 0.0
         self.state.lock_target = det.freq_hz
         self.state.mode = "LOCK"
         self.state.auto = True
@@ -900,30 +1055,35 @@ class Engine:
         return 14_000.0 < float(frame.line_rate) < 17_500.0
 
     def _apply_afc(self, base, fs: float, off: float, ch_bw: float,
-                   deviation: float, vcfg: dict):
+                   deviation: float, vcfg: dict, *,
+                   pic_locked: bool = False):
         """Щокадрова дешева AFC: лише цифровий зсув каналайзера.
 
-        lock_target після «Стати» — якір оператора. Не складаємо AFC
-        в якір і не перебудовуємо RF: freq_error (середина перцентилів
-        ЧМ-відео) зміщена в бік синхри/спідниці і з'їжджала з картинки
-        (3080→3075, той самий клас що 4989). На межі Найквіста — стоп.
+        lock_target після «Стати» — якір оператора. freq_error (середина
+        перцентилів ЧМ-відео) зміщена в бік синхри/спідниці і з'їжджала
+        з картинки (3080→3075). На межі Найквіста — стоп, не ±2 МГц hunt.
+        Wide hunt / RF ±2 MHz freeze while `pic_locked` — they tear.
+        Pegged + locked raster: `_maybe_rf_snap` once moves RF by digital
+        `_afc` and zeros the mixer (hits/pin follow the new lock_target).
         """
         err = demod.freq_error_from_demod(base, deviation)
         self._last_err = err
         dead = float(vcfg.get("afc_deadband_hz", 80e3))
         dig_lim = self._digital_afc_lim(fs, off, ch_bw, vcfg)
         if abs(err) <= dead or dig_lim < 50e3:
-            self._update_afc_peg(vcfg, dig_lim)
+            self._update_afc_peg(vcfg, dig_lim, pic_locked=pic_locked)
             return
         max_step = float(vcfg.get("afc_max_step_hz", 0.25e6))
         gain = float(vcfg.get("afc_gain", 0.5))
         step = float(np.clip(err * gain, -max_step, max_step))
         self._afc = max(-dig_lim, min(dig_lim, self._afc + step))
-        self._update_afc_peg(vcfg, dig_lim)
+        self._update_afc_peg(vcfg, dig_lim, pic_locked=pic_locked)
 
-    def _update_afc_peg(self, vcfg: dict, dig_lim: float) -> None:
+    def _update_afc_peg(self, vcfg: dict, dig_lim: float, *,
+                        pic_locked: bool = False) -> None:
         self._afc_pegged = scan_view.afc_is_pegged(self._afc, dig_lim)
-        nudge = scan_view.afc_should_nudge(self._afc, self._last_err, dig_lim)
+        nudge = scan_view.afc_should_nudge(
+            self._afc, self._last_err, dig_lim, pic_locked=pic_locked)
         self._afc_nudge = nudge
         offs = vcfg.get("hunt_offsets_mhz") or [0.25]
         self._hunt_span = scan_view.hunt_span_hz(offs, pegged=nudge)
@@ -953,13 +1113,49 @@ class Engine:
             f"AFC у упорі — якір {delta/1e6:+.2f} МГц → "
             f"{self.state.lock_target/1e6:.2f}"})
 
-    def _take_hunt_result(self, fs: float, off: float, ch_bw: float):
+    def _maybe_rf_snap(self, *, pic_locked: bool, pic_score: float,
+                       digital_max_hz: float) -> bool:
+        """Retune RF to lock_hz + digital AFC when the mixer is pegged.
+
+        Only with a usable locked raster. Does not hunt ±2 MHz. Cooldown
+        blocks every-frame repeats. Hits list / spectrum pin follow
+        lock_target (MERGE_LOCK_HZ still 2 MHz).
+        """
+        if self.state.mode != "LOCK" or not self.state.lock_target:
+            return False
+        now = time.monotonic()
+        vcfg = self.cfg.get("video") or {}
+        cooldown = float(vcfg.get("rf_snap_cooldown_s", scan_view.RF_SNAP_COOLDOWN_S))
+        if not scan_view.rf_snap_due(
+                pic_locked=pic_locked, pic_score=pic_score,
+                afc_hz=self._afc, digital_max_hz=digital_max_hz,
+                last_snap_mono=self._rf_snap_at, now_mono=now,
+                cooldown_s=cooldown):
+            return False
+        delta = float(self._afc)
+        new_hz = float(self.state.lock_target) + delta
+        self.state.lock_target = new_hz
+        self.state.tuned_hz = new_hz
+        self._afc = 0.0
+        self._lock_tuned = None
+        self._lock_gen += 1
+        self._rf_snap_at = now
+        self._afc_peg_n = 0
+        self._afc_pegged = False
+        self._afc_nudge = False
+        self._emit("notice", {"level": "ok", "text":
+            f"RF snap {delta/1e6:+.2f} МГц → {new_hz/1e6:.2f}"})
+        self._emit("state", self.snapshot())
+        return True
+
+    def _take_hunt_result(self, fs: float, off: float, ch_bw: float, *,
+                          freeze: bool = False):
         """Цифровий зсув з фонової нитки. lock_target — якір, не чіпаємо."""
         delta = self._hunt_out
         note = self._hunt_note
         self._hunt_out = None
         self._hunt_note = None
-        if not delta:
+        if freeze or not delta:
             return
         vcfg = self.cfg["video"]
         safe = self._digital_afc_lim(fs, off, ch_bw, vcfg)
@@ -991,11 +1187,16 @@ class Engine:
             return
         pic = cvbs.score_picture(frame)
         skip = float(vcfg.get("hunt_skip_if_score", 0.70))
+        hold = float(vcfg.get("hunt_hold_score", scan_view.HUNT_HOLD_SCORE))
+        if scan_view.freeze_afc_hunt(
+                pic_locked=bool(frame.locked), pic_score=float(pic.value),
+                min_score=hold):
+            return
         peak = self._lock_score_peak
         if pic.value > peak:
             self._lock_score_peak = pic.value
             peak = pic.value
-        if pic.value >= skip and not self._afc_nudge:
+        if pic.value >= skip:
             return
         drop = float(vcfg.get("hunt_drop", 0.12))
         if not self._afc_nudge and (peak < 0.35 or pic.value >= peak - drop):
@@ -1133,7 +1334,9 @@ class Engine:
         t = time.perf_counter()
         self._lock_n += 1
  
-        every = max(1, int(vcfg.get("spectrum_every", 1)))
+        # Live catalog: spectrum_every_4 → 4, else YAML spectrum_every (1).
+        # Sweep occupancy FFT does not read this.
+        every = scan_view.lock_spectrum_every(vcfg)
         if self._rec is not None:
             every = max(every, int(vcfg.get("rec_spectrum_every", 6)))
         did_spec = False
@@ -1202,9 +1405,21 @@ class Engine:
             if frame.lines < min_lines:
                 frame = None
 
-        self._take_hunt_result(fs, off, ch_bw)
+        pic = cvbs.score_picture(frame)
+        hold = float(vcfg.get("hunt_hold_score", scan_view.HUNT_HOLD_SCORE))
+        freeze_hunt = scan_view.freeze_afc_hunt(
+            pic_locked=bool(pic.locked), pic_score=float(pic.value),
+            min_score=hold)
+
+        self._maybe_auto_mgc(frame, iq)
+        self._take_hunt_result(fs, off, ch_bw, freeze=freeze_hunt)
         if vcfg.get("afc", True) and self._video_ok_for_afc(frame):
-            self._apply_afc(fm_base, fs, off, ch_bw, deviation, vcfg)
+            self._apply_afc(fm_base, fs, off, ch_bw, deviation, vcfg,
+                            pic_locked=freeze_hunt)
+        self._maybe_rf_snap(
+            pic_locked=bool(pic.locked), pic_score=float(pic.value),
+            digital_max_hz=self._digital_afc_lim(fs, off, ch_bw, vcfg),
+        )
         t = self._mark("afc", t)
 
         self._kick_hunt(iq, fs, off, ch_bw, vcfg, frame)
@@ -1233,6 +1448,8 @@ class Engine:
                 "line_rate": round(frame.line_rate, 1),
                 "lines": frame.lines,
                 "locked": frame.locked,
+                "pic_score": round(pic.value, 3),
+                "row_corr": round(pic.row_corr, 3),
                 "afc_hz": round(self._afc, 0),
                 "freq_err_hz": round(self._last_err, 0),
             }
@@ -1244,6 +1461,7 @@ class Engine:
                                   height=None,
                                   method=int(vcfg.get("stream_method", 0)))
                 self._emit("frame", {**self._last_video, "img": img})
+                self._touch_lock_picture(f, frame, pic)
             t = self._mark("encode", t)
 
             now = time.perf_counter()
@@ -1257,7 +1475,9 @@ class Engine:
                         self._fps_ema = inst
                     else:
                         self._fps_ema = self._fps_ema * 0.8 + inst * 0.2
- 
+
+        self._maybe_prune_empty_lock(frame, pic)
+
         # шпаруватість: даємо процесору видихнути між знімками.
         # 0 — без штучної стелі fps (раніше 10 мс різали все, що вище ~15 к/с).
         idle = float(vcfg.get("idle_ms", 0))
@@ -1292,11 +1512,13 @@ class Engine:
         self._lock_tuned = None
         self._lock_n = 0
         self._lock_gen += 1
+        self._reset_auto_mgc()
         self._afc = 0.0
         self._last_err = 0.0
         self._afc_pegged = False
         self._afc_nudge = False
         self._afc_peg_n = 0
+        self._rf_snap_at = 0.0
         self._hunt_out = None
         self._hunt_note = None
         if abs(self.src.sample_rate - float(self.cfg.get("video", {}).get("sample_rate") or 0)) > 1.0:
@@ -1312,12 +1534,15 @@ class Engine:
             "source": self.src.name,
             "recording": self._rec is not None,
             "bias_tee": bool(getattr(self.src, "bias_tee", False)),
+            "gain_db": float((self.cfg.get("sdr") or {}).get("gain_db", 0)),
+            "auto_gain": bool((self.cfg.get("sdr") or {}).get("auto_gain", True)),
             "rec_seconds": (round(time.time() - self._rec.started_at, 1)
             if self._rec else 0),
             "fps": round(self._fps_ema, 2),
             "timings_ms": {k: round(v, 1) for k, v in self._timings.items()},
             "overflows": int(getattr(self.src, "overflows", 0)),
             "clip_frac": round(float(getattr(self.src, "clip_frac", 0.0)), 4),
+            "adc_rms": round(float(getattr(self.src, "adc_rms", 0.0) or 0.0), 4),
             "afc_hz": round(self._afc, 0),
             "freq_err_hz": round(self._last_err, 0),
             "afc_pegged": bool(self._afc_pegged),
@@ -1342,11 +1567,146 @@ class Engine:
         raw = [
             asdict(d) for d in sorted(
                 self.state.detections.values(), key=lambda x: -x.snr_db)
-            if d.hits >= need
+            if d.hits >= need and not self._is_empty_dropped(d.freq_hz)
         ]
-        return scan_hits.filter_published(
+        items = scan_hits.filter_published(
             raw, self.cfg["scan"].get("hit_filter", scan_hits.HIT_FILTER_DEFAULT),
         )
+        lock_hz = self.state.lock_target
+        if self.state.mode == "LOCK" and lock_hz is not None:
+            for d in items:
+                if scan_hits.same_channel(d["freq_hz"], lock_hz, scan_hits.MERGE_LOCK_HZ):
+                    d["freq_hz"] = float(lock_hz)
+        return items
+
+    def _arm_operator_lock(self, freq_hz: float) -> None:
+        """Remember which published hit the operator selected, if any."""
+        mhz = self._published_mhz_near(freq_hz)
+        if (self._operator_lock_hit_mhz is not None
+                and mhz == self._operator_lock_hit_mhz):
+            return
+        self._operator_lock_at = time.monotonic()
+        self._operator_lock_hit_mhz = mhz
+
+    def _published_mhz_near(self, freq_hz: float) -> int | None:
+        best = None
+        best_d = scan_hits.HIT_SELECT_HZ
+        for d in self._published_detections():
+            dist = abs(float(d["freq_hz"]) - float(freq_hz))
+            if dist <= best_d:
+                best_d = dist
+                best = int(round(float(d["freq_hz"]) / 1e6))
+        return best
+
+    def _is_empty_dropped(self, freq_hz: float) -> bool:
+        key = scan_hits.hit_key(freq_hz)
+        span = int(scan_hits.HIT_SELECT_HZ / scan_hits.HIT_KEY_HZ)
+        return any(abs(int(r) - key) <= span for r in self._empty_drops)
+
+    def _clear_empty_drop_near(self, freq_hz: float) -> None:
+        key = scan_hits.hit_key(freq_hz)
+        span = int(scan_hits.HIT_SELECT_HZ / scan_hits.HIT_KEY_HZ)
+        gone = [r for r in self._empty_drops if abs(int(r) - key) <= span]
+        for r in gone:
+            self._empty_drops.discard(r)
+            self._empty_drop_saved.pop(r, None)
+
+    def _detection_near(self, freq_hz: float, tol_hz: float = 2e6):
+        best = None
+        best_d = float(tol_hz)
+        for d in self.state.detections.values():
+            dist = abs(d.freq_hz - float(freq_hz))
+            if dist <= best_d:
+                best_d = dist
+                best = d
+        return best
+
+    def _touch_lock_picture(self, freq_hz: float, frame, pic) -> None:
+        det = self._detection_near(freq_hz)
+        if det is None:
+            return
+        det.last_picture_at = time.time()
+        det.last_seen = det.last_picture_at
+        det.pic_score = round(float(pic.value), 3)
+        det.row_corr = round(float(pic.row_corr), 3)
+        det.pic_locked = bool(pic.locked)
+        det.pic_lines = int(pic.lines)
+        if frame is not None and getattr(frame, "standard", None):
+            det.standard = frame.standard
+
+    def _lock_pic_sample(self, frame, pic) -> dict:
+        std = getattr(frame, "standard", "") if frame is not None else ""
+        return {
+            "pic_locked": bool(pic.locked),
+            "pic_score": float(pic.value),
+            "row_corr": float(pic.row_corr),
+            "pic_lines": int(pic.lines),
+            "standard": std or "",
+            "lines": int(getattr(frame, "lines", 0) or pic.lines),
+        }
+
+    def _maybe_prune_empty_lock(self, frame, pic) -> None:
+        if self.state.mode != "LOCK" or self.state.auto:
+            return
+        mhz = self._operator_lock_hit_mhz
+        if mhz is None:
+            return
+        sample = self._lock_pic_sample(frame, pic)
+        flowing = frame is not None and self._frame_ts is not None
+        if scan_hits.is_video_green(sample, streaming=flowing):
+            self._revive_empty_drop(mhz, sample)
+            return
+        elapsed = time.monotonic() - float(self._operator_lock_at or 0.0)
+        if not scan_hits.should_prune_empty_lock(
+            operator_selected=True,
+            auto_lock=False,
+            elapsed_s=elapsed,
+            sample=sample,
+        ):
+            return
+        self._drop_empty_lock(mhz)
+
+    def _drop_empty_lock(self, mhz: int) -> None:
+        target_hz = float(mhz) * 1e6
+        key = None
+        det = None
+        for k, d in list(self.state.detections.items()):
+            if abs(d.freq_hz - target_hz) <= scan_hits.HIT_SELECT_HZ:
+                key, det = k, d
+                break
+        if det is None:
+            return
+        del self.state.detections[key]
+        drop_key = int(key)
+        self._empty_drops.add(drop_key)
+        self._empty_drop_saved[drop_key] = det
+        self._emit("state", self.snapshot())
+
+    def _revive_empty_drop(self, mhz: int, sample: dict) -> None:
+        target_key = scan_hits.hit_key(float(mhz) * 1e6)
+        span = int(scan_hits.HIT_SELECT_HZ / scan_hits.HIT_KEY_HZ)
+        key = None
+        for r in list(self._empty_drops):
+            if abs(int(r) - target_key) <= span:
+                key = int(r)
+                break
+        if key is None:
+            return
+        det = self._empty_drop_saved.pop(key, None)
+        self._empty_drops.discard(key)
+        if det is None:
+            return
+        det.pic_locked = bool(sample.get("pic_locked"))
+        det.pic_score = round(float(sample.get("pic_score") or 0.0), 3)
+        det.row_corr = round(float(sample.get("row_corr") or 0.0), 3)
+        det.pic_lines = int(sample.get("pic_lines") or 0)
+        if sample.get("standard"):
+            det.standard = str(sample["standard"])
+        det.last_picture_at = time.time()
+        det.last_seen = det.last_picture_at
+        self.state.detections[key] = det
+        self._emit("detection", asdict(det))
+        self._emit("state", self.snapshot())
  
 
 

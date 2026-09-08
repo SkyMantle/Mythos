@@ -27,9 +27,22 @@ def test_parameter_and_session_http_contract() -> None:
     keys = {item["key"] for item in catalog.json()["items"]}
     assert "scan.threshold_db" in keys
     assert "video.afc" in keys
+    assert "video.spectrum_pin_center" in keys
+    assert "video.spectrum_ema" in keys
+    assert "video.spectrum_smooth3" in keys
+    assert "video.spectrum_every_4" in keys
+    tagged = {item["key"]: item for item in catalog.json()["items"]}
+    assert tagged["video.spectrum_pin_center"]["type"] == "bool"
+    assert tagged["video.spectrum_pin_center"]["default"] is True
+    assert tagged["video.spectrum_pin_center"]["affects"] == "spectrum"
+    assert tagged["video.spectrum_ema"]["default"] is True
+    assert tagged["video.spectrum_smooth3"]["default"] is True
+    assert tagged["video.spectrum_every_4"]["type"] == "bool"
+    assert tagged["video.spectrum_every_4"]["default"] is False
+    assert tagged["video.spectrum_every_4"]["affects"] == "spectrum"
     assert "sdr.gain_db" in keys
     assert "sdr.bias_tee" in keys
-    tagged = {item["key"]: item for item in catalog.json()["items"]}
+    assert "sdr.auto_gain" in keys
     assert tagged["video.h_pll"]["type"] == "bool"
     assert tagged["video.h_pll"]["default"] is False
     assert tagged["video.h_pll"]["task"] == "pll"
@@ -64,6 +77,11 @@ def test_parameter_and_session_http_contract() -> None:
     assert "video.h_pll" in lock_keys
     assert "sdr.gain_db" in lock_keys
     assert "sdr.bias_tee" in lock_keys
+    assert "sdr.auto_gain" not in lock_keys
+    assert "video.spectrum_pin_center" not in lock_keys
+    assert "video.spectrum_ema" not in lock_keys
+    assert "video.spectrum_smooth3" not in lock_keys
+    assert "video.spectrum_every_4" not in lock_keys
     assert "video.sample_rate" not in lock_keys
     assert "video.crop_left_frac" not in lock_keys
     assert "video.sharpen" not in lock_keys

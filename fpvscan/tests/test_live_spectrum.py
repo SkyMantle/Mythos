@@ -35,6 +35,9 @@ def test_live_includes_spectrum_and_grid(engine) -> None:
         assert live["afc_pegged"] is False
         assert live["hunt_span_hz"] == 0.25e6
         assert live["video_metrics"]["afc_pegged"] is False
+        assert live["video_metrics"]["timings_ms"] == {"decode": 50.0}
+        assert live["video_metrics"]["overflows"] == 0
+        assert live["video_metrics"]["fps"] == 6.2
 
     asyncio.run(run())
 

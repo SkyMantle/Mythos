@@ -463,19 +463,33 @@ body.rail-collapsed .chev-rail {
   border-left: 2px solid transparent;
 }
 .hit:hover { background: var(--surface-2); }
-.hit.on { border-left-color: var(--accent); background: var(--accent-soft); }
 .hit .f {
   font-size: 0.9375rem;
   font-variant-numeric: tabular-nums;
-  color: var(--fg-title);
+  color: var(--muted);
 }
 .hit .m {
   display: flex;
   gap: var(--space-3);
   margin-top: 2px;
   font-size: var(--fs-meta);
-  color: var(--muted);
+  color: var(--faint);
 }
+.hit.video {
+  border-left-color: var(--ok);
+}
+.hit.video .f { color: var(--ok); }
+.hit.video .m { color: var(--muted); }
+.hit.on {
+  border-left-color: var(--fg-title);
+  background: var(--surface-2);
+}
+.hit.on .f { color: var(--fg-title); }
+.hit.on.video {
+  border-left-color: var(--fg-title);
+  background: var(--accent-soft);
+}
+.hit.on.video .f { color: var(--ok); }
 
 .empty {
   padding: var(--space-4);
@@ -564,12 +578,9 @@ main.watching .stage {
   color: var(--muted);
   font-variant-numeric: tabular-nums;
 }
-.watch-strip .watch-afc {
-  flex: 1 1 100%;
-  color: var(--fg);
-  font-size: var(--fs-support);
-}
-.watch-strip .watch-afc[hidden] { display: none; }
+.watch-strip .w-afc.ok { color: var(--ok); }
+.watch-strip .w-afc.limit { color: var(--warn); }
+.watch-strip .w-afc[hidden] { display: none; }
 .side-col {
   display: flex;
   flex-direction: column;
@@ -579,7 +590,7 @@ main.watching .stage {
 }
 
 .screen {
-  background: #0d0f0e;
+  background: #000;
   border: 1px solid var(--line);
   border-radius: var(--radius);
   display: flex;
@@ -859,6 +870,47 @@ canvas {
   border-radius: 4px;
   box-sizing: border-box;
 }
+.fft-lock-ms {
+  margin: var(--space-2) 0 0;
+  font-size: var(--fs-meta);
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+  line-height: 1.35;
+}
+.fft-lock-ms[hidden] { display: none; }
+.fft-kit {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 6px;
+  margin-top: var(--space-2);
+}
+.fft-kit button {
+  min-width: 32px;
+  width: 32px;
+  min-height: 32px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 0;
+  font-size: 0;
+  letter-spacing: 0;
+}
+.fft-kit button .ico {
+  width: 18px;
+  height: 18px;
+}
+.fft-kit button.ghost {
+  border-color: transparent;
+  color: var(--muted);
+}
+.fft-kit button:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: transparent;
+}
 
 /* ----- testing panel ----- */
 .test-panel {
@@ -1033,9 +1085,9 @@ fieldset.toolset:disabled fieldset.toolset-extra {
 }
 .auto-relock input { width: 16px; height: 16px; accent-color: var(--accent); }
 .param.gain-bias .param-ctrl {
-  grid-template-columns: 1fr 56px 28px auto;
+  grid-template-columns: 1fr 56px 28px auto auto;
 }
-.bias-toggle {
+.bias-toggle, .auto-mgc-toggle {
   min-height: 32px;
   font-size: var(--fs-meta);
   white-space: nowrap;

@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+from queue import Empty, Queue
+
 import numpy as np
 
 from fpvscan.dsp.spectrum import find_occupied
+from fpvscan.engine import Detection, Engine
+from fpvscan.scan_hits import LOCK_HOLD_HZ, LOCK_SPURIOUS_HZ, MERGE_LOCK_HZ
 from fpvscan.scan_view import (
     affect_of,
     cluster_step_hz,
@@ -11,6 +15,7 @@ from fpvscan.scan_view import (
     extras_for_hit,
     grid_snapshot,
     lock_spectrum_due,
+    lock_spectrum_every,
     nearest_sweep_hz,
     needs_lock_refresh,
     pending_for,
@@ -163,8 +168,15 @@ def test_spectrum_lock_follows_target_and_cfg() -> None:
         CFG, mode="LOCK", lock_target=4988e6, tuned_hz=4988e6, last=last,
         afc_hz=120e3,
     )
-    assert tracked["cursor_hz"] == 4988e6 + 120e3
+    assert tracked["cursor_hz"] == 4988e6
     assert tracked["center_hz"] == 4988e6
+    unpinned = spectrum_snapshot(
+        {**CFG, "video": {**CFG["video"], "spectrum_pin_center": False}},
+        mode="LOCK", lock_target=4988e6, tuned_hz=4988e6, last=last,
+        afc_hz=120e3,
+    )
+    assert unpinned["cursor_hz"] == 4988e6 + 120e3
+    assert unpinned["center_hz"] == 4988e6
 
 
 def test_grid_from_real_scan_bounds() -> None:
@@ -209,6 +221,17 @@ def test_lock_spectrum_due_every_iq_when_every_is_one() -> None:
     assert not lock_spectrum_due(0, 1)
 
 
+def test_lock_spectrum_every_reads_live_catalog_flag() -> None:
+    assert lock_spectrum_every(None) == 1
+    assert lock_spectrum_every({}) == 1
+    assert lock_spectrum_every({"spectrum_every": 1}) == 1
+    assert lock_spectrum_every({"spectrum_every": 16}) == 16
+    assert lock_spectrum_every({"spectrum_every_4": False, "spectrum_every": 1}) == 1
+    assert lock_spectrum_every({"spectrum_every_4": True, "spectrum_every": 1}) == 4
+    assert lock_spectrum_every({"spectrum_every_4": True, "spectrum_every": 16}) == 4
+    assert affect_of("video.spectrum_every_4") == "spectrum"
+
+
 def test_pending_keys_only_retune_or_next_cycle() -> None:
     keys, reasons = pending_for(["sdr.gain_db", "video.sample_rate", "scan.threshold_db"])
     assert keys == ["video.sample_rate"]
@@ -224,3 +247,220 @@ def test_pending_keys_only_retune_or_next_cycle() -> None:
     assert needs_lock_refresh(["video.sharpen"])
     assert needs_lock_refresh(["video.h_pll"]) is False
     assert not needs_lock_refresh(["scan.start_hz"])
+
+
+class _StubSrc:
+    name = "stub"
+    sample_rate = 20e6
+    overflows = 0
+    clip_frac = 0.0
+    bias_tee = False
+
+
+def test_lock_command_sets_target_and_emits_state() -> None:
+    events = Queue()
+    eng = Engine(_StubSrc(), CFG, events)
+    eng._handle_command("lock", {"freq_hz": 4988e6})
+    assert eng.state.mode == "LOCK"
+    assert eng.state.lock_target == 4988e6
+    assert eng.state.auto is False
+    found = []
+    while True:
+        try:
+            found.append(events.get_nowait())
+        except Empty:
+            break
+    kinds = [ev["type"] for ev in found]
+    assert "spectrum" in kinds
+    assert "state" in kinds
+    snap = next(ev["data"] for ev in found if ev["type"] == "state")
+    assert snap["mode"] == "LOCK"
+    assert snap["lock_target"] == 4988e6
+
+
+def _inspect(freq_hz: float, **kw) -> Detection:
+    now = float(kw.get("seen", 1.0))
+    return Detection(
+        freq_hz=freq_hz,
+        bandwidth_hz=8e6,
+        snr_db=float(kw.get("snr", 20.0)),
+        standard=kw.get("standard", "PAL"),
+        confidence=float(kw.get("confidence", 0.7)),
+        band="3G3",
+        first_seen=now,
+        last_seen=now,
+        pic_score=float(kw.get("pic_score", 0.25)),
+        row_corr=float(kw.get("row_corr", 0.2)),
+        pic_locked=bool(kw.get("pic_locked", False)),
+    )
+
+
+def test_close_inspects_merge_to_one_hit() -> None:
+    events = Queue()
+    cfg = {**CFG, "scan": {**CFG["scan"], "confirm_hits": 2, "hit_filter": "all"}}
+    eng = Engine(_StubSrc(), cfg, events)
+    base = 3597e6
+    eng._merge(_inspect(base, seen=10.0, snr=18.0, pic_score=0.22))
+    eng._merge(_inspect(base + 1, seen=11.0, snr=21.0, pic_score=0.31))
+    assert len(eng.state.detections) == 1
+    det = next(iter(eng.state.detections.values()))
+    assert det.freq_hz == base
+    assert det.first_seen == 10.0
+    assert det.snr_db == 21.0
+    assert det.pic_score == 0.31
+    assert det.hits == 2
+    published = eng._published_detections()
+    assert len(published) == 1
+    assert published[0]["freq_hz"] == base
+
+    eng2 = Engine(_StubSrc(), cfg, Queue())
+    eng2._merge(_inspect(base, seen=1.0))
+    eng2._merge(_inspect(base + 10e3, seen=2.0, snr=22.0, pic_score=0.4))
+    assert len(eng2.state.detections) == 1
+    merged = next(iter(eng2.state.detections.values()))
+    assert merged.freq_hz == base
+    assert merged.first_seen == 1.0
+    assert merged.hits == 2
+
+
+def test_lock_skips_tiny_delta() -> None:
+    events = Queue()
+    eng = Engine(_StubSrc(), CFG, events)
+    eng._handle_command("lock", {"freq_hz": 3597e6})
+    gen = eng._lock_gen
+    target = eng.state.lock_target
+    tuned = eng._lock_tuned
+    while True:
+        try:
+            events.get_nowait()
+        except Empty:
+            break
+    eng._handle_command("lock", {"freq_hz": 3597e6 + 1})
+    assert eng.state.lock_target == target
+    assert eng._lock_gen == gen
+    assert eng._lock_tuned is tuned
+    leftover = []
+    while True:
+        try:
+            leftover.append(events.get_nowait())
+        except Empty:
+            break
+    assert leftover == []
+    eng._handle_command("lock", {"freq_hz": 3597e6 + 10e3})
+    assert eng.state.lock_target == target
+    assert eng._lock_gen == gen
+    eng._handle_command("lock", {"freq_hz": 3597e6 + LOCK_HOLD_HZ + 1e3})
+    assert eng._lock_gen == gen + 1
+    assert eng.state.lock_target == 3597e6 + LOCK_HOLD_HZ + 1e3
+    eng._handle_command("lock", {"freq_hz": eng.state.lock_target, "force": True})
+    assert eng._lock_gen == gen + 2
+
+
+def test_lock_nudge_01_mhz_retunes_despite_nearby_hit() -> None:
+    events = Queue()
+    cfg = {**CFG, "scan": {**CFG["scan"], "confirm_hits": 2, "hit_filter": "all"}}
+    eng = Engine(_StubSrc(), cfg, events)
+    base = 3597e6
+    eng._merge(_inspect(base, seen=1.0))
+    eng._merge(_inspect(base + 1, seen=2.0))
+    eng._handle_command("lock", {"freq_hz": base})
+    gen = eng._lock_gen
+    assert len(eng.state.detections) == 1
+    eng._handle_command("lock", {"freq_hz": base + 100e3})
+    assert eng._lock_gen == gen + 1
+    assert eng.state.lock_target == base + 100e3
+    published = eng._published_detections()
+    assert len(published) == 1
+    assert published[0]["freq_hz"] == base + 100e3
+    eng._handle_command("lock", {"freq_hz": base + 100e3 + 1})
+    assert eng._lock_gen == gen + 1
+    assert eng.state.lock_target == base + 100e3
+    eng._handle_command("lock", {"freq_hz": base + 200e3, "force": True})
+    assert eng._lock_gen == gen + 2
+    assert eng.state.lock_target == base + 200e3
+    assert LOCK_SPURIOUS_HZ == 20e3
+    assert LOCK_HOLD_HZ == LOCK_SPURIOUS_HZ
+
+
+def test_locked_row_ignores_khz_interp() -> None:
+    events = Queue()
+    cfg = {**CFG, "scan": {**CFG["scan"], "confirm_hits": 2, "hit_filter": "all"}}
+    eng = Engine(_StubSrc(), cfg, events)
+    base = 3597e6
+    eng._merge(_inspect(base, seen=1.0))
+    eng._merge(_inspect(base + 1, seen=2.0))
+    eng._handle_command("lock", {"freq_hz": base})
+    eng._merge(_inspect(base + 1500, seen=3.0, snr=24.0))
+    assert len(eng.state.detections) == 1
+    det = next(iter(eng.state.detections.values()))
+    assert det.freq_hz == base
+    assert det.first_seen == 1.0
+    assert eng._published_detections()[0]["freq_hz"] == base
+
+
+def test_locked_row_pins_afc_residual_to_lock_target() -> None:
+    events = Queue()
+    cfg = {**CFG, "scan": {**CFG["scan"], "confirm_hits": 2, "hit_filter": "all"}}
+    eng = Engine(_StubSrc(), cfg, events)
+    lock_hz = 4990.5e6
+    inspect_hz = 4989e6
+    neighbor_hz = lock_hz + 10e6
+    eng._merge(_inspect(inspect_hz, seen=1.0))
+    eng._merge(_inspect(inspect_hz, seen=2.0))
+    first = next(iter(eng.state.detections.values())).first_seen
+    eng._handle_command("lock", {"freq_hz": lock_hz})
+    eng._merge(_inspect(inspect_hz, seen=3.0, snr=24.0))
+    assert len(eng.state.detections) == 1
+    det = next(iter(eng.state.detections.values()))
+    assert det.freq_hz == lock_hz
+    assert det.first_seen == first
+    published = eng._published_detections()
+    assert len(published) == 1
+    assert published[0]["freq_hz"] == lock_hz
+    gen = eng._lock_gen
+    eng._handle_command("lock", {"freq_hz": lock_hz + 100e3})
+    assert eng._lock_gen == gen + 1
+    assert eng.state.lock_target == lock_hz + 100e3
+    eng._merge(_inspect(neighbor_hz, seen=4.0))
+    eng._merge(_inspect(neighbor_hz, seen=5.0))
+    freqs = sorted(d["freq_hz"] for d in eng._published_detections())
+    assert freqs == [lock_hz + 100e3, neighbor_hz]
+    assert MERGE_LOCK_HZ == 2e6
+
+
+def test_rf_snap_once_when_pegged_and_locked() -> None:
+    events = Queue()
+    cfg = {**CFG, "scan": {**CFG["scan"], "confirm_hits": 2, "hit_filter": "all"}}
+    eng = Engine(_StubSrc(), cfg, events)
+    lock = 4988e6
+    cap = 1.5e6
+    eng._merge(_inspect(lock, seen=1.0, pic_locked=True, pic_score=0.5))
+    eng._merge(_inspect(lock, seen=2.0, pic_locked=True, pic_score=0.5))
+    eng._handle_command("lock", {"freq_hz": lock})
+    eng._afc = -cap
+    gen = eng._lock_gen
+    assert eng._maybe_rf_snap(pic_locked=True, pic_score=0.55, digital_max_hz=cap)
+    assert eng.state.lock_target == lock - cap
+    assert eng.state.tuned_hz == lock - cap
+    assert eng._afc == 0.0
+    assert eng._lock_tuned is None
+    assert eng._lock_gen == gen + 1
+    assert eng._published_detections()[0]["freq_hz"] == lock - cap
+    eng._afc = -cap
+    assert not eng._maybe_rf_snap(pic_locked=True, pic_score=0.55, digital_max_hz=cap)
+    assert eng.state.lock_target == lock - cap
+    assert eng._afc == -cap
+
+
+def test_rf_snap_skipped_without_picture() -> None:
+    eng = Engine(_StubSrc(), CFG, Queue())
+    lock = 4988e6
+    cap = 1.5e6
+    eng._handle_command("lock", {"freq_hz": lock})
+    eng._afc = cap
+    gen = eng._lock_gen
+    assert not eng._maybe_rf_snap(pic_locked=False, pic_score=0.0, digital_max_hz=cap)
+    assert not eng._maybe_rf_snap(pic_locked=True, pic_score=0.10, digital_max_hz=cap)
+    assert eng.state.lock_target == lock
+    assert eng._afc == cap
+    assert eng._lock_gen == gen
