@@ -407,7 +407,7 @@ class Engine:
             iq = self.src.retune_and_read(occ.center_hz, int(fs * insp_s))
             ch, fs2 = demod.channelize(
                 iq, fs, 0.0,
-                out_bw_hz=max(occ.bandwidth_hz  + 2 * self.MERGE_TOL_HZ, 8e6),
+                out_bw_hz=self._inspect_bw(occ.bandwidth_hz),
                 fast=bool(self.cfg["scan"].get("fast_channelizer", False)))
             base = demod.fm_demod(ch, fs2, deviation_hz=occ.bandwidth_hz / 5)
             sc = self.cfg["scan"]
@@ -455,7 +455,18 @@ class Engine:
         self._merge(det)
  
     MERGE_TOL_HZ = 6e6
- 
+    # Запас навколо зайнятості для INSPECT. Не MERGE_TOL: той (6 МГц) —
+    # допуск злиття двох оцінок ОДНОГО борта. 2·MERGE_TOL на 10 МГц
+    # зайнятості давав 22 МГц; при fs=35 Мвідл/с dec=int(fs/out_bw)
+    # ставав 1, фільтр вимикався, і сусід по Raceband (~19 МГц)
+    # аліасився в дискримінатор — INSPECT бачив чужу рядкову лінію
+    # на шпорі/спідниці і публікував хибний хіт.
+    INSPECT_BW_PAD_HZ = 1.5e6
+
+    def _inspect_bw(self, occ_bw_hz: float) -> float:
+        """Ширина вікна каналайзера для підтвердження кандидата."""
+        return max(8e6, float(occ_bw_hz) + self.INSPECT_BW_PAD_HZ)
+
     def _merge(self, det: Detection):
         """Один передавач ловиться на кількох перекритих кроках свіпу
         і щоразу дає трохи інший центр. Зливаємо такі знахідки в одну,

@@ -11,6 +11,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from fpvscan.dsp import demod, spectrum
 from fpvscan.engine import Engine
 
 
@@ -136,6 +137,115 @@ def test_run_writes_actual_rate_into_cfg():
     assert cfg["video"]["sample_rate"] == actual
 
 
+def test_inspect_bw_does_not_open_full_nyquist_for_typical_vtx():
+    """10 МГц зайнятості + 2·MERGE_TOL (12 МГц) = 22 МГц вікно.
+
+    При типових 35 Мвідл/с це int(fs/out_bw)=1: каналайзер не децимує,
+    сусідній Raceband (~19 МГц) аліаситься в ЧМ-дискримінатор, і
+    INSPECT підтверджує шпору/спідницю як окреме відео.
+    """
+    fs = 35e6
+    occupied = 10e6
+    neighbor = 19e6
+    src = _Source(fs, fs)
+    eng = Engine(src, _cfg(fs), Queue())
+    out_bw = eng._inspect_bw(occupied)
+    dec = max(1, int(fs / out_bw))
+    assert out_bw <= occupied + 2e6, (
+        f"вікно INSPECT {out_bw/1e6:.1f} МГц — зашироке для "
+        f"зайнятості {occupied/1e6:.0f} МГц (не можна додавати 2·MERGE_TOL)"
+    )
+    assert out_bw >= occupied, "вікно не має бути вужчим за зміряну зайнятість"
+    assert dec >= 2, (
+        f"dec={dec} при out_bw={out_bw/1e6:.1f} МГц: каналайзер вимкнув "
+        f"фільтр і пропустить сусіда на 19 МГц"
+    )
+    nyq = fs / 2
+    alias = neighbor - fs
+    assert abs(alias) < nyq, "передумова: аліас сусіда лежить у смузі ADC"
+    assert out_bw < fs / 2, (
+        f"out_bw={out_bw/1e6:.1f} МГц ≥ fs/2 — dec=1, аліас {alias/1e6:.1f} МГц "
+        f"потрапляє в дискримінатор"
+    )
+    old = max(occupied + 2 * Engine.MERGE_TOL_HZ, 8e6)
+    assert max(1, int(fs / old)) == 1, "старий 2·MERGE_TOL має лишатись зламаним"
+
+
+def test_inspect_bw_hides_neighbor_line_rate_from_spur():
+    """Шпора на DC + живий борт на 16 МГц (всередині Найквіста 35 Мвідл/с).
+
+    Старе вікно 22 МГц (dec=1) не фільтрує сусіда — INSPECT підтверджує
+    шпору як PAL/NTSC. Вузьке вікно FIR-децимує, рядкова сусіда зникає.
+    """
+    fs = 35e6
+    n = int(fs * 0.04)
+    t = np.arange(n, dtype=np.float64) / fs
+    line = demod.LINE_NTSC
+    sync = (np.mod(t * line, 1.0) < 0.08).astype(np.float64)
+
+    def fm_at(if_hz: float, dev_hz: float = 2e6) -> np.ndarray:
+        inst = if_hz + np.where(sync > 0.5, -dev_hz * 0.5, dev_hz * 0.5)
+        ph = 2 * np.pi * np.cumsum(inst) / fs
+        return np.exp(1j * ph).astype(np.complex64)
+
+    spur = 0.15 * np.exp(2j * np.pi * 0.3e6 * t).astype(np.complex64)
+    iq = spur + fm_at(16e6)
+    eng = Engine(_Source(fs, fs), _cfg(fs), Queue())
+    occupied = 10e6
+    new_bw = eng._inspect_bw(occupied)
+    old_bw = max(occupied + 2 * Engine.MERGE_TOL_HZ, 8e6)
+
+    def classify(bw: float):
+        ch, fs2 = demod.channelize(iq, fs, 0.0, out_bw_hz=bw, fast=False)
+        base = demod.fm_demod(ch, fs2, deviation_hz=max(bw, 8e6) / 5)
+        # FIR startup is not the leak — drop a tenth so we score steady state.
+        return demod.classify_video(base[len(base) // 10:], fs2)
+
+    old = classify(old_bw)
+    new = classify(new_bw)
+    assert old.is_video, (
+        f"передумова: широке вікно має бачити рядкову сусіда, got {old}"
+    )
+    assert not new.is_video, (
+        f"після звуження INSPECT шпора не має проходити як відео, got {new}"
+    )
+
+    ch, fs2 = demod.channelize(fm_at(0.0, 4e6), fs, 0.0,
+                               out_bw_hz=new_bw, fast=False)
+    base = demod.fm_demod(ch, fs2, deviation_hz=max(new_bw, 8e6) / 5)
+    on_ch = demod.classify_video(base[len(base) // 10:], fs2)
+    assert on_ch.is_video, f"свій канал не має відсіюватись: {on_ch}"
+
+
+def test_inspect_passes_helper_bw_to_channelize():
+    """_inspect має різати смугу через _inspect_bw, а не 2·MERGE_TOL."""
+    fs = 35e6
+    occupied = 10e6
+    src = _Source(fs, fs)
+    cfg = _cfg(fs)
+    cfg["scan"]["inspect_ms"] = 5
+    eng = Engine(src, cfg, Queue())
+    seen: list[float] = []
+    orig = demod.channelize
+
+    def wrap(iq, rate, offset_hz, out_bw_hz, fast=True):
+        seen.append(float(out_bw_hz))
+        return orig(iq, rate, offset_hz, out_bw_hz, fast=fast)
+
+    demod.channelize = wrap
+    try:
+        occ = spectrum.Occupancy(
+            center_hz=5806e6, bandwidth_hz=occupied,
+            peak_db=-20.0, snr_db=15.0,
+        )
+        eng._inspect(None, 5800e6, fs, occ)
+    finally:
+        demod.channelize = orig
+    assert seen, "channelize не викликався"
+    assert seen[0] == eng._inspect_bw(occupied)
+    assert seen[0] != occupied + 2 * Engine.MERGE_TOL_HZ
+
+
 def test_manual_lock_listener_is_registered_once():
     """Heartbeat applyState() раніше вішав новий keydown щодва секунди."""
     html = (Path(__file__).resolve().parents[1]
@@ -151,5 +261,8 @@ if __name__ == "__main__":
     test_lock_keeps_reader_when_fs_off_by_fraction()
     test_lock_retunes_when_fs_really_changes()
     test_run_writes_actual_rate_into_cfg()
+    test_inspect_bw_does_not_open_full_nyquist_for_typical_vtx()
+    test_inspect_bw_hides_neighbor_line_rate_from_spur()
+    test_inspect_passes_helper_bw_to_channelize()
     test_manual_lock_listener_is_registered_once()
     print("OK")
