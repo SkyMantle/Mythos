@@ -771,6 +771,8 @@ class Engine:
             self.state.mode = "SWEEP"
             self._acc = None
             self._afc = 0.0
+            if self._rec is not None:
+                self._rec_stop()       # ролик прив'язаний до одного каналу
             self._stop_reader()        # звільняємо src перед _do_sweep()
  
     def snapshot(self) -> dict:

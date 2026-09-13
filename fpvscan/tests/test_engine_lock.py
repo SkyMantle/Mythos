@@ -147,9 +147,55 @@ def test_manual_lock_listener_is_registered_once():
     assert html.count("manual-freq').addEventListener") == 1
 
 
+class _FakeRec:
+    """Мінімальний записувач: тільки те, що чіпає _rec_stop / snapshot."""
+
+    def __init__(self):
+        self.stopped = False
+        self.started_at = time.time()
+        self.pushed = 0
+
+    def push(self, luma):
+        self.pushed += 1
+
+    def stop(self):
+        self.stopped = True
+        return {"path": "/tmp/peek.mp4", "bytes": 0, "seconds": 1.0, "kbps": 0}
+
+
+def test_auto_peek_timeout_stops_recording():
+    """Автоперегляд повернувся у SWEEP — ролик має закритись, як після sweep.
+
+    Інакше насос ffmpeg далі крутить останній кадр, таймер росте, а
+    наступний peek дописує вже інший канал у той самий файл.
+    """
+    want = 2_000_000.0
+    src = _Source(want, want)
+    eng = Engine(src, _cfg(want), Queue())
+    rec = _FakeRec()
+    eng.state.mode = "LOCK"
+    eng.state.lock_target = 5800e6
+    eng.state.auto = True
+    eng.state.auto_until = 0.0
+    eng._rec = rec
+    try:
+        eng._do_lock()
+        assert rec.stopped, "автоперегляд лишив запис активним після виходу в SWEEP"
+        assert eng._rec is None
+        assert eng.state.mode == "SWEEP"
+        assert eng.state.lock_target is None
+        assert not eng.state.auto
+    finally:
+        eng._stop_reader()
+        if eng._rec is not None and hasattr(eng._rec, "stop"):
+            eng._rec.stop()
+            eng._rec = None
+
+
 if __name__ == "__main__":
     test_lock_keeps_reader_when_fs_off_by_fraction()
     test_lock_retunes_when_fs_really_changes()
     test_run_writes_actual_rate_into_cfg()
     test_manual_lock_listener_is_registered_once()
+    test_auto_peek_timeout_stops_recording()
     print("OK")
