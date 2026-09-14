@@ -156,6 +156,11 @@ class Engine:
             self.state.lock_target = None
             self.state.mode = "SWEEP"
             self.state.auto = False
+            # Lock already zeros these; Sweep must too. Otherwise the next
+            # auto-peek channelizes the new VTx with the previous AFC offset
+            # and blends its field into _acc — snow, or two birds in one frame.
+            self._acc = None
+            self._afc = 0.0
             self._stop_reader()
         elif name == "clear":
             self._peeked.clear()
@@ -497,6 +502,8 @@ class Engine:
             return
         self._peeked[key] = now
         self._lock_tuned = None
+        self._acc = None
+        self._afc = 0.0
         self.state.lock_target = det.freq_hz
         self.state.mode = "LOCK"
         self.state.auto = True
