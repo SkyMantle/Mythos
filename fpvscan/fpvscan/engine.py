@@ -145,13 +145,23 @@ class Engine:
                 print(f"[рушій] команда «{name}» впала: {e}", flush=True)
  
     def _handle_command(self, name: str, kw: dict):
+        same_lock = False
         if name == "lock":
-            self._acc = None
-            self._afc = 0.0
-            self._lock_tuned = None
-            self.state.lock_target = float(kw["freq_hz"])
+            freq = float(kw["freq_hz"])
+            # Автоперегляд уже стоїть на цій частоті. Повторний lock
+            # (клік по знахідці / Стати) має лише зняти таймер і
+            # лишити картинку, AFC і запис — інакше «утримати канал»
+            # зносить IQ-нитку і ріже ролик на тому ж VTx.
+            same_lock = (self.state.mode == "LOCK"
+                         and self.state.lock_target is not None
+                         and abs(float(self.state.lock_target) - freq) < 1e3)
+            self.state.lock_target = freq
             self.state.mode = "LOCK"
             self.state.auto = False
+            if not same_lock:
+                self._acc = None
+                self._afc = 0.0
+                self._lock_tuned = None
         elif name == "sweep":
             self.state.lock_target = None
             self.state.mode = "SWEEP"
@@ -177,7 +187,7 @@ class Engine:
                            f"bias-tee: {'увімкнено' if on and ok else 'вимкнено' if ok else 'не підтримується платою'}"})
             else:
                 self._emit("notice", {"level": "error", "text": "джерело не підтримує bias-tee"})
-        if name in ("sweep", "lock") and self._rec is not None:
+        if name in ("sweep", "lock") and self._rec is not None and not same_lock:
             self._rec_stop()      # ролик прив'язаний до одного каналу
         # ---------- фото і відео ----------
  
