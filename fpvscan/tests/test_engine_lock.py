@@ -147,9 +147,75 @@ def test_manual_lock_listener_is_registered_once():
     assert html.count("manual-freq').addEventListener") == 1
 
 
+class _FakeRec:
+    def __init__(self):
+        self.stop_calls = 0
+        self.started_at = time.time()
+
+    def stop(self):
+        self.stop_calls += 1
+        return {"path": "/tmp/rec.mp4", "bytes": 1e6, "seconds": 3, "kbps": 100}
+
+
+def test_same_freq_lock_holds_peek_without_teardown():
+    """Автоперегляд → клік по тій самій знахідці має утримати канал.
+
+    _maybe_peek уже стоїть у LOCK на det.freq_hz. Оператор натискає
+    знахідку (або Стати), щоб не повертатись у свіп. lock-команда
+    раніше завжди нулила AFC, acc, _lock_tuned і різала запис — тобто
+    ламала саме те утримання, заради якого клікали.
+    """
+    src = _Source(2e6, 2e6)
+    eng = Engine(src, _cfg(2e6), Queue())
+    freq = 5800e6
+    eng.state.mode = "LOCK"
+    eng.state.lock_target = freq
+    eng.state.auto = True
+    eng.state.auto_until = time.time() + 5
+    eng._afc = 1.2e6
+    eng._acc = np.ones((8, 8), np.float32)
+    eng._lock_tuned = freq
+    rec = _FakeRec()
+    eng._rec = rec
+
+    eng._handle_command("lock", {"freq_hz": freq})
+
+    assert eng.state.mode == "LOCK"
+    assert eng.state.lock_target == freq
+    assert eng.state.auto is False, "клік має зняти таймер автоперегляду"
+    assert eng._afc == 1.2e6, f"AFC скинуто при повторному lock: {eng._afc}"
+    assert eng._acc is not None, "накопичувач поля скинуто"
+    assert eng._lock_tuned == freq, "IQ-нитку мали лишити"
+    assert rec.stop_calls == 0, "запис на тому ж каналі зупинено"
+    assert eng._rec is rec
+
+
+def test_lock_new_freq_still_resets_and_stops_recording():
+    src = _Source(2e6, 2e6)
+    eng = Engine(src, _cfg(2e6), Queue())
+    eng.state.mode = "LOCK"
+    eng.state.lock_target = 5800e6
+    eng._afc = 800e3
+    eng._acc = np.ones((4, 4), np.float32)
+    eng._lock_tuned = 5800e6
+    rec = _FakeRec()
+    eng._rec = rec
+
+    eng._handle_command("lock", {"freq_hz": 5843e6})
+
+    assert eng.state.lock_target == 5843e6
+    assert eng._afc == 0.0
+    assert eng._acc is None
+    assert eng._lock_tuned is None
+    assert rec.stop_calls == 1
+    assert eng._rec is None
+
+
 if __name__ == "__main__":
     test_lock_keeps_reader_when_fs_off_by_fraction()
     test_lock_retunes_when_fs_really_changes()
     test_run_writes_actual_rate_into_cfg()
     test_manual_lock_listener_is_registered_once()
+    test_same_freq_lock_holds_peek_without_teardown()
+    test_lock_new_freq_still_resets_and_stops_recording()
     print("OK")
