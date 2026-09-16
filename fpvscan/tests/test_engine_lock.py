@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 import time
 from pathlib import Path
 from queue import Queue
@@ -147,9 +148,110 @@ def test_manual_lock_listener_is_registered_once():
     assert html.count("manual-freq').addEventListener") == 1
 
 
+class _ConcurrentSource:
+    """Джерело, яке ловить два виклики src з різних ниток одночасно."""
+
+    name = "mock"
+
+    def __init__(self):
+        self._fs = 2_000_000.0
+        self.overlap = 0
+        self._inflight = 0
+        self._guard = threading.Lock()
+        self.entered_read = threading.Event()
+        self.bias_tee = False
+        self.bias_calls = 0
+        self.gain_calls = 0
+
+    def _op(self, hold=0.0, signal_read=False):
+        with self._guard:
+            self._inflight += 1
+            if self._inflight > 1:
+                self.overlap += 1
+        try:
+            if signal_read:
+                self.entered_read.set()
+            if hold:
+                time.sleep(hold)
+        finally:
+            with self._guard:
+                self._inflight -= 1
+
+    @property
+    def sample_rate(self):
+        return self._fs
+
+    @property
+    def center_freq(self):
+        return 5800e6
+
+    def open(self):
+        pass
+
+    def close(self):
+        pass
+
+    def set_gain(self, db):
+        self.gain_calls += 1
+        self._op(hold=0.05)
+
+    def set_bias_tee(self, on):
+        self.bias_calls += 1
+        self._op(hold=0.05)
+        self.bias_tee = bool(on)
+        return True
+
+    def set_sample_rate(self, hz):
+        self._fs = float(hz)
+
+    def set_center_freq(self, hz):
+        pass
+
+    def read(self, n: int) -> np.ndarray:
+        self._op(hold=0.35, signal_read=True)
+        return np.zeros(int(n), dtype=np.complex64)
+
+    def retune_and_read(self, hz: float, n: int) -> np.ndarray:
+        return np.zeros(int(n), dtype=np.complex64)
+
+
+def test_bias_tee_during_lock_does_not_overlap_reader():
+    """Кнопка bias-tee під час LOCK не повинна бити в src, поки читач у read()."""
+    src = _ConcurrentSource()
+    eng = Engine(src, _cfg(src._fs), Queue())
+    eng.state.mode = "LOCK"
+    eng.state.lock_target = 5800e6
+    try:
+        eng._start_reader(5800e6, src._fs, 0.05)
+        assert src.entered_read.wait(timeout=2), "читач не зайшов у read()"
+        eng._handle_command("bias_tee", {"on": True})
+        assert src.bias_calls == 1
+        assert src.overlap == 0, (
+            f"bias-tee/gain перетнулись з read() {src.overlap} разів "
+            f"(має бути 0: контракт одного потоку-власника)"
+        )
+        assert src.bias_tee is True
+        assert eng._ring is None
+        assert eng._lock_tuned is None
+    finally:
+        eng._stop_reader()
+
+
+def test_bias_tee_without_reader_still_applies():
+    src = _ConcurrentSource()
+    eng = Engine(src, _cfg(src._fs), Queue())
+    eng._handle_command("bias_tee", {"on": False})
+    assert src.bias_calls == 1
+    assert src.bias_tee is False
+    assert src.overlap == 0
+    assert src.gain_calls >= 1
+
+
 if __name__ == "__main__":
     test_lock_keeps_reader_when_fs_off_by_fraction()
     test_lock_retunes_when_fs_really_changes()
     test_run_writes_actual_rate_into_cfg()
     test_manual_lock_listener_is_registered_once()
+    test_bias_tee_during_lock_does_not_overlap_reader()
+    test_bias_tee_without_reader_still_applies()
     print("OK")
