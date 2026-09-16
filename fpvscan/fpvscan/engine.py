@@ -170,6 +170,10 @@ class Engine:
         elif name == "bias_tee":
             on = bool(kw.get("on", True))
             if hasattr(self.src, "set_bias_tee"):
+                # Контракт джерела — один потік-власник. Нитка LOCK
+                # сидить у sync_rx, а команда bias-tee б'є в libbladeRF
+                # з робочої нитки рушія. Два потоки вішають NIOS.
+                self._pause_reader()
                 ok = self.src.set_bias_tee(on)
                 if ok:
                     self._apply_bias_tee_gain(on)
@@ -549,6 +553,16 @@ class Engine:
             self._reader_thread.join(timeout=2)
         self._reader_thread = None
         self._ring = None
+
+    def _pause_reader(self):
+        """Гасить IQ-нитку, щоб рушій міг смикнути src з цієї ж нитки.
+
+        _do_lock побачить порожнє кільце і підніме читача знову.
+        """
+        if self._reader_thread is None and self._ring is None:
+            return
+        self._stop_reader()
+        self._lock_tuned = None
  
     def _reader_loop(self, fs: float):
         chunk = max(1024, int(fs * 0.005))     # 5 мс за раз
