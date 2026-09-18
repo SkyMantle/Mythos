@@ -11,6 +11,21 @@ from fpvscan.app.domain.models import Session
 class HealthResponse(BaseModel):
     status: str
     service: str
+    engine_alive: bool | None = None
+    sdr_state: str | None = None
+    sdr_state_age_ms: int = 0
+    sdr_operation: str | None = None
+    sdr_last_operation: str | None = None
+    sdr_consecutive_errors: int = 0
+    sdr_open_attempts: int = 0
+    sdr_open_failures: int = 0
+    sdr_next_retry_ms: int = 0
+    last_error: str | None = None
+    last_error_code: int | None = None
+    last_error_time: str | None = None
+    last_error_operation: str | None = None
+    last_action: str | None = None
+    message: str | None = None
 
 
 class SessionCreateRequest(BaseModel):

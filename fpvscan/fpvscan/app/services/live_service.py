@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from fpvscan.app.services.catalog import catalog_values
@@ -12,6 +13,10 @@ class LiveService:
         self._engine = engine
 
     async def live_context(self) -> dict[str, Any]:
+        # Snapshot/grid work contends for the GIL with LOCK decode.
+        return await asyncio.to_thread(self._live_context)
+
+    def _live_context(self) -> dict[str, Any]:
         snap = self._engine.snapshot()
         video = dict(snap.get("video") or {})
         spec = snap.get("spectrum") or {}

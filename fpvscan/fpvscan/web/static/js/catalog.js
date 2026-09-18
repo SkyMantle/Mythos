@@ -74,6 +74,74 @@ export const TASK_TOOLS = {
   ],
 }
 
+/** Ручки тесту під підказкою клавіш. Не дублюють верхню панель (смуга / gain / PLL). */
+export const TEST_TOOLS = {
+  sweep: [
+    {
+      id: "scan_speed",
+      label: "Швидкість свіпу",
+      keys: [
+        "scan.step_hz", "scan.averages",
+        "scan.inspect_ms", "scan.inspect_ms_5g8",
+      ],
+    },
+    {
+      id: "scan_detect",
+      label: "Детекція",
+      keys: [
+        "scan.threshold_mode", "scan.threshold_offset_db", "scan.threshold_db",
+        "scan.accept_energy", "scan.energy_min_snr_db", "scan.confirm_hits",
+        "scan.line_prominence_db", "scan.inspect_extras_need_comb",
+      ],
+    },
+  ],
+  lock: [
+    {
+      id: "analog_if",
+      label: "Як інший сканер",
+      keys: [
+        "video.sample_rate", "video.channel_bw_hz", "video.deviation_hz",
+      ],
+    },
+    {
+      id: "picture_jump",
+      label: "Стрибки картинки",
+      tasks: ["picture_jump"],
+      keys: [
+        "video.afc", "video.afc_gain", "video.afc_deadband_hz",
+        "video.afc_max_step_hz", "video.afc_digital_max_hz",
+        "video.hunt", "video.hunt_every", "video.hunt_drop",
+        "sdr.settle_us", "video.capture_ms",
+      ],
+    },
+    {
+      id: "phase_tear",
+      label: "Фазові розриви",
+      children: [
+        {
+          id: "phase_tear_h",
+          label: "Горизонтальні",
+          tasks: ["phase_tear_h"],
+          keys: ["video.track_window_margin", "video.h_phase_frac"],
+        },
+        {
+          id: "phase_tear_v",
+          label: "Вертикальні",
+          tasks: ["phase_tear_v"],
+          keys: ["video.average", "video.motion_thresh"],
+        },
+      ],
+    },
+  ],
+}
+
+export const TEST_CORE_HIDE = new Set([
+  "scan.start_hz", "scan.stop_hz", "scan.channel_bw_hz",
+  "scan.cluster_step_mhz", "scan.hit_filter",
+  "sdr.gain_db", "sdr.auto_gain", "sdr.bias_tee",
+  "video.h_pll", "video.pll_enable",
+])
+
 export const DEFAULT_SCHEMA = [
   { key: "signal_quality", label: "Якість сигналу", type: "rating", required: false, min: 1, max: 5 },
   { key: "picture_lock", label: "Синхро картинки", type: "bool", required: false },
@@ -113,7 +181,7 @@ export const PARAMETER_CATALOG = [
   // ---- shared: SDR, впливає на обидва режими ----
   n({
     key: "sdr.gain_db", group: "shared", label: "Підсилення",
-    unit: "дБ", min: 0, max: 60, step: 1, default: 35,
+    unit: "дБ", min: 0, max: 60, step: 1, default: 60,
   }),
   b({
     key: "sdr.auto_gain", group: "shared", label: "Авто MGC",
@@ -122,7 +190,7 @@ export const PARAMETER_CATALOG = [
   }),
   n({
     key: "sdr.bias_tee_gain_offset_db", group: "shared", label: "Компенсація LNA",
-    help: "На скільки зрізати gain, коли bias-tee увімкнено.",
+    help: "Запас під LNA, поки повзунок не на стелі. На 60 плата бере повне MGC.",
     unit: "дБ", min: 0, max: 40, step: 1, default: 15,
   }),
   i({
@@ -180,17 +248,17 @@ export const PARAMETER_CATALOG = [
   n({
     key: "scan.channel_bw_hz", group: "sweep", label: "Очікувана ширина каналу",
     help: "Визначає крок свіпу, якщо step_hz = 0.",
-    unit: "МГц", factor: MHZ, min: 1e6, max: 40e6, step: 0.5e6, default: 10e6,
+    unit: "МГц", factor: MHZ, min: 1e6, max: 40e6, step: 0.5e6, default: 16e6,
   }),
   n({
     key: "scan.step_hz", group: "sweep", label: "Крок свіпу",
-    help: "0 — порахувати автоматично зі смуги і ширини каналу.",
-    unit: "МГц", factor: MHZ, min: 0, max: 40e6, step: 0.5e6, default: 0,
+    help: "0 — порахувати автоматично зі смуги і ширини каналу. 12 МГц перекриває краї тайла.",
+    unit: "МГц", factor: MHZ, min: 0, max: 40e6, step: 0.5e6, default: 12e6,
   }),
   e({
     key: "scan.cluster_step_mhz", group: "sweep", label: "Крок кластера",
     help: "Extras навколо хіта. Вимк. — лише грубий крок.",
-    default: "8",
+    default: "4",
     options: [
       { value: "off", label: "вимк. (грубо)" },
       { value: "12", label: "12 МГц" },
@@ -201,7 +269,7 @@ export const PARAMETER_CATALOG = [
   e({
     key: "scan.hit_filter", group: "sweep", label: "Фільтр знахідок",
     help: "Ховає сміття в списку. Сирі піки в рушії лишаються.",
-    default: "hide_weak",
+    default: "all",
     options: [
       { value: "all", label: "усі" },
       { value: "hide_weak", label: "ховати слабкі" },
@@ -216,27 +284,79 @@ export const PARAMETER_CATALOG = [
   }),
   i({
     key: "scan.averages", group: "sweep", label: "Усереднень спектра",
-    min: 1, max: 32, step: 1, default: 8,
+    min: 1, max: 32, step: 1, default: 16,
   }),
   n({
-    key: "scan.threshold_db", group: "sweep", label: "Поріг над підлогою",
-    unit: "дБ", min: 0, max: 40, step: 0.5, default: 5,
+    key: "scan.threshold_db", group: "sweep", label: "Мін. зсув порога",
+    help: "У auto — мінімум над підлогою; у fixed — фіксований зсув.",
+    unit: "дБ", min: 0, max: 40, step: 0.5, default: 1.0,
+  }),
+  e({
+    key: "scan.threshold_mode", group: "sweep", label: "Поріг зайнятості",
+    help: "Авто: підлога FFT (25-й перцентиль) + зсув на кожному dwell.",
+    default: "auto",
+    options: [
+      { value: "auto", label: "авто (CFAR)" },
+      { value: "fixed", label: "фіксований" },
+    ],
+  }),
+  n({
+    key: "scan.threshold_offset_db", group: "sweep", label: "CFAR-зсув",
+    help: "Над робастною підлогою. 1.2 дБ ловить полицю 3–10 дБ.",
+    unit: "дБ", min: 0, max: 20, step: 0.1, default: 1.2,
+  }),
+  n({
+    key: "scan.threshold_min_db", group: "sweep", label: "Мін. live-поріг",
+    unit: "дБ", min: 0, max: 20, step: 0.1, default: 1.0,
+  }),
+  n({
+    key: "scan.threshold_max_db", group: "sweep", label: "Макс. live-поріг",
+    help: "Не повертатись до 5 дБ, що різало далекий аналог.",
+    unit: "дБ", min: 0, max: 20, step: 0.1, default: 2.5,
+  }),
+  n({
+    key: "scan.threshold_k", group: "sweep", label: "CFAR k·MAD",
+    help: "0 = лише offset. Не піднімає планку «бо шумно».",
+    min: 0, max: 4, step: 0.05, default: 0.75,
+  }),
+  n({
+    key: "scan.noise_percentile", group: "sweep", label: "Перцентиль підлоги",
+    help: "25: полиця не стає підлогою. 50 = стара медіана.",
+    min: 1, max: 50, step: 1, default: 25,
+  }),
+  n({
+    key: "scan.edge_guard", group: "sweep", label: "Край FFT",
+    help: "Частка смуги без ролофу ФНЧ. 0.90 ховала краї тайла.",
+    min: 0.5, max: 1, step: 0.01, default: 0.95,
   }),
   n({
     key: "scan.min_bw_hz", group: "sweep", label: "Мін. ширина зайнятості",
-    unit: "МГц", factor: MHZ, min: 0.5e6, max: 40e6, step: 0.5e6, default: 5e6,
+    unit: "МГц", factor: MHZ, min: 0.5e6, max: 40e6, step: 0.5e6, default: 1.5e6,
+  }),
+  n({
+    key: "scan.fft_min_bw_hz", group: "sweep", label: "Мін. ширина FFT-зайнятості",
+    help: "Вужче за inspect: слабка полиця на краю тайла.",
+    unit: "МГц", factor: MHZ, min: 0.3e6, max: 20e6, step: 0.1e6, default: 0.6e6,
   }),
   n({
     key: "scan.max_bw_hz", group: "sweep", label: "Макс. ширина зайнятості",
-    unit: "МГц", factor: MHZ, min: 2e6, max: 60e6, step: 1e6, default: 25e6,
+    unit: "МГц", factor: MHZ, min: 2e6, max: 60e6, step: 1e6, default: 30e6,
   }),
   n({
     key: "scan.inspect_ms", group: "sweep", label: "Вікно класифікації",
-    unit: "мс", min: 5, max: 200, step: 1, default: 40,
+    unit: "мс", min: 5, max: 200, step: 1, default: 90,
   }),
   n({
     key: "scan.inspect_bw_hz", group: "sweep", label: "Смуга класифікації",
-    unit: "МГц", factor: MHZ, min: 2e6, max: 40e6, step: 0.5e6, default: 12e6,
+    unit: "МГц", factor: MHZ, min: 2e6, max: 40e6, step: 0.5e6, default: 18e6,
+  }),
+  n({
+    key: "scan.inspect_ms_5g8", group: "sweep", label: "Вікно класифікації 5.8",
+    unit: "мс", min: 5, max: 200, step: 1, default: 110,
+  }),
+  n({
+    key: "scan.inspect_bw_5g8_hz", group: "sweep", label: "Смуга класифікації 5.8",
+    unit: "МГц", factor: MHZ, min: 2e6, max: 40e6, step: 0.5e6, default: 22e6,
   }),
   n({
     key: "scan.dc_notch_hz", group: "sweep", label: "Виріз гетеродина",
@@ -244,23 +364,23 @@ export const PARAMETER_CATALOG = [
   }),
   i({
     key: "scan.confirm_hits", group: "sweep", label: "Підтверджень",
-    min: 1, max: 8, step: 1, default: 2,
+    min: 1, max: 8, step: 1, default: 1,
   }),
   n({
     key: "scan.line_tol_hz", group: "sweep", label: "Допуск рядкової",
-    unit: "Гц", min: 10, max: 500, step: 5, default: 150,
+    unit: "Гц", min: 10, max: 500, step: 5, default: 200,
   }),
   n({
     key: "scan.line_prominence_db", group: "sweep", label: "Висота рядкової лінії",
-    unit: "дБ", min: 1, max: 40, step: 0.5, default: 10,
+    unit: "дБ", min: 0.5, max: 40, step: 0.5, default: 2,
   }),
   n({
     key: "scan.min_confidence", group: "sweep", label: "Мін. впевненість",
-    min: 0, max: 1, step: 0.05, default: 0.45,
+    min: 0, max: 1, step: 0.01, default: 0,
   }),
   i({
     key: "scan.min_harmonics", group: "sweep", label: "Мін. гармонік рядка",
-    min: 0, max: 8, step: 1, default: 1,
+    min: 0, max: 8, step: 1, default: 0,
   }),
   b({
     key: "scan.inspect_decode", group: "sweep", label: "Димовий decode",
@@ -269,7 +389,7 @@ export const PARAMETER_CATALOG = [
   }),
   n({
     key: "scan.inspect_min_row_corr", group: "sweep", label: "Мін. кореляція рядків",
-    min: 0, max: 1, step: 0.01, default: 0.12,
+    min: 0, max: 1, step: 0.01, default: 0.02,
   }),
   b({
     key: "scan.inspect_require_lock", group: "sweep", label: "Вимагати кадрову на inspect",
@@ -278,16 +398,34 @@ export const PARAMETER_CATALOG = [
   }),
   i({
     key: "scan.inspect_min_lines", group: "sweep", label: "Мін. рядків димового кадру",
-    min: 16, max: 625, step: 1, default: 80,
+    min: 16, max: 625, step: 1, default: 32,
   }),
   s({
     key: "scan.inspect_offsets_mhz", group: "sweep", label: "Зсуви inspect",
     help: "МГц через кому. Центр зайнятості ≠ центр відео.",
-    default: [1.0, 2.0],
+    default: [1.0, 2.0, 4.0],
   }),
   n({
     key: "scan.inspect_conf_bypass", group: "sweep", label: "Обхід decode за впевненістю",
-    min: 0, max: 1, step: 0.05, default: 0.7,
+    min: 0, max: 1, step: 0.05, default: 0.10,
+  }),
+  b({
+    key: "scan.accept_energy", group: "sweep", label: "Публікувати енергію без PAL",
+    help: "Хіт зі спектральної зайнятості, як звичайний FPV-сканер. Без кадру.",
+    default: false,
+  }),
+  n({
+    key: "scan.energy_min_snr_db", group: "sweep", label: "Мін. С/Ш енергетичного хіта",
+    unit: "дБ", min: 0, max: 40, step: 0.5, default: 1.0,
+  }),
+  n({
+    key: "scan.inspect_min_snr_db", group: "sweep", label: "Мін. С/Ш для вузького inspect",
+    unit: "дБ", min: 0, max: 40, step: 0.5, default: 1.0,
+  }),
+  b({
+    key: "scan.inspect_extras_need_comb", group: "sweep", label: "Extras лише з рядковою",
+    help: "Вимк.: inspect extras без 15.7 кГц — інакше слабкий аналог пропускається.",
+    default: false,
   }),
   n({
     key: "scan.merge_smear_hz", group: "sweep", label: "Злиття ЧМ-плями",
@@ -326,11 +464,11 @@ export const PARAMETER_CATALOG = [
   }),
   n({
     key: "video.deviation_hz", group: "lock", label: "Девіація ЧМ",
-    unit: "МГц", factor: MHZ, min: 1e6, max: 30e6, step: 0.5e6, default: 10e6,
+    unit: "МГц", factor: MHZ, min: 1e6, max: 30e6, step: 0.5e6, default: 4.8e6,
   }),
   n({
     key: "video.channel_bw_hz", group: "lock", label: "Смуга каналу",
-    unit: "МГц", factor: MHZ, min: 2e6, max: 40e6, step: 0.5e6, default: 10e6,
+    unit: "МГц", factor: MHZ, min: 2e6, max: 40e6, step: 0.5e6, default: 16e6,
   }),
   n({
     key: "video.lo_offset_hz", group: "lock", label: "Зміщення ФАПЧ",
@@ -425,7 +563,7 @@ export const PARAMETER_CATALOG = [
   }),
   i({
     key: "video.spectrum_every", group: "lock", label: "Спектр раз на N кадрів",
-    min: 1, max: 64, step: 1, default: 16,
+    min: 1, max: 64, step: 1, default: 1,
   }),
   b({
     key: "video.spectrum_pin_center", group: "lock",
@@ -476,6 +614,10 @@ export const PARAMETER_CATALOG = [
   n({
     key: "video.hunt_skip_if_score", group: "lock", label: "Не шукати, якщо оцінка ≥",
     min: 0, max: 1, step: 0.05, default: 0.7,
+  }),
+  n({
+    key: "video.hunt_skip_if_decode_ms", group: "lock", label: "Не шукати, якщо decode ≥",
+    unit: "мс", min: 0, max: 500, step: 10, default: 120,
   }),
   n({
     key: "video.hunt_drop", group: "lock", label: "Hunt при спаді оцінки",

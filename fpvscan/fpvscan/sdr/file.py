@@ -10,12 +10,27 @@ Windows -> ганяєш алгоритми скільки треба, з тим 
 параметрами захоплення.
 """
 from __future__ import annotations
+import errno
 import json
+import os
+import shutil
 from pathlib import Path
+from uuid import uuid4
 
 import numpy as np
 
 from .base import SdrSource
+
+
+def is_disk_full_error(exc: BaseException) -> bool:
+    """True for ENOSPC and NumPy's short ``tofile`` write on a full disk."""
+    err = getattr(exc, "errno", None)
+    if err in (errno.ENOSPC, errno.EDQUOT):
+        return True
+    msg = str(exc).lower()
+    return "no space left" in msg or (
+        "requested and" in msg and "written" in msg
+    )
 
 
 class FileSource(SdrSource):
@@ -32,6 +47,7 @@ class FileSource(SdrSource):
         self._meta: dict = {}
         self._fc = 0.0
         self._fs = 0.0
+        self.stream_discontinuities = 0
 
     def open(self):
         meta_p = self.path.with_suffix(".json")
@@ -57,6 +73,7 @@ class FileSource(SdrSource):
             if not self.loop:
                 raise EOFError("Запис закінчився")
             self._pos = 0
+            self.stream_discontinuities += 1
         out = d[self._pos:self._pos + n]
         self._pos += n
         if out.size < n:                      # запис коротший за запит
@@ -90,10 +107,21 @@ class FileSource(SdrSource):
 
 
 def write_capture(path: str | Path, iq: np.ndarray, center_hz: float,
-                  sample_rate: float, gain_db: float = 0.0, note: str = ""):
+                  sample_rate: float, gain_db: float = 0.0, note: str = "",
+                  metadata: dict | None = None):
+    """Atomically publish a CF32 capture and its JSON sidecar.
+
+    Both temporary files live beside the destination, so ``os.replace`` stays
+    on one filesystem.  Callers may add hardware/runtime metadata without
+    changing the established on-disk format.
+    """
     p = Path(path)
-    iq.astype(np.complex64).tofile(p)
-    p.with_suffix(".json").write_text(json.dumps({
+    p.parent.mkdir(parents=True, exist_ok=True)
+    meta_p = p.with_suffix(".json")
+    token = uuid4().hex
+    tmp_p = p.with_name(f".{p.name}.{token}.tmp")
+    tmp_meta = meta_p.with_name(f".{meta_p.name}.{token}.tmp")
+    body = {
         "center_hz": center_hz,
         "sample_rate": sample_rate,
         "gain_db": gain_db,
@@ -101,5 +129,33 @@ def write_capture(path: str | Path, iq: np.ndarray, center_hz: float,
         "duration_s": float(iq.size / sample_rate),
         "format": "complex64",
         "note": note,
-    }, ensure_ascii=False, indent=2), encoding="utf-8")
+    }
+    if metadata:
+        body.update(metadata)
+    needed = int(np.asarray(iq).nbytes) + 8192
+    free = int(shutil.disk_usage(p.parent).free)
+    if free < needed:
+        raise OSError(
+            errno.ENOSPC,
+            f"need {needed} bytes, {free} free in {p.parent}",
+        )
+    try:
+        np.asarray(iq, dtype=np.complex64).tofile(tmp_p)
+        tmp_meta.write_text(
+            json.dumps(body, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        os.replace(tmp_p, p)
+        os.replace(tmp_meta, meta_p)
+    except Exception as exc:
+        tmp_p.unlink(missing_ok=True)
+        tmp_meta.unlink(missing_ok=True)
+        # If only the first replace succeeded, do not leave an unpaired CF32.
+        if p.exists() and not meta_p.exists():
+            p.unlink(missing_ok=True)
+        if is_disk_full_error(exc) and getattr(exc, "errno", None) not in (
+            errno.ENOSPC, errno.EDQUOT,
+        ):
+            raise OSError(errno.ENOSPC, str(exc)) from exc
+        raise
     return p

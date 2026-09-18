@@ -1,0 +1,7 @@
+timestamp,trial,freq_hz,applied_keys,applied_values,lock_target,tuned_hz,pic_score,locked,free_run,line_rate,row_corr,luma_mean,luma_std,fps,mode,standard,lines,afc_hz,http_status,error,frame_path,video_freq_hz,stale,note
+2026-09-11T10:28:39.105606+00:00,0,1321000000.0,,,1321000000.0,1321000000.0,0.09,False,True,16967.9,-0.011,,,0.2,LOCK,?,288,0.0,200,,,1321000000.0,False,no new still (snow/free_run never writes)
+2026-09-11T10:28:54.357902+00:00,1,1321000000.0,video.channel_bw_hz,"{""video.channel_bw_hz"": 8000000.0}",1321000000.0,1321000000.0,0.09,False,True,16829.6,-0.044,,,0.2,LOCK,?,288,0.0,200,,,1321000000.0,False,
+2026-09-11T10:29:04.598909+00:00,2,1321000000.0,video.channel_bw_hz,"{""video.channel_bw_hz"": 10000000.0}",1321000000.0,1321000000.0,0.249,False,True,16116.3,0.089,,,0.33,LOCK,?,288,0.0,200,,,1321000000.0,False,
+2026-09-11T10:29:14.290311+00:00,3,1321000000.0,video.channel_bw_hz,"{""video.channel_bw_hz"": 16000000.0}",1321000000.0,1321000000.0,0.09,False,True,15735.4,-0.003,,,0.36,LOCK,?,288,0.0,200,,,1321000000.0,False,
+2026-09-11T10:29:25.509983+00:00,4,1321000000.0,video.channel_bw_hz,"{""video.channel_bw_hz"": 20000000.0}",1321000000.0,1321000000.0,0.09,False,True,15114.9,-0.037,,,0.3,LOCK,?,288,0.0,200,,,1321000000.0,False,
+2026-09-11T10:29:39.952370+00:00,5,1321000000.0,video.deviation_hz,"{""video.deviation_hz"": 3500000.0}",1321000000.0,1321000000.0,0.092,False,True,15825.6,0.008,,,0.25,LOCK,?,288,0.0,200,,,1321000000.0,False,

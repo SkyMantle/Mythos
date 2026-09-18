@@ -1,0 +1,10 @@
+Package: fpvscan
+Version: @VERSION@
+Section: hamradio
+Priority: optional
+Architecture: arm64
+Maintainer: Mythos <fpvscan>
+Depends: python3 (>= 3.11), python3-venv, python3-dev, python3-pip, build-essential, rsync, ffmpeg, libusb-1.0-0, adduser, udev, systemd, libbladerf2, bladerf, bladerf-fpga-hostedxa4
+Description: Analog FPV video scanner (bladeRF) for Raspberry Pi 5
+ Scans 400 MHz–6 GHz for analog composite FPV video and serves a web console.
+ Bind address is 0.0.0.0:8080 so the UI is reachable via a ZeroTier IP.

@@ -55,10 +55,25 @@ _NAMED_BOUNDS: dict[str, tuple[float, float, float]] = {
     "crop_bottom_lines": (0, 24, 1),
     "hunt_min_gain": (0, 1, 0.01),
     "hunt_skip_if_score": (0, 1, 0.01),
+    "hunt_skip_if_decode_ms": (0, 500, 10),
     "hunt_drop": (0, 1, 0.01),
     "min_confidence": (0, 1, 0.01),
     "inspect_min_row_corr": (0, 1, 0.01),
     "inspect_conf_bypass": (0, 1, 0.01),
+    "energy_min_snr_db": (0, 40, 0.5),
+    "inspect_min_snr_db": (0, 40, 0.5),
+    "threshold_offset_db": (0, 20, 0.1),
+    "threshold_min_db": (0, 20, 0.1),
+    "threshold_max_db": (0, 20, 0.1),
+    "threshold_k": (0, 4, 0.05),
+    "noise_percentile": (1, 50, 1),
+    "line_harm_db": (0, 40, 0.5),
+    "edge_guard": (0.5, 1.0, 0.01),
+    "inspect_snow_corr": (0, 1, 0.01),
+    "inspect_narrow_frac": (0.1, 1.0, 0.05),
+    "inspect_snow_lines": (10, 400, 1),
+    "inspect_ms": (5, 200, 1),
+    "inspect_ms_5g8": (5, 200, 1),
 }
 _NAMED_ENUMS: dict[str, list[str]] = {
     "rec_preset": [
@@ -66,10 +81,12 @@ _NAMED_ENUMS: dict[str, list[str]] = {
     ],
     "cluster_step_mhz": ["off", "12", "8", "4"],
     "hit_filter": ["all", "hide_weak", "hide_no_video", "hide_near_dup"],
+    "threshold_mode": ["auto", "fixed"],
 }
 _NAMED_LABELS: dict[str, str] = {
     "cluster_step_mhz": "Крок кластера",
     "hit_filter": "Фільтр знахідок",
+    "threshold_mode": "Поріг зайнятості",
     "h_pll": "ФАПЧ рядка",
     "gain_db": "Підсилення",
     "auto_gain": "Авто MGC",
@@ -91,6 +108,10 @@ _ENUM_LABELS: dict[str, dict[str, str]] = {
         "hide_weak": "ховати слабкі",
         "hide_no_video": "ховати без картинки",
         "hide_near_dup": "ховати сусідів",
+    },
+    "threshold_mode": {
+        "auto": "авто (CFAR)",
+        "fixed": "фіксований",
     },
 }
 

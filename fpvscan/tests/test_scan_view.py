@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from queue import Empty, Queue
+from types import SimpleNamespace
+import time
 
 import numpy as np
 
@@ -45,10 +47,9 @@ CFG = {
 
 def test_sweep_step_matches_engine_formula() -> None:
     step = sweep_step_hz(CFG["scan"])
-    fs, ch = 35e6, 10e6
-    assert step == max(fs * 0.25, fs * 0.9 - ch / 2)
+    assert step == 12e6
     cluster = sweep_step_hz(CFG["scan"], cluster=True)
-    assert cluster == 8.0e6
+    assert cluster == 4.0e6
     assert cluster < step
     assert cluster_step_hz({**CFG["scan"], "cluster_step_mhz": "off"}) is None
     assert sweep_step_hz({**CFG["scan"], "cluster_step_mhz": "4"}, cluster=True) == 4.0e6
@@ -72,16 +73,38 @@ def test_sweep_plan_visits_near_3489() -> None:
     assert abs(nearest_sweep_hz(full, 3489e6) - 3489e6) <= 15.0e6
     assert len(full) < 3 * coarse_sweep_len(full_scan)
     assert abs(len(full) - coarse_sweep_len(full_scan)) <= 2
-    assert sweep_step_hz(scan) > 20e6
+    assert sweep_step_hz(scan) == 12e6
     extras = extras_for_hit(near, 3489e6, full_scan)
     dense = densify_around(3489e6, full_scan)
     assert nearest_sweep_hz(dense, 3489e6) is not None
     assert abs(nearest_sweep_hz(dense, 3489e6) - 3489e6) <= 2.0e6
     assert extras
-    assert abs(nearest_sweep_hz(extras, 3489e6) - 3489e6) <= 2.0e6
+    covered = [near, *extras]
+    assert abs(nearest_sweep_hz(covered, 3489e6) - 3489e6) <= 2.0e6
     assert len(extras) < 20
-    assert extras_for_hit(near, float(near) + 25e6, full_scan) == []
+    assert extras_for_hit(near, float(near) + 35e6, full_scan) == []
     assert extras_for_hit(2412e6, 2412e6, full_scan)
+
+
+def test_cluster_step_4_survives_coarse_step_hz() -> None:
+    """Live config has step_hz 12e6; that must not flatten 4 MHz extras."""
+    scan = {
+        "start_hz": 400e6,
+        "stop_hz": 6000e6,
+        "sample_rate": 35e6,
+        "channel_bw_hz": 16e6,
+        "step_hz": 12e6,
+        "cluster_step_mhz": "4",
+    }
+    assert sweep_step_hz(scan) == 12e6
+    assert sweep_step_hz(scan, cluster=True) == 4e6
+    extras = extras_for_hit(4988e6, 4988e6, scan)
+    assert extras
+    assert min(extras) >= 4960e6
+    assert max(extras) <= 5016e6
+    assert not any(hz < 4920e6 for hz in extras)
+    assert abs(min(extras) - 4968e6) <= 4e6
+    assert any(abs(hz - 4992e6) <= 2e6 for hz in extras)
 
 
 def test_cluster_step_8_vs_4_plan_size() -> None:
@@ -235,7 +258,9 @@ def test_lock_spectrum_every_reads_live_catalog_flag() -> None:
 def test_pending_keys_only_retune_or_next_cycle() -> None:
     keys, reasons = pending_for(["sdr.gain_db", "video.sample_rate", "scan.threshold_db"])
     assert keys == ["video.sample_rate"]
-    assert reasons["video.sample_rate"] == "next lock retune"
+    assert reasons["video.sample_rate"] == (
+        "request recorded; session source rate remains shared"
+    )
     cleared, _ = pending_for(
         ["video.sample_rate", "scan.start_hz"], lock_refreshed=True,
     )
@@ -244,9 +269,131 @@ def test_pending_keys_only_retune_or_next_cycle() -> None:
     assert affect_of("scan.start_hz") == "grid"
     assert affect_of("scan.cluster_step_mhz") == "grid"
     assert affect_of("scan.hit_filter") == "detections"
-    assert needs_lock_refresh(["video.sharpen"])
+    assert not needs_lock_refresh([
+        "video.deviation_hz", "video.capture_ms", "video.sharpen",
+        "video.average", "video.h_pll", "video.width",
+    ])
+    assert not needs_lock_refresh(["video.sample_rate"])
+    assert needs_lock_refresh(["video.lo_offset_hz"])
     assert needs_lock_refresh(["video.h_pll"]) is False
     assert not needs_lock_refresh(["scan.start_hz"])
+
+
+def test_lock_metrics_separate_processed_iteration_and_ws() -> None:
+    eng = Engine(_StubSrc(), CFG, Queue())
+    eng._fps_ema = 7.5
+    eng._iteration_fps_ema = 9.25
+    eng._frame_seq = 12
+    eng._frame_mono = time.monotonic()
+    eng._ws_frame_ts = time.perf_counter() - 0.1
+    eng.note_ws_frame_emitted(10)
+    eng._timings.update({"line_hunt": 3.2, "fallback": 1.4, "lock_total": 8.8})
+
+    snap = eng.snapshot()
+    assert snap["processed_fps"] == 7.5
+    assert snap["iteration_fps"] == 9.25
+    assert snap["emitted_fps"] > 0.0
+    assert snap["frame_seq"] == 12
+    assert snap["emitted_frame_seq"] == 10
+    assert snap["frame_age_ms"] is not None
+    assert snap["timings_ms"]["line_hunt"] == 3.2
+    assert snap["timings_ms"]["fallback"] == 1.4
+
+
+def test_stale_good_lock_is_not_held_indefinitely() -> None:
+    eng = Engine(_StubSrc(), CFG, Queue())
+    eng._lock_good = object()
+    eng._lock_good_at = time.monotonic() - 2.0
+    assert eng._fresh_lock_good(max_age_s=0.25) is None
+    assert eng._lock_good is None
+
+
+def _analog_lock_frame(*, free_run: bool = False, locked: bool = True):
+    from fpvscan.dsp import cvbs
+
+    luma = np.full((288, 48), 90, dtype=np.uint8)
+    luma[:, 12:28] = 170
+    luma[1::2, :] = np.clip(luma[1::2, :].astype(np.int16) + 18, 0, 255).astype(
+        np.uint8,
+    )
+    return cvbs.Frame(
+        luma=luma,
+        line_rate=15_625.0,
+        lines=288,
+        standard="PAL",
+        locked=locked,
+        free_run=free_run,
+    )
+
+
+class _HoldAssembler:
+    period = 85.0
+    standard = "PAL"
+
+    def __init__(self, *, comb: bool = True, snow=None) -> None:
+        self._comb = comb
+        self.snow_calls = 0
+        self._snow = snow
+
+    def line_comb_present(self, *, field_span: float = 1.2) -> bool:
+        return bool(self._comb)
+
+    def latest_free_run(self, *, max_lines: int = 288):
+        self.snow_calls += 1
+        return self._snow
+
+
+def test_lock_hold_does_not_publish_snow_over_analog() -> None:
+    from fpvscan.dsp import cvbs
+
+    eng = Engine(_StubSrc(), CFG, Queue())
+    good = _analog_lock_frame()
+    assert cvbs.analog_usable(good)
+    eng._remember_good_frame(good)
+    snow = _analog_lock_frame(free_run=True, locked=False)
+    snow.luma = np.random.default_rng(3).integers(0, 255, snow.luma.shape, dtype=np.uint8)
+    assembler = _HoldAssembler(comb=True, snow=snow)
+    eng._snow_frame_at = 0.0
+    shown = eng._choose_lock_display(
+        None, assembler, {"snow_interval_ms": 1.0, "lock_good_hold_s": 5.0},
+    )
+    assert shown is not None
+    assert shown.locked and not shown.free_run
+    assert assembler.snow_calls == 0
+    eng._lock_good_at = time.monotonic() - 2.0
+    shown2 = eng._choose_lock_display(
+        None, assembler, {"snow_interval_ms": 1.0, "lock_good_hold_s": 5.0},
+    )
+    assert shown2 is not None
+    assert shown2.locked and not shown2.free_run
+
+
+def test_true_snow_without_analog_still_publishes_unlocked_snow() -> None:
+    eng = Engine(_StubSrc(), CFG, Queue())
+    snow = _analog_lock_frame(free_run=True, locked=False)
+    assembler = _HoldAssembler(comb=False, snow=snow)
+    eng._snow_frame_at = 0.0
+    shown = eng._choose_lock_display(
+        None, assembler, {"snow_interval_ms": 1.0, "lock_good_hold_s": 5.0},
+    )
+    assert shown is not None
+    assert shown.free_run
+    assert not shown.locked
+    assert assembler.snow_calls == 1
+
+
+def test_lock_hold_expires_without_h_comb_then_allows_snow() -> None:
+    eng = Engine(_StubSrc(), CFG, Queue())
+    eng._remember_good_frame(_analog_lock_frame())
+    eng._lock_good_at = time.monotonic() - 1.0
+    snow = _analog_lock_frame(free_run=True, locked=False)
+    assembler = _HoldAssembler(comb=False, snow=snow)
+    eng._snow_frame_at = 0.0
+    shown = eng._choose_lock_display(
+        None, assembler, {"snow_interval_ms": 1.0, "lock_good_hold_s": 5.0},
+    )
+    assert eng._lock_good is None
+    assert shown is not None and shown.free_run
 
 
 class _StubSrc:
@@ -255,6 +402,42 @@ class _StubSrc:
     overflows = 0
     clip_frac = 0.0
     bias_tee = False
+
+
+def test_publish_spectrum_refreshes_cached_grid() -> None:
+    events = Queue()
+    eng = Engine(_StubSrc(), CFG, events)
+    eng.state.mode = "SWEEP"
+    eng._sweep_i = 20
+    eng.state.sweep_pos_hz = 1200e6
+    eng.state.tuned_hz = 1200e6
+    assert eng.snapshot()["grid"]["pass_index"] == 0
+    eng._publish_spectrum(1200e6, 35e6, [-40.0, -20.0], -50.0, 8192)
+    snap = eng.snapshot()
+    assert snap["grid"]["pass_index"] == 20
+    assert snap["grid"]["current_hz"] == 1200e6
+    assert snap["sweep_pos_hz"] == 1200e6
+    found = []
+    while True:
+        try:
+            found.append(events.get_nowait())
+        except Empty:
+            break
+    spec = next(ev["data"] for ev in found if ev["type"] == "spectrum")
+    assert spec["grid"]["pass_index"] == 20
+    assert spec["grid"]["current_hz"] == 1200e6
+
+
+def test_auto_peek_expires_when_ring_empty() -> None:
+    eng = Engine(_StubSrc(), CFG, Queue())
+    eng.state.mode = "LOCK"
+    eng.state.auto = True
+    eng.state.lock_target = 1200e6
+    eng.state.auto_until = 0.0
+    assert eng._end_auto_peek_if_due() is True
+    assert eng.state.mode == "SWEEP"
+    assert eng.state.lock_target is None
+    assert eng.state.auto is False
 
 
 def test_lock_command_sets_target_and_emits_state() -> None:
@@ -276,6 +459,31 @@ def test_lock_command_sets_target_and_emits_state() -> None:
     snap = next(ev["data"] for ev in found if ev["type"] == "state")
     assert snap["mode"] == "LOCK"
     assert snap["lock_target"] == 4988e6
+
+
+def test_inspect_skips_when_lock_queued() -> None:
+    class _SpySrc:
+        name = "stub"
+        sample_rate = 20e6
+        overflows = 0
+        clip_frac = 0.0
+        bias_tee = False
+
+        def __init__(self) -> None:
+            self.retunes: list[float] = []
+
+        def retune_and_read(self, f, n):
+            self.retunes.append(float(f))
+            return np.zeros(8, np.complex64)
+
+    src = _SpySrc()
+    eng = Engine(src, CFG, Queue())
+    eng.command("lock", freq_hz=4988e6)
+    occ = SimpleNamespace(center_hz=1200e6, bandwidth_hz=8e6, snr_db=20.0)
+    eng._inspect(None, 1200e6, 20e6, occ)
+    assert eng.state.mode == "LOCK"
+    assert eng.state.lock_target == 4988e6
+    assert src.retunes == []
 
 
 def _inspect(freq_hz: float, **kw) -> Detection:

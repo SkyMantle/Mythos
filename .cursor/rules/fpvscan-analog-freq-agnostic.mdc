@@ -1,0 +1,14 @@
+---
+description: Analog lock frequencies never repeat; tests and sweeps stay frequency-agnostic
+alwaysApply: true
+---
+
+# Analog lock frequencies do not repeat
+
+Operator rule: **одинакових частот між сесіями не буває**.
+
+- Each session has a new analog lock frequency. Never treat last CSV or past MHz (3430 / 3429 / 5473 / 5827 / 1280 / 1321) as “the” bird.
+- Ground truth picture is the other analog box OSD labelled **Rabbit** *this session*, not fpvscan’s last sweep.
+- Sweep `--freq` is whatever Rabbit / the console shows now.
+- Tests and sweep helpers must be frequency-agnostic: assert OFAT, correlation, relock, empty-video, keep-best vs restore, and band-threshold behavior. Use arbitrary Hz (e.g. `1.1e9`, `5.1e9`) as parameters, not operational channel IDs.
+- Band extras use a generic `freq < 2e9` vs `≥ 2e9` split, never a hardcoded MHz list.

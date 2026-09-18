@@ -1,0 +1,9 @@
+#!/bin/bash
+set -e
+export FPVSCAN_SKIP_COPY=1
+export FPVSCAN_APP=/opt/fpvscan
+export FPVSCAN_SRC=/opt/fpvscan
+if [ -x /opt/fpvscan/deploy/install_pi.sh ]; then
+  bash /opt/fpvscan/deploy/install_pi.sh --from-deb
+fi
+exit 0

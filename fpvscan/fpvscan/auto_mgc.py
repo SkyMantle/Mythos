@@ -6,9 +6,10 @@ this loop must not add a fixed +15 dB and must never toggle Bias-T.
 
 Hill-climb: after a step up, wait ``SETTLE_S``. If pic_score / lock
 quality does not improve, revert that step and mark a ceiling. Frozen
-(near-identical) luma with a weak picture steps down, not up. A locked
-usable picture is not brightened. Operator catalog writes of ``gain_db``
-turn auto off; they click авто to resume.
+mid-gray luma with a weak picture steps down, not up. Flat-black snow
+(distant / no signal) must not walk gain down. A locked usable picture
+is not brightened. Operator catalog writes of ``gain_db`` turn auto off;
+they click авто to resume.
 """
 from __future__ import annotations
 
@@ -28,6 +29,7 @@ RMS_THRESH = 0.40
 SAT_FRAC = 0.12
 FREEZE_CORR = 0.985
 FREEZE_DOWN_DB = 36.0
+FREEZE_DARK_MEAN = 16.0
 IMPROVE_EPS = 0.02
 WEAK_SCORE = 0.20
 HOLD_SCORE = 0.35
@@ -142,14 +144,18 @@ def luma_signature(luma: Any, n: int = SIG_N) -> tuple[float, ...]:
 
 
 def luma_sat_frac(luma: Any) -> float:
-    """Fraction of pixels crushed to black or white (overload proxy)."""
+    """Fraction of pixels crushed to white (ADC/luma overload).
+
+    Black crush is a weak/distant picture, not a hot front-end — counting
+    it as saturation made auto MGC step gain *down* on snow and far analog.
+    """
     if luma is None:
         return 0.0
     arr = np.asarray(luma)
     if arr.size == 0:
         return 0.0
     x = arr.reshape(-1)
-    return float(np.mean((x <= 3) | (x >= 252)))
+    return float(np.mean(x >= 252))
 
 
 def iq_rms(iq: Any, n: int = IQ_RMS_N) -> float:
@@ -195,6 +201,12 @@ def adc_hot(sample: MgcSample) -> bool:
     if float(sample.sat_frac) >= float(sample.sat_thresh):
         return True
     return False
+
+
+def _sig_mean(sig: tuple[float, ...]) -> float:
+    if not sig:
+        return 0.0
+    return sum(sig) / len(sig)
 
 
 def picture_frozen(sample: MgcSample, state: MgcState) -> bool:
@@ -258,7 +270,10 @@ def step(sample: MgcSample, state: MgcState) -> float:
         return nxt
     if frozen:
         _clear_probe(state)
-        if gain >= float(sample.freeze_down_db):
+        # Uniform black/snow looks "frozen" (flat corr = 1) but is a weak
+        # picture — do not walk gain down from 60 toward freeze_down_db.
+        dark = _sig_mean(sample.frame_sig) < FREEZE_DARK_MEAN
+        if (not dark) and gain >= float(sample.freeze_down_db):
             nxt = max(lo, gain - step_db)
             state.ceiling_db = nxt
             _remember_sig(state, sample)

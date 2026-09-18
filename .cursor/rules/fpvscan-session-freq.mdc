@@ -1,0 +1,21 @@
+---
+description: Analog FPV lock frequencies do not repeat across operator sessions.
+alwaysApply: true
+---
+
+# Analog lock frequencies do not repeat
+
+Operator rule (Ukrainian): **«одинакових частот між сесіями не буває»**.
+
+- Each operator session has a **new** set of analog lock frequencies. Do not treat past MHz (3430, 3429, 5473, 5827, 1280, 1321, or any other) as “the usual bird”.
+- Never assume last session’s MHz, IF winners (`channel_bw` / `deviation` / `sample_rate` / capture), or a `knob_sweep.csv` as the next bird.
+- Ground truth picture is the other analog box OSD labelled **Rabbit**, not fpvscan’s last sweep.
+- Sweep `--freq` is always whatever Rabbit / the console shows *this* session.
+
+```text
+# ❌ BAD — reuse last CSV / last MHz
+python knob_sweep.py --freq 1321e6   # “worked yesterday”
+
+# ✅ GOOD — this session’s Rabbit / console readout
+python knob_sweep.py --freq <MHz from Rabbit>
+```

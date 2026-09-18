@@ -5,7 +5,7 @@
 import {
   PARAMETER_CATALOG, CATALOG_DEFAULTS, DEFAULT_SCHEMA,
   clampToSpec, cloneValue,
-} from "./catalog.js?v=18"
+} from "./catalog.js?v=24"
 
 const UK_HINT = Object.fromEntries(PARAMETER_CATALOG.map(p => [p.key, p]))
 
@@ -13,7 +13,22 @@ export const TEST_PREFIX = "/api/test"
 const LS_KEY = "fpvscan.test.v1"
 
 function uuid() {
-  return crypto.randomUUID()
+  // randomUUID() exists only in a secure context (HTTPS / localhost).
+  // ZeroTier http://10.x.x.x is not secure — fall back so SCAN/LOCK still work.
+  const c = typeof globalThis !== "undefined" ? globalThis.crypto : undefined
+  if (c && typeof c.randomUUID === "function") {
+    return c.randomUUID()
+  }
+  const bytes = new Uint8Array(16)
+  if (c && typeof c.getRandomValues === "function") {
+    c.getRandomValues(bytes)
+  } else {
+    for (let i = 0; i < 16; i++) bytes[i] = Math.random() * 256 & 255
+  }
+  bytes[6] = (bytes[6] & 0x0f) | 0x40
+  bytes[8] = (bytes[8] & 0x3f) | 0x80
+  const hex = Array.from(bytes, b => b.toString(16).padStart(2, "0")).join("")
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
 }
 
 function loadLocal() {
@@ -131,6 +146,8 @@ export class TestClient {
     this.db = loadLocal()
     this.catalog = PARAMETER_CATALOG
     this.defaults = { ...CATALOG_DEFAULTS }
+    this._paramSeq = 0
+    this._paramKeySeq = new Map()
   }
 
   async probe() {
@@ -182,26 +199,54 @@ export class TestClient {
   }
 
   async setParameters(patch) {
+    const requestSeq = ++this._paramSeq
+    const requestedKeys = Object.keys(patch)
+    const idempotencyKey = uuid()
     const next = { ...this.db.values }
     for (const [k, v] of Object.entries(patch)) {
       const spec = this.spec(k)
       next[k] = spec ? clampToSpec(spec, v) : v
+      this._paramKeySeq.set(k, requestSeq)
     }
     this.db.values = next
     saveLocal(this.db)
-    const body = { idempotency_key: uuid(), values: patch }
+    const body = { idempotency_key: idempotencyKey, values: patch }
     const r = await req("PUT", "/parameters", body)
-    if (r.ok && r.data && r.data.values) Object.assign(next, r.data.values)
-    this.db.values = next
+    const responseTx = r.data && r.data.transaction_id
+    const transactionMatches = !responseTx || responseTx === idempotencyKey
+    const merged = { ...this.db.values }
+    if (r.ok && transactionMatches && r.data && r.data.values) {
+      for (const [key, value] of Object.entries(r.data.values)) {
+        if ((this._paramKeySeq.get(key) || 0) <= requestSeq) merged[key] = value
+      }
+    }
+    this.db.values = merged
     saveLocal(this.db)
+    const serverApplied = r.ok && transactionMatches
+      ? (r.data && r.data.applied_keys) || requestedKeys
+      : []
+    const acknowledgedKeys = serverApplied.filter(key => requestedKeys.includes(key))
     return {
-      values: next,
-      remote: r.ok,
+      values: merged,
+      remote: r.ok && transactionMatches,
       status: r.status,
-      error: r.ok ? null : errText(r),
-      pending_keys: r.ok ? (r.data && r.data.pending_keys) || [] : [],
-      pending_reasons: r.ok ? (r.data && r.data.pending_reasons) || {} : {},
-      applied_keys: r.ok ? (r.data && r.data.applied_keys) || Object.keys(patch) : [],
+      error: !r.ok
+        ? errText(r)
+        : transactionMatches ? null : "parameter transaction ACK mismatch",
+      transaction_id: responseTx || idempotencyKey,
+      request_seq: requestSeq,
+      requested_keys: requestedKeys,
+      acknowledged_keys: acknowledgedKeys,
+      pending_keys: r.ok && transactionMatches
+        ? ((r.data && r.data.pending_keys) || []).filter(key => acknowledgedKeys.includes(key))
+        : [],
+      pending_reasons: r.ok && transactionMatches
+        ? (r.data && r.data.pending_reasons) || {}
+        : {},
+      applied_keys: serverApplied,
+      affects: r.ok && transactionMatches
+        ? (r.data && r.data.affects) || {}
+        : {},
     }
   }
 
@@ -538,10 +583,14 @@ function errText(r) {
 
 export function engineLock(freqHz, opts) {
   const q = opts && opts.force ? "?force=1" : ""
-  return fetch("/api/lock/" + freqHz + q, { method: "POST" })
+  const ctrl = new AbortController()
+  const t = setTimeout(() => ctrl.abort(), 6000)
+  return fetch("/api/lock/" + freqHz + q, { method: "POST", signal: ctrl.signal })
+    .finally(() => clearTimeout(t))
 }
-export function engineSweep() {
-  return fetch("/api/sweep", { method: "POST" })
+export function engineSweep(opts) {
+  const autoLock = !!(opts && opts.autoLock)
+  return fetch("/api/sweep?auto_lock=" + (autoLock ? "1" : "0"), { method: "POST" })
 }
 export function engineClear() {
   return fetch("/api/clear", { method: "POST" })

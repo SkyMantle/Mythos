@@ -1,0 +1,112 @@
+{
+  "version": 1,
+  "source_transcript": "4e8f4ad2-83e4-49ce-8543-5313035d5039",
+  "pc_http": {
+    "cwd": "D:\\projects\\Mythos\\fpvscan",
+    "base": "http://10.252.65.41:8000",
+    "pi_pkg": "/opt/fpvscan/fpvscan",
+    "pi_console": "http://10.252.65.47:8080"
+  },
+  "never_auto_deploy": ["rotator.py", "config.yaml"],
+  "banned_wget_home": ["logging.py"],
+  "companions": {
+    "engine.py": [
+      "scan_gate.py",
+      "scan_view.py",
+      "sdr/file.py",
+      "dsp/cvbs.py",
+      "dsp/streaming.py",
+      "dsp/adaptive_if.py"
+    ],
+    "dsp/streaming.py": ["dsp/cvbs.py", "dsp/demod.py"],
+    "streaming.py": ["dsp/cvbs.py"],
+    "dsp/adaptive_if.py": ["dsp/cvbs.py", "dsp/demod.py"],
+    "scan_view.py": ["hardware_rate.py"],
+    "web/server.py": ["web/static/js/app.js", "web/static/index.html"]
+  },
+  "failed_approaches": [
+    {
+      "id": "incomplete-wget-scan-gate",
+      "symptom": "AttributeError: inspect_wall_s after engine.py-only deploy",
+      "do_not": "wget engine.py without scan_gate.py when engine calls scan_gate.inspect_wall_s"
+    },
+    {
+      "id": "incomplete-wget-scan-view",
+      "symptom": "ImportError freeze_lock_afc after engine.py-only deploy",
+      "do_not": "wget engine.py without scan_view.py when engine imports freeze_lock_afc"
+    },
+    {
+      "id": "incomplete-wget-sdr-file",
+      "symptom": "ImportError: cannot import name is_disk_full_error from fpvscan.sdr.file",
+      "do_not": "wget engine.py without sdr/file.py after adding that import"
+    },
+    {
+      "id": "incomplete-wget-cvbs-frame",
+      "symptom": "TypeError: Frame.__init__() got an unexpected keyword argument 'incomplete'",
+      "do_not": "wget dsp/streaming.py that passes Frame(incomplete=...) without dsp/cvbs.py"
+    },
+    {
+      "id": "fpv-upd-copy-list",
+      "symptom": "sudo cp ~/fpv-upd/... fails; directory does not exist on Pi",
+      "do_not": "give ~/fpv-upd/ copy lists"
+    },
+    {
+      "id": "empty-base-wget",
+      "symptom": "wget http:///fpvscan/... because $BASE was empty",
+      "do_not": "paste wget with $BASE/$PC variables; hardcode http://10.252.65.41:8000"
+    },
+    {
+      "id": "stdlib-shadow-logging",
+      "symptom": "PIL/import logging crashes because wget -O ~/logging.py shadows stdlib",
+      "do_not": "wget -O ~/logging.py or run Python from $HOME with that file present"
+    },
+    {
+      "id": "wget-from-repo-root",
+      "symptom": "404 because http.server cwd is fpvscan/, not Mythos root",
+      "do_not": "wget /fpvscan/scripts/knob_sweep.py; use /scripts/knob_sweep.py"
+    },
+    {
+      "id": "sticky-no-hedge",
+      "symptom": "black LOCK pane, 282 empty lines, sync missing",
+      "user_quote": "Такий фікс уже був) Ти повторюєшся?",
+      "do_not": "predicted sticky t0 with no H-edge plus skip free_run globally"
+    },
+    {
+      "id": "always-free-run-revert",
+      "symptom": "picture returns but 0.3–0.5 fps; operator called it a repeat",
+      "do_not": "ship 'always free_run / drop sticky' as a new fix after the black-pane revert"
+    },
+    {
+      "id": "constant-if-architecture",
+      "symptom": "operator: constant IF is bad architecture",
+      "do_not": "hardcode a session IF / MHz as the architecture; frequencies do not repeat across sessions"
+    },
+    {
+      "id": "gil-on-event-loop",
+      "symptom": "LOCK hangs uvicorn, WS drops to «нема»",
+      "do_not": "call snapshot_json / ws_state_json / engine.snapshot on the asyncio loop"
+    },
+    {
+      "id": "sweep-forced-lock",
+      "symptom": "operator cannot stay in sweep; UI jumps to LOCK",
+      "do_not": "auto-lock so the operator cannot remain in SWEEP"
+    },
+    {
+      "id": "rotator-pi-reboot",
+      "symptom": "sharp rotator move drops BladeRF or reboots Pi",
+      "do_not": "redeploy rotator.py or enlarge LOCK IQ chunks while chasing fps"
+    }
+  ],
+  "user_repeat_quotes": [
+    "Такий фікс уже був) Ти повторюєшся?",
+    "Не стало",
+    "Тепер картинки взагалі нема",
+    "Останні впровадження не дали жодного приросту в кадрах",
+    "Останній раз кажу за frame rate",
+    "Еу слухай начорта поламав режим свіп?",
+    "Дивись щось в останньому апдейті заділо rotator знову падає blade",
+    "Не спрацювало різкий поворот вліво вивів pi5 в ребут",
+    "Це що за баг після деплою",
+    "Звіряв архітектуру використання постійних if кепська практика"
+  ]
+}

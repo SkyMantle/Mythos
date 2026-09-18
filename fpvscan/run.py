@@ -11,6 +11,7 @@ if not os.environ.get("OPENBLAS_NUM_THREADS") and not os.environ.get("OMP_NUM_TH
 import argparse
 import queue
 import sys
+import threading
 from pathlib import Path
 
 import yaml
@@ -22,6 +23,26 @@ sys.path.insert(0, str(Path(__file__).parent))
 from fpvscan.engine import Engine
 from fpvscan.sdr.factory import make_source
 from fpvscan.web.server import create_app
+
+
+def _watch_engine(engine, server, stop: threading.Event,
+                  interval_s: float = 0.5) -> None:
+    """Stop Uvicorn if its engine worker dies unexpectedly."""
+    while not stop.wait(interval_s):
+        alive = getattr(engine, "worker_alive", None)
+        if (
+            getattr(engine, "_worker_started", False)
+            and callable(alive)
+            and not alive()
+            and not getattr(engine, "_stop", stop).is_set()
+        ):
+            print(
+                "[watchdog] нитка рушія завершилась; зупиняємо процес "
+                "для перезапуску systemd",
+                flush=True,
+            )
+            server.should_exit = True
+            return
 
 def _port_busy(port: int) -> bool:
     import socket
@@ -49,7 +70,9 @@ def main():
         cfg["web"]["port"] = args.port
 
     src = make_source(cfg["sdr"])
-    engine = Engine(src, cfg, queue.Queue(maxsize=64))
+    # Ordered low-rate state/notice/catalog events are reliable.  Video has
+    # its own bounded single-slot publisher and never enters this queue.
+    engine = Engine(src, cfg, queue.Queue())
     app = create_app(engine)
     engine.start()
 
@@ -58,11 +81,27 @@ def main():
         print(f"Порт {port} уже зайнятий. ...")
         engine.stop()
         return
-    shown = "127.0.0.1" if host in ("0.0.0.0", "::") else host
-    print(f"Приймач: {src.name}   ->   http://{shown}:{port}")
+    bind = f"{host}:{port}"
+    print(f"Приймач: {src.name}   слухає {bind}")
+    if host in ("0.0.0.0", "::"):
+        print(f"Консоль: http://<IP-цього-вузла>:{port}  (усі інтерфейси, включно з ZeroTier; не лише localhost)")
+    else:
+        print(f"Консоль: http://{host}:{port}")
+    server = uvicorn.Server(uvicorn.Config(
+        app, host=host, port=port, log_level="warning"))
+    watchdog_stop = threading.Event()
+    watchdog = threading.Thread(
+        target=_watch_engine,
+        args=(engine, server, watchdog_stop),
+        daemon=True,
+        name="fpvscan-watchdog",
+    )
+    watchdog.start()
     try:
-        uvicorn.run(app, host=host, port=port, log_level="warning")
+        server.run()
     finally:
+        watchdog_stop.set()
+        watchdog.join(timeout=1)
         engine.stop()
 
 if __name__ == "__main__":

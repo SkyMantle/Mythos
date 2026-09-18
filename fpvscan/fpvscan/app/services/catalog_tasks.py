@@ -17,7 +17,7 @@ SWEEP_TASKS: dict[str, str] = {
 }
 
 # Picture jumps = AFC/hunt wander, clip, retune settle, short capture.
-# video.sample_rate is not a jump tool: LOCK must stay dec=1.
+# video.sample_rate is not a jump tool: 20 Msps + 9 MHz uses channelize dec=2.
 # H tears = short tracked field (207-line crop). V tears = same-field blend.
 # crop_left_frac / crop_bottom_lines are always-on defaults, not LOCK-wall knobs.
 # TBC window / smooth are engine constants — not operator sliders.

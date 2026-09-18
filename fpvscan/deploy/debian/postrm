@@ -1,0 +1,10 @@
+#!/bin/bash
+set -e
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl daemon-reload 2>/dev/null || true
+fi
+if [ "$1" = "purge" ]; then
+  rm -f /etc/systemd/system/fpvscan.service
+  # /opt/fpvscan лишаємо: там config.yaml і out/
+fi
+exit 0

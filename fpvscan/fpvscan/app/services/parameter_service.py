@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 from uuid import UUID
@@ -30,7 +31,7 @@ class ParameterService:
         )
 
     async def list_parameters(self, mode: str | None = None) -> list[ParamSpec]:
-        items = self._catalog()
+        items = await asyncio.to_thread(self._catalog)
         if mode is None:
             return items
         if mode not in ("sweep", "lock"):
@@ -42,7 +43,8 @@ class ParameterService:
         return [item for item in items if item.key in allow]
 
     async def current_values(self) -> dict[str, Any]:
-        return catalog_values(self._engine.current_cfg())
+        return await asyncio.to_thread(
+            lambda: catalog_values(self._engine.current_cfg()))
 
     async def apply_parameters(
         self,
@@ -54,7 +56,7 @@ class ParameterService:
         )
         if replay is not None:
             return AppliedParams.from_dict(replay)
-        specs = {s.key: s for s in self._catalog()}
+        specs = {s.key: s for s in await asyncio.to_thread(self._catalog)}
         unknown = [k for k in values if k not in specs]
         if unknown:
             raise ValidationError(
@@ -63,19 +65,21 @@ class ParameterService:
             )
         coerced = {key: coerce_param(specs[key], raw) for key, raw in values.items()}
         if coerced:
-            self._engine.apply_values(coerced)
-        snap = self._engine.snapshot()
+            await asyncio.to_thread(self._engine.apply_values, coerced)
+        snap = await asyncio.to_thread(self._engine.snapshot)
         relocked = False
         if str(snap.get("mode") or "").upper() == "LOCK" and needs_lock_refresh(coerced):
-            self._engine.refresh_lock()
+            await asyncio.to_thread(self._engine.refresh_lock)
             relocked = True
         pending, reasons = pending_for(coerced, lock_refreshed=relocked)
         result = AppliedParams(
-            values=catalog_values(self._engine.current_cfg()),
+            values=await asyncio.to_thread(
+                lambda: catalog_values(self._engine.current_cfg())),
             applied_keys=sorted(coerced),
             pending_keys=pending,
             pending_reasons=reasons,
             affects={key: affect_of(key) for key in coerced},
+            transaction_id=str(idempotency_key),
         )
         await remember(
             self._repo,

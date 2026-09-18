@@ -11,6 +11,8 @@ from typing import Any, Iterable
 
 import numpy as np
 
+from .hardware_rate import USABLE_SPAN_FRACTION, requested_sweep_step_hz
+
 
 def mono_ms() -> int:
     return int(time.monotonic() * 1000)
@@ -63,6 +65,27 @@ def freeze_afc_hunt(*, pic_locked: bool, pic_score: float = 0.0,
     return bool(pic_locked) and float(pic_score) >= float(min_score)
 
 
+def freeze_lock_afc(*, analog_ok: bool = False, pic_locked: bool = False,
+                    pic_score: float = 0.0, row_corr: float = 0.0,
+                    luma_mean: float | None = None,
+                    min_score: float = HUNT_HOLD_SCORE,
+                    min_corr: float = 0.18,
+                    min_luma: float = 12.0) -> bool:
+    """Hold digital AFC only when a visible analog picture is on screen.
+
+    Publishing 282 black lines is not a picture: freq_error then walks
+    the LO (3430→3431) while sticky t0 paints sync/porch.
+    """
+    if luma_mean is not None and float(luma_mean) < float(min_luma):
+        return False
+    if analog_ok:
+        return True
+    if bool(pic_locked) and float(row_corr) >= float(min_corr):
+        return True
+    return freeze_afc_hunt(pic_locked=pic_locked, pic_score=pic_score,
+                           min_score=min_score)
+
+
 def rf_snap_due(*, pic_locked: bool, pic_score: float, afc_hz: float,
                 digital_max_hz: float, last_snap_mono: float = 0.0,
                 now_mono: float | None = None,
@@ -100,26 +123,60 @@ def afc_should_nudge(afc_hz: float, freq_err_hz: float, digital_max_hz: float,
 def lock_channel_bw(fs: float, want_bw: float, *,
                     off_hz: float = 0.0,
                     headroom_hz: float = 1.5e6,
-                    min_bw: float = 12e6) -> float:
-    """LOCK channel width with dec=1. dec=2 breaks PAL (30 Msps + 12 MHz IF)."""
+                    min_bw: float = 8e6) -> float:
+    """LOCK channel width. Keep a narrow analog IF (≈9 MHz).
+
+    20 Msps + 9 MHz is dec=2; channelize() has a 3-sample path that
+    keeps PAL edges. Do not raise want_bw up to fs — that dropped the
+    PAL-preserving dec=2 path and demodulated the whole USB span.
+    """
     fs = float(fs)
+    want = float(want_bw)
     if fs < 1.0:
-        return float(want_bw)
-    ch = min(float(want_bw), fs * 0.9)
-    ch = max(ch, min(float(min_bw), fs * 0.9))
+        return want
+    floor = min(float(min_bw), want) if want > 0 else float(min_bw)
+    ch = min(want, fs * 0.9)
+    ch = max(ch, min(floor, fs * 0.9))
     max_bw = 2.0 * max(6e6, fs * 0.45 - abs(float(off_hz)) - float(headroom_hz))
     ch = min(ch, max_bw)
-    ch = max(ch, min(float(min_bw), fs * 0.9))
-    # Forbid dec>=2: raise BW to match fs so channelize stays dec=1.
-    if int(fs / max(ch, 1.0)) >= 2:
-        ch = fs
+    ch = max(ch, min(floor, fs * 0.9))
     return ch
 
 
 def lock_decimation(fs: float, ch_bw: float) -> int:
-    """LOCK decimation. dec=2 is forbidden — never return 2+."""
-    dec = max(1, int(float(fs) / max(float(ch_bw), 1.0)))
-    return 1 if dec >= 2 else dec
+    """LOCK decimation, matching demod.channelize (dec=2 is allowed)."""
+    return max(1, int(float(fs) / max(float(ch_bw), 1.0)))
+
+
+def prelock_mix_hz(
+    blob_hz: float,
+    *,
+    tracking: bool,
+    fs: float,
+    ch_bw: float,
+    off_hz: float = 0.0,
+    max_hz: float = 2.5e6,
+    deadband_hz: float = 80e3,
+) -> float:
+    """Digital mixer nudge onto the FM energy blob before CVBS lock.
+
+    Video AFC / hunt are gated on a locked raster, so a 1–2 MHz click
+    error stayed mixed off-center and decode returned None (black pane).
+    """
+    if tracking:
+        return 0.0
+    nyq = max(0.0, float(fs) * 0.45 - abs(float(off_hz)) - float(ch_bw) / 2.0)
+    lim = min(float(max_hz), nyq)
+    if lim < 50e3:
+        return 0.0
+    x = float(blob_hz)
+    if abs(x) < float(deadband_hz):
+        return 0.0
+    if x > lim:
+        return lim
+    if x < -lim:
+        return -lim
+    return x
 
 
 def hunt_span_hz(offsets_mhz: list | None, *, pegged: bool, wide_hz: float = 2e6) -> float:
@@ -131,23 +188,22 @@ def hunt_span_hz(offsets_mhz: list | None, *, pegged: bool, wide_hz: float = 2e6
 
 
 PENDING_REASONS: dict[str, str] = {
-    "scan.sample_rate": "next sweep retune",
-    "video.sample_rate": "next lock retune",
+    "scan.sample_rate": "request recorded; session source rate remains shared",
+    "video.sample_rate": "request recorded; session source rate remains shared",
     "video.lo_offset_hz": "next lock retune",
     "sdr.settle_us": "next retune",
     "scan.fft_size": "next sweep FFT",
     "scan.averages": "next sweep FFT",
+    "scan.edge_guard": "next sweep FFT",
+    "scan.noise_percentile": "next sweep FFT",
+    "scan.threshold_mode": "next sweep FFT",
+    "scan.threshold_offset_db": "next sweep FFT",
     "scan.channel_bw_hz": "next sweep step/FFT",
     "scan.step_hz": "next sweep plan",
     "scan.start_hz": "next sweep plan",
     "scan.stop_hz": "next sweep plan",
     "scan.cluster_step_mhz": "next sweep plan",
-    "video.channel_bw_hz": "next lock channelize",
-    "video.capture_ms": "next lock capture",
-    "video.hunt": "next hunt cycle",
-    "video.hunt_offsets_mhz": "next hunt cycle",
-    "video.hunt_every": "next hunt cycle",
-    "video.deviation_hz": "next lock demod",
+    "scan.cluster_see_hz": "next sweep plan",
 }
 
 # Keys that a LOCK refresh (restart reader / decode, keep rec) makes live.
@@ -165,7 +221,10 @@ def affect_of(key: str) -> str:
         return "detections"
     if key in {
         "scan.fft_size", "scan.averages", "scan.threshold_db",
-        "scan.dc_notch_hz", "video.spectrum_every",
+        "scan.threshold_mode", "scan.threshold_offset_db",
+        "scan.threshold_min_db", "scan.threshold_max_db", "scan.threshold_k",
+        "scan.noise_percentile",
+        "scan.dc_notch_hz", "scan.edge_guard", "video.spectrum_every",
         "video.spectrum_every_4",
         "video.spectrum_pin_center", "video.spectrum_ema",
         "video.spectrum_smooth3",
@@ -187,21 +246,19 @@ def pending_for(
     return pending, {k: PENDING_REASONS[k] for k in pending}
 
 
-LOCK_LIVE_KEYS = frozenset({"video.h_pll"})
+LOCK_HARDWARE_KEYS = frozenset({"video.lo_offset_hz"})
 
 
 def needs_lock_refresh(keys: Iterable[str]) -> bool:
-    """Restart reader/decode only when the picture path cannot pick up live."""
-    return any(
-        affect_of(k) == "picture" and k not in LOCK_LIVE_KEYS for k in keys
-    )
+    """Restart LOCK only for settings that change its RF tuning."""
+    return any(k in LOCK_HARDWARE_KEYS for k in keys)
 
 
 # Coarse Nyquist tile (~26 MHz at 35 Msps). Cluster extras are
 # injected only around a coarse hit. Default spacing is 8 MHz.
-SWEEP_CLUSTER_STEP_DEFAULT_MHZ = 8.0
-SWEEP_HIT_TOL_HZ = 14.0e6
-SWEEP_HIT_SEE_HZ = 20.0e6
+SWEEP_CLUSTER_STEP_DEFAULT_MHZ = 4.0
+SWEEP_HIT_TOL_HZ = 18.0e6
+SWEEP_HIT_SEE_HZ = 28.0e6
 SWEEP_DENSE_RADIUS_HZ = 20.0e6
 SWEEP_DENSE_ALIGN_HZ = 2.0e6
 
@@ -222,19 +279,18 @@ def cluster_step_hz(scan: dict[str, Any]) -> float | None:
 
 def sweep_step_hz(scan: dict[str, Any], *, cluster: bool = False) -> float:
     fs = float(scan.get("sample_rate") or 0)
-    ch_bw = float(scan.get("channel_bw_hz") or 20e6)
-    step = float(scan.get("step_hz") or 0)
-    if step > 0:
-        return step
-    if fs <= 0:
-        return 0.0
-    tile = max(fs * 0.25, fs * 0.9 - ch_bw / 2)
+    usable = fs * USABLE_SPAN_FRACTION if fs > 0 else None
+    coarse = requested_sweep_step_hz(scan, usable_span_hz=usable)
+    # A configured step is a request, not permission to leave holes.  Clamp
+    # it to the transition-safe source span instead of raising USB rate.
+    if usable is not None:
+        coarse = min(coarse, usable)
     if not cluster:
-        return tile
+        return coarse
     wanted = cluster_step_hz(scan)
     if wanted is None:
-        return tile
-    return min(tile, wanted)
+        return coarse
+    return wanted
 
 
 def _unique_hz(points: Iterable[float], tol_hz: float = 1.0e6) -> list[float]:
@@ -314,16 +370,15 @@ def extras_for_hit(
     *,
     priority_bands: Iterable[Any] | None = None,
 ) -> list[float]:
-    """Cluster extras when a coarse dwell sees a nearby blob. off → []."""
+    """Frequency-agnostic dense extras around any nearby occupied region."""
     if cluster_step_hz(scan) is None:
         return []
     see = float(scan.get("cluster_see_hz") or SWEEP_HIT_SEE_HZ)
     if abs(float(peak_hz) - float(dwell_hz)) > see:
         return []
-    band = cluster_containing(peak_hz, priority_bands)
-    if band is None:
-        return []
-    extras = densify_around(peak_hz, scan, band=band)
+    # Operational lock frequencies change every session.  Named catalogue
+    # bands remain useful UI metadata, but must never gate RF follow-up.
+    extras = densify_around(peak_hz, scan, band=None)
     return [hz for hz in extras if abs(hz - float(dwell_hz)) >= 1.0e6]
 
 
@@ -346,18 +401,26 @@ def sweep_centers(
     step = sweep_step_hz(scan)
     if fs <= 0 or step <= 0 or stop <= start:
         return []
-    pts = [float(p) for p in np.arange(start + fs / 2, stop, step)]
-    return _unique_hz(pts)
+    usable = fs * USABLE_SPAN_FRACTION
+    first = start + usable / 2.0
+    last = stop - usable / 2.0
+    if last < first:
+        return [(start + stop) / 2.0]
+    pts = [float(p) for p in np.arange(first, last + 1.0, step)]
+    # Cover the upper endpoint even when arange's final tile falls short.
+    if not pts or pts[-1] + usable / 2.0 < stop - 1.0:
+        pts.append(last)
+    out = _unique_hz(pts)
+    if out and out[-1] + usable / 2.0 < stop - 1.0:
+        if last - out[-1] < 1.0e6:
+            out[-1] = last
+        else:
+            out.append(last)
+    return out
 
 
 def coarse_sweep_len(scan: dict[str, Any]) -> int:
-    fs = float(scan.get("sample_rate") or 0)
-    start = float(scan.get("start_hz") or 0)
-    stop = float(scan.get("stop_hz") or 0)
-    step = sweep_step_hz(scan)
-    if fs <= 0 or step <= 0 or stop <= start:
-        return 0
-    return int(np.arange(start + fs / 2, stop, step).size)
+    return len(sweep_centers(scan))
 
 
 def nearest_sweep_hz(centers: Iterable[float], freq_hz: float) -> float | None:

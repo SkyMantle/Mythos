@@ -36,6 +36,7 @@ class AppliedParams:
     pending_keys: list[str] = field(default_factory=list)
     pending_reasons: dict[str, str] = field(default_factory=dict)
     affects: dict[str, str] = field(default_factory=dict)
+    transaction_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -44,6 +45,7 @@ class AppliedParams:
             "pending_keys": self.pending_keys,
             "pending_reasons": self.pending_reasons,
             "affects": self.affects,
+            "transaction_id": self.transaction_id,
         }
 
     @classmethod
@@ -54,6 +56,7 @@ class AppliedParams:
             pending_keys=list(data.get("pending_keys") or []),
             pending_reasons=dict(data.get("pending_reasons") or {}),
             affects=dict(data.get("affects") or {}),
+            transaction_id=data.get("transaction_id"),
         )
 
 

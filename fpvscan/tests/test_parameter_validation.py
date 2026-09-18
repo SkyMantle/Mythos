@@ -4,7 +4,10 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
+from fpvscan.app.bootstrap import attach_test_api
 from fpvscan.app.domain.exceptions import ValidationError
 from fpvscan.app.services.catalog import build_catalog, coerce_param
 from fpvscan.app.services.catalog_tasks import LOCK_TASKS, SWEEP_TASKS
@@ -49,11 +52,17 @@ def test_catalog_from_real_config_has_sweep_and_lock() -> None:
     assert grid.task == "scan_grid"
     assert grid.type == "enum"
     assert grid.affects == "grid"
-    assert grid.default == "8"
+    assert grid.default == "4"
     filt = next(s for s in specs if s.key == "scan.hit_filter")
     assert filt.task == "hit_filter"
     assert filt.affects == "detections"
-    assert filt.default == "hide_weak"
+    assert filt.default == "all"
+    mode = next(s for s in specs if s.key == "scan.threshold_mode")
+    assert mode.type == "enum"
+    assert mode.default == "auto"
+    assert mode.affects == "spectrum"
+    off = next(s for s in specs if s.key == "scan.threshold_offset_db")
+    assert off.default == 1.2
     afc = next(s for s in specs if s.key == "video.afc")
     assert afc.task == "picture_jump"
     assert afc.modes == ["lock"]
@@ -208,17 +217,22 @@ def test_lock_apply_refreshes_picture_knobs(engine, store) -> None:
             "scan.start_hz": 500e6,
         })
         assert "video.sample_rate" in result.applied_keys
-        assert "video.sample_rate" not in result.pending_keys
+        assert "video.sample_rate" in result.pending_keys
+        assert result.pending_reasons["video.sample_rate"] == (
+            "request recorded; session source rate remains shared"
+        )
         assert "scan.start_hz" in result.pending_keys
         assert result.pending_reasons["scan.start_hz"] == "next sweep plan"
         assert result.affects["video.sharpen"] == "picture"
         assert result.affects["scan.start_hz"] == "grid"
-        assert ("refresh_lock", {}) in engine.commands
+        assert ("refresh_lock", {}) not in engine.commands
         engine.commands.clear()
         engine._snap["mode"] = "SWEEP"
         swept = await svc.apply_parameters(uuid4(), {"video.sample_rate": 20e6})
         assert "video.sample_rate" in swept.pending_keys
-        assert swept.pending_reasons["video.sample_rate"] == "next lock retune"
+        assert swept.pending_reasons["video.sample_rate"] == (
+            "request recorded; session source rate remains shared"
+        )
         assert ("refresh_lock", {}) not in engine.commands
 
     import asyncio
@@ -234,6 +248,108 @@ def test_apply_h_pll_live_on_lock(engine, store) -> None:
         assert result.affects["video.h_pll"] == "picture"
         assert "video.h_pll" not in result.pending_keys
         assert ("refresh_lock", {}) not in engine.commands
+
+    import asyncio
+    asyncio.run(run())
+
+
+def test_decoder_only_put_does_not_refresh_reader(engine, store) -> None:
+    svc = ParameterService(engine, store)
+
+    async def run() -> None:
+        result = await svc.apply_parameters(uuid4(), {
+            "video.capture_ms": 80,
+            "video.sharpen": 0.7,
+            "video.average": 3,
+        })
+        assert not result.pending_keys
+        assert ("refresh_lock", {}) not in engine.commands
+
+    import asyncio
+    asyncio.run(run())
+
+
+def test_legacy_video_rate_put_does_not_refresh_reader(engine, store) -> None:
+    svc = ParameterService(engine, store)
+
+    async def run() -> None:
+        await svc.apply_parameters(uuid4(), {"video.sample_rate": 25e6})
+        assert ("refresh_lock", {}) not in engine.commands
+
+    import asyncio
+    asyncio.run(run())
+
+
+def test_scan_plan_put_while_locked_does_not_relock_or_touch_source(
+        engine, store) -> None:
+    class Source:
+        def __getattr__(self, name):
+            if name.startswith("set_"):
+                raise AssertionError(f"scan plan called SDR method {name}")
+            raise AttributeError(name)
+
+    engine.src = Source()
+    engine._snap.update({
+        "engine_alive": True,
+        "sdr_state": "OK",
+        "sdr_restarts": 0,
+        "reader_restarts": 0,
+    })
+    before = {
+        "mode": engine._snap["mode"],
+        "lock_target": engine._snap["lock_target"],
+        "source": engine._snap["source"],
+    }
+    svc = ParameterService(engine, store)
+
+    async def run() -> None:
+        tx = uuid4()
+        result = await svc.apply_parameters(tx, {
+            "scan.start_hz": 450e6,
+            "scan.stop_hz": 5.5e9,
+            "scan.channel_bw_hz": 12e6,
+        })
+        assert result.transaction_id == str(tx)
+        assert set(result.applied_keys) == {
+            "scan.start_hz", "scan.stop_hz", "scan.channel_bw_hz",
+        }
+        assert ("refresh_lock", {}) not in engine.commands
+        assert {
+            "mode": engine._snap["mode"],
+            "lock_target": engine._snap["lock_target"],
+            "source": engine._snap["source"],
+        } == before
+        app = FastAPI()
+        attach_test_api(app, engine, store=store)
+        health = TestClient(app).get("/api/health")
+        assert health.status_code == 200
+        assert health.json()["sdr_state"] == "OK"
+        snap = engine.snapshot()
+        assert snap["sdr_restarts"] == 0
+        assert snap["reader_restarts"] == 0
+
+    import asyncio
+    asyncio.run(run())
+
+
+def test_overlapping_parameter_transactions_keep_ack_keys_and_ids(
+        engine, store) -> None:
+    svc = ParameterService(engine, store)
+
+    async def run() -> None:
+        scan_tx = uuid4()
+        hardware_tx = uuid4()
+        scan_result, hardware_result = await asyncio.gather(
+            svc.apply_parameters(scan_tx, {"scan.start_hz": 475e6}),
+            svc.apply_parameters(hardware_tx, {"video.sample_rate": 25e6}),
+        )
+        assert scan_result.transaction_id == str(scan_tx)
+        assert scan_result.applied_keys == ["scan.start_hz"]
+        assert scan_result.pending_keys == ["scan.start_hz"]
+        assert hardware_result.transaction_id == str(hardware_tx)
+        assert hardware_result.applied_keys == ["video.sample_rate"]
+        assert hardware_result.pending_keys == ["video.sample_rate"]
+        assert engine.commands.count(("refresh_lock", {})) == 0
 
     import asyncio
     asyncio.run(run())

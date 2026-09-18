@@ -1,0 +1,11 @@
+# Nuand bladeRF USB access for group plugdev.
+# The Ubuntu `bladerf` package usually ships equivalent rules; this is a fallback.
+
+# bladeRF 1
+SUBSYSTEM=="usb", ATTR{idVendor}=="1d50", ATTR{idProduct}=="6066", MODE="0660", GROUP="plugdev", SYMLINK+="bladerf-%k"
+
+# bladeRF 2.0 micro (xA4 / xA9)
+SUBSYSTEM=="usb", ATTR{idVendor}=="2cf0", ATTR{idProduct}=="5246", MODE="0660", GROUP="plugdev", SYMLINK+="bladerf2-%k"
+
+# FX3 bootloader / recovery
+SUBSYSTEM=="usb", ATTR{idVendor}=="1d50", ATTR{idProduct}=="6080", MODE="0660", GROUP="plugdev", SYMLINK+="bladerf-recovery-%k"

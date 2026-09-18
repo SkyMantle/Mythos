@@ -22,9 +22,9 @@ PRIORITY_BANDS = [
     Band("433",     420 * MHz,   470 * MHz,   10 * MHz),
     Band("900",     840 * MHz,   960 * MHz,   14 * MHz),
     Band("1G2",    1040 * MHz,  1400 * MHz,   18 * MHz),
-    Band("2G4",    2300 * MHz,  2550 * MHz,   20 * MHz),
-    Band("3G3",    3100 * MHz,  4000 * MHz,   20 * MHz),
-    Band("5G8",    4900 * MHz,  6000 * MHz,   27 * MHz),
+    Band("2G4",    2200 * MHz,  2600 * MHz,   20 * MHz),
+    Band("3G3",    3000 * MHz,  4100 * MHz,   20 * MHz),
+    Band("5G8",    4800 * MHz,  6050 * MHz,   27 * MHz),
 ]
 
 # Класична сітка 5.8 ГГц (A/B/E/F/R), для прив'язки знахідки до каналу.

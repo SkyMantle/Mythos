@@ -54,6 +54,7 @@ class ApplyParametersRequest(BaseModel):
 
 
 class ApplyParametersResponse(BaseModel):
+    transaction_id: UUID | None = None
     values: dict[str, Any]
     applied_keys: list[str]
     pending_keys: list[str] = Field(default_factory=list)
@@ -63,6 +64,7 @@ class ApplyParametersResponse(BaseModel):
     @classmethod
     def from_domain(cls, result: AppliedParams) -> ApplyParametersResponse:
         return cls(
+            transaction_id=result.transaction_id,
             values=result.values,
             applied_keys=result.applied_keys,
             pending_keys=result.pending_keys,

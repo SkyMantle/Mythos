@@ -72,11 +72,11 @@ def test_put_params_update_live_spectrum_metadata(engine, store) -> None:
             "sdr.gain_db": 40,
         })
         assert "video.channel_bw_hz" in applied.applied_keys
-        assert "video.sample_rate" not in applied.pending_keys
+        assert "video.sample_rate" in applied.pending_keys
         assert applied.affects["video.sample_rate"] == "picture"
         assert applied.affects["scan.start_hz"] == "grid"
         assert "sdr.gain_db" not in applied.pending_keys
-        assert ("refresh_lock", {}) in engine.commands
+        assert ("refresh_lock", {}) not in engine.commands
         live = await live_svc.live_context()
         assert live["spectrum"]["bw_hz"] == 8e6
         assert live["spectrum"]["span_hz"] == 25e6

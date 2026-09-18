@@ -28,10 +28,11 @@ def coalesce_ws_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def enqueue_live_event(q, ev: dict[str, Any]) -> None:
-    """Put an event; if the queue is full, keep the latest frame and spectrum.
+    """Put an event while only coalescing frame/spectrum traffic.
 
-    Frames used to evict old items; spectrum was discarded. During LOCK that
-    muted FFT updates whenever video filled the queue (record makes it worse).
+    State, notice, catalog, and detection events retain their insertion order.
+    Normal Engine video uses a separate latest-only publisher, but frame
+    handling remains here for compatibility with small standalone producers.
     """
     try:
         q.put_nowait(ev)
@@ -44,11 +45,20 @@ def enqueue_live_event(q, ev: dict[str, Any]) -> None:
             dumped.append(q.get_nowait())
     except Empty:
         pass
-    dumped.append(ev)
-    coalesced = coalesce_ws_events(dumped)
-    live = [e for e in coalesced if e.get("type") in ("spectrum", "frame")]
-    others = [e for e in coalesced if e.get("type") not in ("spectrum", "frame")]
-    for item in live + others[-8:]:
+    kind = ev.get("type")
+    live_kind = kind in ("spectrum", "frame")
+    reliable = [
+        item for item in dumped
+        if item.get("type") not in ("spectrum", "frame")
+    ]
+    live = coalesce_ws_events([
+        item for item in dumped
+        if item.get("type") in ("spectrum", "frame")
+    ] + ([ev] if live_kind else []))
+    # Reliable events go back first and in their original order.  The incoming
+    # reliable event is never displaced by high-rate live data.
+    restore = reliable + ([] if live_kind else [ev]) + live
+    for item in restore:
         try:
             q.put_nowait(item)
         except (Full, Exception):

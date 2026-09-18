@@ -58,10 +58,22 @@ class EngineAdapter:
                 sdr = self._engine.cfg.get("sdr")
                 if isinstance(sdr, dict):
                     sdr["auto_gain"] = False
+        if any(key in values for key in (
+            "scan.sample_rate", "video.sample_rate", "scan.step_hz",
+            "scan.channel_bw_hz", "video.channel_bw_hz", "sdr.sample_rate",
+        )):
+            note_rates = getattr(
+                self._engine, "note_rate_parameter_values", None,
+            )
+            if note_rates:
+                note_rates(values)
         if any(k in values for k in ("sdr.gain_db", "sdr.bias_tee_gain_offset_db")):
             apply_bt = getattr(self._engine, "_apply_bias_tee_gain", None)
             try:
-                if apply_bt:
+                worker_alive = getattr(self._engine, "worker_alive", lambda: False)
+                if worker_alive():
+                    self._engine.command("gain")
+                elif apply_bt:
                     apply_bt(bool(self._engine.cfg.get("sdr", {}).get("bias_tee", False)))
                 elif hasattr(self._engine.src, "set_gain"):
                     self._engine.src.set_gain(float(

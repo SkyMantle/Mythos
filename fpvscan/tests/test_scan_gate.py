@@ -19,6 +19,7 @@ from fpvscan.scan_gate import (
     inspect_bw_hz,
     inspect_ms,
     inspect_soft_ok,
+    inspect_wall_s,
     should_full_inspect,
 )
 from fpvscan.scan_view import cluster_containing, extras_for_hit, nearest_sweep_hz
@@ -59,6 +60,18 @@ def test_4988_in_5g8_cluster() -> None:
     assert inspect_ms(SCAN, 4988e6) == INSPECT_MS_5G8
     assert inspect_bw_hz(SCAN, 1280e6) == INSPECT_BW_HZ
     assert inspect_ms(SCAN, 1280e6) == INSPECT_MS
+    assert inspect_ms({**SCAN, "inspect_ms": 90_000}, 1280e6) == 200.0
+    assert inspect_ms({**SCAN, "inspect_ms": 0}, 1280e6) == INSPECT_MS
+    assert inspect_ms({**SCAN, "inspect_ms": 20}, 1.1e9) == INSPECT_MS
+    assert inspect_ms({**SCAN, "inspect_ms_5g8": 20}, 5.1e9) == INSPECT_MS_5G8
+    assert inspect_wall_s(None) == 0.35
+    assert inspect_wall_s({"inspect_wall_s": 9}) == 2.0
+    assert inspect_wall_s({"inspect_wall_s": 0.01}) == 0.05
+    dense = extras_for_hit(4988e6, 4988e6, {**SCAN, "cluster_step_mhz": "4"})
+    assert dense
+    assert min(dense) >= 4960e6
+    assert max(dense) <= 5016e6
+    assert not any(hz < 4920e6 for hz in dense)
 
 
 def test_extras_for_hit_2412_nonempty() -> None:
@@ -95,13 +108,19 @@ def test_inspect_skipped_for_far_wide_digital_blob() -> None:
     )
     assert far is False
     near = should_full_inspect(
-        dwell_hz=3489e6, center_hz=3491e6, bandwidth_hz=10e6, snr_db=18.0,
-        from_extra=False, scan=scan,
+        dwell_hz=1.1e9, center_hz=1.102e9, bandwidth_hz=10e6, snr_db=18.0,
+        from_extra=False, scan=scan, line_hint=True,
     )
     assert near is True
+    near_no_comb = should_full_inspect(
+        dwell_hz=1.1e9, center_hz=1.102e9, bandwidth_hz=10e6, snr_db=18.0,
+        from_extra=False, scan=scan, line_hint=False,
+    )
+    assert near_no_comb is False
     extra_no_comb = should_full_inspect(
         dwell_hz=2412e6, center_hz=2430e6, bandwidth_hz=10e6, snr_db=16.0,
-        from_extra=True, scan=scan, line_hint=False,
+        from_extra=True, scan={**scan, "inspect_extras_need_comb": True},
+        line_hint=False,
     )
     assert extra_no_comb is False
     extra_comb = should_full_inspect(
@@ -110,25 +129,24 @@ def test_inspect_skipped_for_far_wide_digital_blob() -> None:
     )
     assert extra_comb is True
     narrow_near = should_full_inspect(
-        dwell_hz=3489e6, center_hz=3491e6, bandwidth_hz=3.1e6, snr_db=12.0,
-        from_extra=False, scan=scan,
+        dwell_hz=1.1e9, center_hz=1.102e9, bandwidth_hz=3.1e6, snr_db=12.0,
+        from_extra=False, scan=scan, line_hint=True,
     )
     assert narrow_near is True
 
 
-def test_inspect_near_is_14mhz() -> None:
-    dwell = 4988e6
+def test_inspect_near_is_18mhz() -> None:
     near = should_full_inspect(
-        dwell_hz=dwell, center_hz=dwell + 13e6, bandwidth_hz=10e6, snr_db=18.0,
-        from_extra=False, scan=SCAN,
+        dwell_hz=5.1e9, center_hz=5.1e9 + 17e6, bandwidth_hz=10e6, snr_db=18.0,
+        from_extra=False, scan=SCAN, line_hint=True,
     )
     far = should_full_inspect(
-        dwell_hz=dwell, center_hz=dwell + 15e6, bandwidth_hz=10e6, snr_db=18.0,
-        from_extra=False, scan=SCAN,
+        dwell_hz=5.1e9, center_hz=5.1e9 + 19e6, bandwidth_hz=10e6, snr_db=18.0,
+        from_extra=False, scan=SCAN, line_hint=True,
     )
     assert near is True
     assert far is False
-    assert HIT_TOL_HZ == 14.0e6
+    assert HIT_TOL_HZ == 18.0e6
 
 
 def test_pal_wide_bw_not_rejected_by_5018_rule() -> None:
@@ -151,10 +169,11 @@ def test_extra_without_line_comb_skips_full_inspect() -> None:
     pal = np.sin(2 * np.pi * LINE_PAL * t).astype(np.float32)
     noise = np.random.default_rng(0).normal(0, 1, 2048).astype(np.float32)
     assert line_comb_hint(pal, fs) is True
-    assert line_comb_hint(noise, fs) is False
+    assert line_comb_hint(noise, fs, min_prominence_db=6.0) is False
     skip = should_full_inspect(
         dwell_hz=5800e6, center_hz=5808e6, bandwidth_hz=10e6, snr_db=18.0,
-        from_extra=True, scan=SCAN, line_hint=line_comb_hint(noise, fs),
+        from_extra=True, scan={**SCAN, "inspect_extras_need_comb": True},
+        line_hint=False,
     )
     assert skip is False
     go = should_full_inspect(
@@ -171,3 +190,115 @@ def test_auto_peek_skipped_when_pic_score_zero() -> None:
     assert auto_peek_allowed(frame, SCAN) is True
     locked = SimpleNamespace(confidence=0.85, pic_score=0.0, pic_locked=True)
     assert auto_peek_allowed(locked, SCAN) is True
+
+
+def test_auto_peek_needs_8db_stable_analog_not_distant_2db_comb() -> None:
+    from fpvscan.scan_gate import STABLE_ANALOG_PROMINENCE_DB
+
+    weak = SimpleNamespace(
+        confidence=0.2,
+        pic_score=0.0,
+        pic_locked=False,
+        analog_evidence=True,
+        inspect_votes=2,
+        prominence_db=3.0,
+    )
+    assert auto_peek_allowed(weak, SCAN) is False
+    strong = SimpleNamespace(
+        confidence=0.2,
+        pic_score=0.0,
+        pic_locked=False,
+        analog_evidence=True,
+        inspect_votes=2,
+        prominence_db=STABLE_ANALOG_PROMINENCE_DB,
+    )
+    assert auto_peek_allowed(strong, SCAN) is True
+
+
+def test_energy_hit_lists_weak_3g3_without_pal() -> None:
+    from fpvscan.scan_gate import energy_hit_ok
+
+    scan = {**SCAN, "accept_energy": True, "energy_min_snr_db": 3.0}
+    weak = energy_hit_ok(
+        dwell_hz=3472e6, center_hz=3472.7e6, bandwidth_hz=8e6, snr_db=6.0,
+        scan=scan,
+    )
+    assert weak is True
+    off = energy_hit_ok(
+        dwell_hz=800e6, center_hz=820e6, bandwidth_hz=12e6, snr_db=20.0,
+        scan=scan,
+    )
+    assert off is False
+    disabled = energy_hit_ok(
+        dwell_hz=3472e6, center_hz=3472.7e6, bandwidth_hz=8e6, snr_db=6.0,
+        scan=SCAN,
+    )
+    assert disabled is False
+
+
+def test_energy_hits_are_off_without_explicit_accept() -> None:
+    from fpvscan.scan_gate import energy_hit_ok
+
+    assert energy_hit_ok(
+        dwell_hz=1.1e9, center_hz=1.1e9, bandwidth_hz=8e6, snr_db=20.0,
+        scan={},
+    ) is False
+
+
+def test_narrow_weak_blob_inspects_when_snr_floor_lowered() -> None:
+    scan = {**SCAN, "inspect_min_snr_db": 3.0}
+    go = should_full_inspect(
+        dwell_hz=1.1e9, center_hz=1.101e9, bandwidth_hz=3.1e6, snr_db=4.0,
+        from_extra=False, scan=scan, line_hint=True,
+    )
+    assert go is True
+    blocked = should_full_inspect(
+        dwell_hz=3472e6, center_hz=3473e6, bandwidth_hz=3.1e6, snr_db=4.0,
+        from_extra=False, scan={**SCAN, "inspect_min_snr_db": 8.0},
+    )
+    assert blocked is False
+
+
+def test_energy_hit_live_offset_does_not_drop_cfar_blob() -> None:
+    from fpvscan.scan_gate import energy_hit_ok
+
+    scan = {**SCAN, "accept_energy": True, "energy_min_snr_db": 1.5}
+    dropped = energy_hit_ok(
+        dwell_hz=3472e6, center_hz=3472.7e6, bandwidth_hz=8e6, snr_db=1.3,
+        scan=scan,
+    )
+    assert dropped is False
+    kept = energy_hit_ok(
+        dwell_hz=3472e6, center_hz=3472.7e6, bandwidth_hz=8e6, snr_db=1.3,
+        scan=scan, offset_db=1.2,
+    )
+    assert kept is True
+
+
+def test_extras_inspect_without_comb_when_configured() -> None:
+    scan = {**SCAN, "inspect_extras_need_comb": False}
+    go = should_full_inspect(
+        dwell_hz=1.1e9, center_hz=1.108e9, bandwidth_hz=10e6, snr_db=6.0,
+        from_extra=True, scan=scan, line_hint=False,
+    )
+    assert go is True
+
+
+def test_sweep_comb_pass_is_at_least_twice_as_fast_as_inspect_storm() -> None:
+    from fpvscan.engine import SWEEP_AVERAGES_MAX, SWEEP_COMB_S
+    from fpvscan.scan_view import coarse_sweep_len
+
+    scan = {
+        "start_hz": 400e6,
+        "stop_hz": 6000e6,
+        "sample_rate": 20e6,
+        "step_hz": 12e6,
+        "channel_bw_hz": 16e6,
+    }
+    n = coarse_sweep_len(scan)
+    assert 400 <= n <= 500
+    assert SWEEP_AVERAGES_MAX == 8
+    assert 0.018 <= SWEEP_COMB_S <= 0.025
+    before_s = n * 0.70
+    after_s = n * (SWEEP_COMB_S + 0.012)
+    assert after_s * 2.0 <= before_s

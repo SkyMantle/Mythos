@@ -10,3 +10,9 @@ fpvscan/scripts/decoded.png
 
 # Generated runtime output
 fpvscan/out/
+
+# Pi 5 installer artifacts (wheels + tar.gz + deb)
+fpvscan/dist/
+
+# Cursor loop-guard runtime (per-conversation JSON / JSONL)
+.cursor/hooks/state/

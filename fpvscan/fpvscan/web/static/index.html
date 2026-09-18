@@ -5,7 +5,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>МІФ · скан</title>
-  <link rel="stylesheet" href="/static/css/console.css?v=16">
+  <link rel="stylesheet" href="/static/css/console.css?v=23">
 </head>
 
 <body>
@@ -100,8 +100,8 @@
           </svg>
           <span class="sr-only">фільтр</span>
           <select id="sel-hit-filter" aria-label="Фільтр знахідок">
-            <option value="all">усі</option>
-            <option value="hide_weak" selected>слабкі</option>
+            <option value="all" selected>усі</option>
+            <option value="hide_weak">слабкі</option>
             <option value="hide_no_video">без відео</option>
             <option value="hide_near_dup">сусіди</option>
           </select>
@@ -191,6 +191,30 @@
                 </svg>
               </button>
             </div>
+            <label class="fft-span" for="spec-span">
+              <span>шкала</span>
+              <input id="spec-span" type="range" min="15" max="80" step="1" value="45" aria-label="Шкала спектра, дБ">
+              <span class="fft-span-val"><span id="spec-span-num">45</span> дБ</span>
+            </label>
+            <div class="rotator" id="rotator-box" hidden>
+              <div class="rotator-head">
+                <span>азимут</span>
+                <span class="fft-span-val"><span id="rot-az-num">90</span>°</span>
+              </div>
+              <div class="rotator-steps" role="group" aria-label="Крок азимута">
+                <button type="button" id="b-rot-left" title="90° ліворуч">−90°</button>
+                <button type="button" id="b-rot-nudge-left" title="1° ліворуч">−1°</button>
+                <button type="button" id="b-rot-center" title="центр, 90° від лівого упору">90°</button>
+                <button type="button" id="b-rot-nudge-right" title="1° праворуч">+1°</button>
+                <button type="button" id="b-rot-right" title="90° праворуч">+90°</button>
+              </div>
+              <label class="fft-span rotator-span" for="rot-az">
+                <span id="rot-az-min">0</span>
+                <input id="rot-az" type="range" min="0" max="180" step="1" value="90" aria-label="Азимут антени від лівого упору, градуси">
+                <span id="rot-az-max">180</span>
+              </label>
+              <p class="rotator-meta" id="rotator-meta">ціль 90° · центр</p>
+            </div>
             <p class="fft-lock-ms" id="fft-lock-ms" hidden></p>
           </div>
         </aside>
@@ -217,11 +241,12 @@
           <kbd>2</kbd> скан ·
           <kbd>F2</kbd> панель
         </p>
+        <div id="param-test" class="param-test"></div>
       </div>
     </div>
   </aside>
 
-  <script type="module" src="/static/js/app.js?v=22"></script>
+  <script type="module" src="/static/js/app.js?v=37"></script>
 </body>
 
 </html>

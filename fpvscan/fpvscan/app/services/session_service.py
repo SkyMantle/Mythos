@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 from uuid import UUID, uuid4
@@ -48,6 +49,10 @@ class SessionService:
         if schema is None:
             raise NotFoundError(f"observation schema {schema_id} not found")
         now = utc_now_iso()
+        params = parameter_snapshot
+        if params is None:
+            params = await asyncio.to_thread(
+                lambda: catalog_values(self._engine.current_cfg()))
         session = Session(
             id=str(uuid4()),
             title=(title or "").strip() or f"{mode} session",
@@ -56,7 +61,7 @@ class SessionService:
             notes="",
             schema_id=schema.id,
             schema_snapshot=list(schema.fields),
-            parameter_snapshot=parameter_snapshot or catalog_values(self._engine.current_cfg()),
+            parameter_snapshot=params,
             created_at=now,
             updated_at=now,
         )

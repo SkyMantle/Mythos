@@ -100,11 +100,13 @@ def test_parameter_and_session_http_contract() -> None:
     assert current.status_code == 200
     assert "scan.threshold_db" in current.json()["values"]
 
+    parameter_tx = uuid4()
     applied = client.put("/api/test/parameters", json={
-        "idempotency_key": str(uuid4()),
+        "idempotency_key": str(parameter_tx),
         "values": {"scan.threshold_db": 6.5},
     })
     assert applied.status_code == 200
+    assert applied.json()["transaction_id"] == str(parameter_tx)
     assert applied.json()["values"]["scan.threshold_db"] == 6.5
 
     pll = client.put("/api/test/parameters", json={

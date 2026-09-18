@@ -75,7 +75,8 @@ def shift(iq: np.ndarray, offset_hz: float, fs: float) -> np.ndarray:
 
 
 def channelize(iq: np.ndarray, fs: float, offset_hz: float,
-            out_bw_hz: float, fast: bool = True) -> tuple[np.ndarray, float]:
+            out_bw_hz: float, fast: bool = True, *,
+            decimation: int | None = None) -> tuple[np.ndarray, float]:
     """Зсув на нуль + децимація до потрібної смуги. Повертає (iq, fs_нов).
 
     Швидкий шлях — прямокутне усереднення через reshape+sum замість
@@ -85,7 +86,13 @@ def channelize(iq: np.ndarray, fs: float, offset_hz: float,
     для ЧМ-відео цього досить, а коштує воно на порядок дешевше.
     """
     x = shift(iq, offset_hz, fs)
-    dec = max(1, int(fs / out_bw_hz))
+    # Adaptive LOCK passes an explicit integer factor.  Legacy sweep/inspect
+    # callers retain the historical bandwidth-derived behavior.
+    dec = (
+        max(1, int(decimation))
+        if decimation is not None
+        else max(1, int(fs / out_bw_hz))
+    )
     if dec == 1:
         if x.dtype != np.complex64:
             x = x.astype(np.complex64)
@@ -256,7 +263,8 @@ def _decimate_for_line(base: np.ndarray, fs: float) -> tuple[np.ndarray, float]:
     return x, fs / dec
 
 
-def _line_comb_spectrum(x: np.ndarray, fs2: float) -> _LineComb | None:
+def _line_comb_spectrum(x: np.ndarray, fs2: float,
+                        harm_db: float = 3.0) -> _LineComb | None:
     """Пік 15.0–16.2 кГц, підйом над фоном, 2–3 гармоніки."""
     x = x - x.mean()
     nfft = 1 << int(np.floor(np.log2(len(x))))
@@ -283,18 +291,19 @@ def _line_comb_spectrum(x: np.ndarray, fs2: float) -> _LineComb | None:
             break
         hi = int(hf / (fs2 / nfft))
         win = sp[max(0, hi - 3):hi + 4]
-        if len(win) and 10 * np.log10(win.max() / bg) > 6:
+        if len(win) and 10 * np.log10(win.max() / bg) > harm_db:
             harm += 1
     return _LineComb(peak_f, prominence_db, harm)
 
 
 def line_comb_hint(base: np.ndarray, fs: float,
-                   min_prominence_db: float = 6.0) -> bool:
+                   min_prominence_db: float = 2.0,
+                   harm_db: float = 3.0) -> bool:
     """Cheap 15.7 kHz comb on a short extra-dwell buffer. Not full classify."""
     x, fs2 = _decimate_for_line(base, fs)
     if len(x) < 256:
         return False
-    comb = _line_comb_spectrum(x, fs2)
+    comb = _line_comb_spectrum(x, fs2, harm_db=harm_db)
     if comb is None:
         return False
     return bool(comb.prominence_db >= min_prominence_db)
@@ -302,9 +311,10 @@ def line_comb_hint(base: np.ndarray, fs: float,
 
 def classify_video(base: np.ndarray, fs: float,
                 tol_hz: float = 150.0,
-                min_prominence_db: float = 8.0,
-                min_conf: float = 0.45,
-                min_harmonics: int = 1) -> VideoScore:
+                min_prominence_db: float = 2.0,
+                min_conf: float = 0.0,
+                min_harmonics: int = 0,
+                harm_db: float = 3.0) -> VideoScore:
     """Шукає рядкову лінію в спектрі демодульованого сигналу."""
     # Досить смуги до ~200 кГц — рядкова та кілька її гармонік.
     # Просте прорідження тут неприпустиме: воно завернуло б увесь
@@ -314,7 +324,7 @@ def classify_video(base: np.ndarray, fs: float,
     if len(x) < 8192:      # менше ~20 мс ефіру — рядкову не виміряти
         return VideoScore(False, 0.0, "?", 0.0, reason="закороткий буфер")
 
-    comb = _line_comb_spectrum(x, fs2)
+    comb = _line_comb_spectrum(x, fs2, harm_db=harm_db)
     if comb is None:
         return VideoScore(False, 0.0, "?", 0.0, reason="нема лінії 15–16 кГц")
     peak_f = comb.peak_f
@@ -328,13 +338,13 @@ def classify_video(base: np.ndarray, fs: float,
     if std == "?":
         conf *= 0.5        # знижуємо, але не відкидаємо: буває нестандарт
 
-    # Гармоніки обов'язкові: одиночний пік дає будь-яка вузька завада,
-    # а гребінець із кратних частот — тільки рядкова розгортка.
+    # Гармоніки обов'язкові лише якщо min_harmonics>0: одиночний пік
+    # на далекому аналозі часто єдине, що лишилось від гребінця.
     if harm < min_harmonics:
         return VideoScore(False, peak_f, std, round(conf, 2),
                           round(prominence_db, 1), harm,
                           f"гармонік {harm} < {min_harmonics}")
-    if conf <= min_conf:
+    if conf < min_conf:
         return VideoScore(False, peak_f, std, round(conf, 2),
                           round(prominence_db, 1), harm,
                           f"впевненість {conf:.2f}: підйом {prominence_db:.1f} дБ, "

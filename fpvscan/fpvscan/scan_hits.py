@@ -4,14 +4,14 @@ from __future__ import annotations
 from typing import Any, Iterable
 
 HIT_FILTERS = ("all", "hide_weak", "hide_no_video", "hide_near_dup")
-HIT_FILTER_DEFAULT = "hide_weak"
+HIT_FILTER_DEFAULT = "all"
 NEAR_DUP_HZ = 8.0e6
-WEAK_REL_DB = 12.0
-WEAK_ABS_DB = 8.0
+WEAK_REL_DB = 18.0
+WEAK_ABS_DB = 3.0
 NO_VIDEO_SCORE = 0.12
 KEEP_PIC_SCORE = 0.20
-INSPECT_MIN_ROW_CORR = 0.12
-MIN_RASTER_LINES = 80
+INSPECT_MIN_ROW_CORR = 0.04
+MIN_RASTER_LINES = 48
 VIDEO_STANDARDS = frozenset({"PAL", "NTSC"})
 FRAME_FRESH_S = 2.5
 PRUNE_SETTLE_S = 5.0
@@ -124,6 +124,48 @@ def _has_video(d: dict[str, Any]) -> bool:
 
 def analog_standard(std: Any) -> bool:
     return str(std or "").strip().upper() in VIDEO_STANDARDS
+
+
+def merge_standard(
+    old_std: Any,
+    new_std: Any,
+    *,
+    old_pic: float = 0.0,
+    new_pic: float = 0.0,
+) -> str:
+    """PAL/NTSC survives energy ``?`` even when both pic_scores are 0."""
+    old = str(old_std or "")
+    new = str(new_std or "")
+    if analog_standard(new) and analog_standard(old):
+        return new.strip().upper() if float(new_pic) > float(old_pic) else old.strip().upper()
+    if analog_standard(new):
+        return new.strip().upper()
+    if analog_standard(old):
+        return old.strip().upper()
+    return old if float(old_pic) >= float(new_pic) else new
+
+
+def promote_analog_identity(
+    *,
+    analog_evidence: bool,
+    video_confirmed: bool = False,
+    standard: str = "?",
+    other_standard: str = "",
+    stage: str = "rf_candidate",
+) -> tuple[bool, bool, str, str]:
+    """PAL/NTSC analog_evidence wins over energy ``?`` / rf_candidate."""
+    analog = bool(analog_evidence)
+    confirmed = bool(video_confirmed)
+    std = str(standard or "")
+    other = str(other_standard or "")
+    if analog_standard(other) and not analog_standard(std):
+        std = other
+    if analog and analog_standard(std):
+        label = str(std).strip().upper()
+        if confirmed:
+            return analog, confirmed, label, "video_confirmed"
+        return analog, confirmed, label, "analog_evidence"
+    return analog, confirmed, standard, stage
 
 
 def _row_corr(d: dict[str, Any]) -> float:

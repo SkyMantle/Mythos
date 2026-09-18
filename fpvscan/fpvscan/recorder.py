@@ -125,7 +125,9 @@ class VideoRecorder:
         if luma.shape != (self.height, self.width):
             luma = _resize_nearest(luma, self.height, self.width)
         with self._lock:
-            self._latest = np.ascontiguousarray(luma, dtype=np.uint8)
+            # Publisher reuses its two bounded handoff buffers.  Recorder owns
+            # this copy until the fixed-rate ffmpeg pump has consumed it.
+            self._latest = np.array(luma, dtype=np.uint8, order="C", copy=True)
 
     def _pump(self):
         period = 1.0 / self.fps

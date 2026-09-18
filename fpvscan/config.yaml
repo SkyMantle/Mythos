@@ -7,7 +7,7 @@ sdr:
   num_buffers: 32 # потік USB: більше буферів = стійкіше до зривів,
   buffer_size: 32768 # але більша затримка. buffer_size кратний 1024
   num_transfers: 16
-  gain_db: 35 # рядок gain: ручне MGC на платі 0…60. АРП (agc) окремо і для LOCK вимкнена. При Bias-T плата ріже gain на bias_tee_gain_offset_db, щоб LNA не кліпав АЦП
+  gain_db: 60 # рядок gain: ручне MGC на платі 0…60. АРП (agc) окремо і для LOCK вимкнена. При Bias-T плата ріже gain на bias_tee_gain_offset_db, поки є запас до стелі; 60 = повне MGC плати (далекі цілі). Рестарт більше не скидає на 35
   auto_gain: true # програмне MGC у LOCK: hill-climb gain_db за картинкою. Повзунок gain вимикає авто; «авто» вмикає знову. Не АРП плати і не Bias-T
   bias_tee: true # 4.5 В на RX для активної антени; тримай на рядку gain, не окремою кнопкою. Команда bias_tee + компенсація gain
   agc: false # АРП зручна для пошуку, шкідлива для декодування
@@ -20,34 +20,51 @@ scan:
   start_hz: 400.0e6
   stop_hz: 6000.0e6
   sample_rate: 35.0e6 # bladeRF A4 тягне до 61.44, але 40 стабільніше по USB
-  channel_bw_hz: 10.0e6 # очікувана ширина каналу; визначає крок свіпу
-  step_hz: 0 # 0 = грубий крок; extras лише навколо хіта в кластері
-  cluster_step_mhz: "8" # extras: off | 12 | 8 | 4 (типово 8, не килим 4)
-  hit_filter: hide_weak # список: all | hide_weak | hide_no_video | hide_near_dup
+  channel_bw_hz: 16.0e6 # очікувана ширина ЧМ-каналу ~3G3; визначає крок свіпу
+  step_hz: 12.0e6 # було 0≈23.5 МГц: полиця на краї тайла падала під поріг; 12 МГц перекриває
+  cluster_step_mhz: "4" # extras: off | 12 | 8 | 4; 4 МГц — густіше навколо хіта
+  cluster_see_hz: 28.0e6 # extras, якщо пік далі ніж 20 МГц від dwell (край тайла)
+  hit_filter: all # список: all | hide_weak | hide_no_video | hide_near_dup. hide_weak ховав далекі 5–10 дБ
   fft_size: 8192
-  averages: 8
-  threshold_db: 5.0 # наскільки сигнал має піднятись над шумовою підлогою
-  min_bw_hz: 5.0e6 # inspect: відео ~5–15 МГц; Wi-Fi цятки не публікуємо
-  fft_min_bw_hz: 2.5e6 # FFT зайнятість/extras: вузький аналог на краю тайла
-  max_bw_hz: 25.0e6 # стеля зайнятості на свіпі (ЧМ-розмазка, не весь крок)
-  inspect_ms: 40 # інші діапазони; 5G8 — inspect_ms_5g8
-  inspect_ms_5g8: 70 # ширше вікно 5.8: кадр на ЧМ-спідниці
-  inspect_bw_hz: 12.0e6 # вікно класифікації поза 5G8
-  inspect_bw_5g8_hz: 18.0e6 # 5.8: класифікація, не лише крок сітки
-  hit_tol_hz: 14.0e6 # inspect-near ≈ пів грубого кроку (~26.5 МГц)
+  averages: 8 # CFAR на 8 середніх; 16 подвоювало USB/FFT без виграшу для гребінки
+  threshold_mode: auto # auto = CFAR на кожному dwell; fixed = лише threshold_db
+  threshold_db: 1.0 # auto: мінімальний зсув; fixed: фіксований зсув над підлогою
+  threshold_offset_db: 1.2 # цільовий CFAR-зсув; 3–10 дБ полиця має пройти
+  threshold_min_db: 1.0 # стеля знизу, щоб шум не став порогом 0
+  threshold_max_db: 2.5 # стеля зверху — не повертатись до 5 дБ, що різало аналог
+  threshold_k: 0.75 # множник MAD шуму; 0 = лише offset. Не піднімає планку «бо шумно»
+  noise_percentile: 25 # підлога FFT; медіана (50) тоне в широкій ЧМ-полиці
+  edge_guard: 0.95 # частка FFT без країв ФНЧ; 0.90 ховала ~1.75 МГц з кожного боку
+  min_bw_hz: 1.5e6 # inspect: слабка полиця вужча за 2.5 МГц, бо над порогом лише верхівка
+  fft_min_bw_hz: 0.6e6 # FFT зайнятість/extras: вузький аналог на краю тайла
+  max_bw_hz: 30.0e6 # стеля зайнятості на свіпі (ЧМ-розмазка, не весь крок)
+  inspect_ms: 90 # довше вікно — рядкова 15.7 кГц на слабкому ЧМ
+  inspect_ms_5g8: 110 # ширше вікно 5.8: кадр на ЧМ-спідниці
+  inspect_bw_hz: 18.0e6 # 3G3 типово ~20 МГц; 12 МГц різало полицю
+  inspect_bw_5g8_hz: 22.0e6 # 5.8: класифікація, не лише крок сітки
+  hit_tol_hz: 18.0e6 # inspect-near: грубий крок 12 МГц + запас на зсув центру
   dc_notch_hz: 200.0e3 # ширина вирізу на нулі (витік гетеродина)
   priority_bands: false # частіше обходити 433/900/1G2/2G4/3G3/5G8
-  confirm_hits: 2
-  line_tol_hz: 150.0 # допуск рядкової частоти від номіналу PAL/NTSC
-  line_prominence_db: 10.0 # наскільки лінія має бути вища за фон
-  min_confidence: 0.45 # поріг ухвалення за рядковою лінією
-  min_harmonics: 1 # без гребінця гармонік рядок — вузька завада, не відео
+  confirm_hits: 1 # 2 = пропуск з першого проходу; інший сканер показує одразу
+  line_tol_hz: 200.0 # допуск рядкової; слабкий PAL/NTSC пливе
+  line_prominence_db: 2.0 # було 4: рядкова далекого аналога ~2–6 дБ, не 10
+  line_harm_db: 3.0 # поріг 2-ї/3-ї гармоніки рядка; було жорстко 6 дБ у коді
+  min_confidence: 0.0 # conf=(prom−min_prom)/18; 0.08 вимагало ще +2 дБ лінії
+  min_harmonics: 0 # далекий аналог часто без 2-ї гармоніки; 1 відсікав живе відео
   inspect_decode: true # м'який фільтр: кадр на зсуві АБО спектральний PAL/NTSC
-  inspect_min_row_corr: 0.12 # схожість сусідніх рядків; шум/сніг дає ~0
+  inspect_min_row_corr: 0.02 # сніг/далеке відео ~0.02–0.08; 0.04 ще ховало
   inspect_require_lock: false # 40 мс INSPECT часто не ловить кадрову; фільтр — corr
-  inspect_min_lines: 80 # мінімум рядків у димовому кадрі
+  inspect_min_lines: 32 # мінімум рядків у димовому кадрі
+  inspect_snow_corr: 0.02 # veto «снігового» растру; було жорстко 0.06
+  inspect_snow_lines: 80 # veto лише при багатьох рядках (не різати короткий дим)
   inspect_offsets_mhz: [1.0, 2.0, 4.0] # цифрові зсуви: 3487 vs 3489, не лише сітка
-  inspect_conf_bypass: 0.70 # якщо decode не зібрав кадр — пустити сильний PAL/NTSC
+  inspect_conf_bypass: 0.10 # якщо decode не зібрав кадр — пустити слабкий PAL/NTSC
+  inspect_narrow_frac: 0.4 # вузький блоб біля dwell: було 0.6×min_bw
+  accept_energy: false # енергія без PAL — дебаг-сканер, не робочий список 400–6000
+  energy_min_snr_db: 1.0 # ≤ live CFAR-зсуву, інакше зайнятість знаходять і відкидають
+  inspect_min_snr_db: 1.0 # вузький блоб біля dwell: було 3 дБ — різало полицю 3 дБ
+  inspect_extras_need_comb: true # extras без 15.7 кГц не inspect; гребінка на dwell IQ вже кладе analog у список
+  inspect_need_comb: true # грубий тайль: 90 мс inspect лише з PAL/NTSC гребінкою
   merge_smear_hz: 32.0e6 # ЧМ-пляма на 5 ГГц розмазується по кроках свіпу
   debug_candidates: false
   auto_peek: true # автоматично зазирати на щойно знайдений канал
@@ -57,9 +74,9 @@ scan:
   auto_peek_cooldown_s: 60 # не повертатись на той самий канал частіше
 
 video:
-  sample_rate: 20.0e6 # LOCK fs; не інструмент стрибків — dec=2 заборонено
-  deviation_hz: 10.0e6
-  channel_bw_hz: 10.0e6 # очікувана зайнята смуга; LOCK підніме BW щоб dec=1
+  sample_rate: 20.0e6 # робочий USB bladeRF; 13e6 часто не наповнює кільце (0.0/с)
+  deviation_hz: 4.8e6
+  channel_bw_hz: 16.0e6 # 3290 PAL Rabbit: 16 МГц IF (corr 0.65); 12 різало, 20 зашироко. 20 Msps + 16 = dec=1
   lo_offset_hz: 0.0 # зміщення ФАПЧ від центру каналу; для 5.8 ГГц
   # при sample_rate 61.44e6 постав 8.0e6
   afc: true # автопідстроювання: лише цифровий зсув каналайзера
@@ -92,9 +109,10 @@ video:
   h_phase_frac: 0.0 # залишковий зсув ПІСЛЯ TBC; 0 / |x|<0.01 = немає; не ховає blank
   h_pll: false # ФАПЧ рядка: повільно уточнює period у DecodeState; вимк = заморожений період
   crop_left_frac: 0.07 # страховий зріз leftover porch на 4991; футер не чіпати
-  crop_bottom_lines: 6 # нижні рядки 288-поля; OSD 3487 сидить внизу
+  crop_bottom_lines: 0 # 6 на NTSC 240 давало футер 234 і різало OSD; PAL і так 288
   hunt_min_gain: 0.10 # наскільки оцінка має зрости, щоб прийняти зсув
   hunt_skip_if_score: 0.70 # якщо вже добре — не витрачати CPU
+  hunt_skip_if_decode_ms: 120 # decode ≥ цього — hunt не стартує (Pi ~200 мс)
   hunt_drop: 0.12 # шукати лише коли оцінка впала відносно недавнього піку
   # Pi 5: 1 DSP + 1 USB reader + BLAS, без інференсу. Інакше hunt з'їсть ядра:
   #   OPENBLAS_NUM_THREADS=2 OMP_NUM_THREADS=2 MKL_NUM_THREADS=2
@@ -108,5 +126,20 @@ video:
   ring_seconds: 0.5
 
 web:
-  host: 0.0.0.0
+  host: 0.0.0.0 # усі інтерфейси, включно з ZeroTier; або пропиши ZT-IP вузла
   port: 8080
+
+rotator:
+  enable: true # серво на GPIO 12 через sysfs PWM (Type 2); на Windows — лише стан
+  type: pwm # 2 = Linux PWM /sys/class/pwm/pwmchipN
+  max_range: 220 # фізичний хід серво, градуси
+  gpio_pin: 12 # Pi 5 PWM0; overlay dtoverlay=pwm,pin=12,func=4
+  pwm_chip: 0
+  pwm_channel: 0
+  frequency_hz: 50
+  servo_min_pulse_width_us: 300
+  servo_max_pulse_width_us: 2500
+  speed: 1 # 1 = ~90°/с для індикатора «обертання»
+  reverse: true # лише інверсія PWM, не підписи шкали
+  azimuth_offset: 90 # 0 = лівий упор, 90 = середина шкали, 180 = +90° праворуч
+  step_deg: 90

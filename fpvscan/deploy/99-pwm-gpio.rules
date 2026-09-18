@@ -1,0 +1,2 @@
+# Sysfs PWM (серво ротора) для групи gpio — канал export/enable.
+ACTION=="add", SUBSYSTEM=="pwm", RUN+="/bin/sh -c 'chgrp -R gpio /sys%p /sys/class/pwm; chmod -R g+rwx /sys%p /sys/class/pwm'"

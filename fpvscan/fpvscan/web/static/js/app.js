@@ -1,11 +1,12 @@
 import {
-  TASK_TOOLS, sameValue, displayOf, storedFromDisplay, formatDefault,
+  TASK_TOOLS, TEST_TOOLS, TEST_CORE_HIDE, GROUPS, PARAMETER_CATALOG,
+  sameValue, displayOf, storedFromDisplay, formatDefault,
   clampToSpec, optValue, optLabel, formatList, displayUnit,
-} from "./catalog.js?v=18"
+} from "./catalog.js?v=25"
 import {
   TestClient, engineLock, engineSweep, engineClear, engineSnapshot,
   engineRecord, engineState,
-} from "./api.js?v=18"
+} from "./api.js?v=25"
 
 const F0 = 400e6, F1 = 6000e6
 const UI_LS = "fpvscan.ui.v1"
@@ -85,9 +86,9 @@ const autoFill = {
 
 let hits = new Map()
 let current = null
-const INSPECT_MIN_ROW_CORR = 0.12
+const INSPECT_MIN_ROW_CORR = 0.04
 const INSPECT_MIN_PIC_SCORE = 0.20
-const MIN_RASTER_LINES = 80
+const MIN_RASTER_LINES = 48
 const FRAME_FRESH_MS = 2500
 const PRUNE_SETTLE_MS = 5000
 const HIT_SELECT_HZ = 2e6
@@ -97,6 +98,8 @@ const HIT_KEY_HZ = 5e4
 const LOCK_SPURIOUS_HZ = 2e4
 const droppedHits = new Set()
 let lastHitsHtml = ""
+let pendingLockHz = null
+let pendingSweep = false
 const SPEC_PIN = "video.spectrum_pin_center"
 const SPEC_EMA = "video.spectrum_ema"
 const SPEC_SMOOTH3 = "video.spectrum_smooth3"
@@ -124,14 +127,17 @@ let panelTab = "params"
 let autoRelock = true
 let pendingNow = new Set()
 let pendingWhy = {}
+const pendingAckSeq = new Map()
+let latestParamStatusSeq = 0
 let toolsetMode = ""
 let toolsetKeys = null
 
 const LOCK_RETUNE = new Set([
-  "video.sample_rate", "video.capture_ms", "video.hunt",
+  "video.sample_rate", "video.channel_bw_hz", "video.deviation_hz",
+  "video.capture_ms", "video.hunt",
   "video.hunt_every", "video.hunt_drop", "sdr.settle_us",
 ])
-const LOCK_HIDE = new Set(["video.sample_rate", "sdr.gain_db", "video.h_pll", "video.pll_enable"])
+const LOCK_HIDE = new Set(["sdr.gain_db", "video.h_pll", "video.pll_enable"])
 const PANEL_SKIP = new Set(["scan_grid", "hit_filter", "pll", "picture_jump", "phase_tear", "phase_tear_h", "phase_tear_v"])
 
 const dirty = { spec: false, grid: false, frame: false, hud: true }
@@ -146,6 +152,7 @@ const motion = {
   playFromAt: 0,
 }
 
+let specSpanDb = 45
 let rafStarted = false
 
 function retargetHz(kind, hz) {
@@ -279,6 +286,13 @@ function presentFrame(d) {
   if (picPendingUrl) URL.revokeObjectURL(picPendingUrl)
   picPendingUrl = url
   const gen = ++picGen
+  const hint = $("hint")
+  if (hint) hint.hidden = true
+  img.style.display = "block"
+  img.onerror = () => {
+    if (gen !== picGen) return
+    img.style.display = "none"
+  }
   img.onload = () => {
     if (gen !== picGen) return
     if (!modeIsLock()) {
@@ -289,7 +303,6 @@ function presentFrame(d) {
     picShownUrl = url
     if (picPendingUrl === url) picPendingUrl = null
     img.style.display = "block"
-    const hint = $("hint")
     if (hint) hint.hidden = true
   }
   img.src = url
@@ -386,20 +399,30 @@ function connect() {
   try {
     sock = new WebSocket((location.protocol === "https:" ? "wss" : "ws") + "://" + location.host + "/ws")
   } catch (err) {
-    setWs(false, "нема")
+    setWs(false, "перепідключення")
     setTimeout(connect, 1500)
     return
   }
   const ws = sock
   ws.onopen = () => setWs(true, "є")
-  ws.onerror = () => setWs(false, "помилка")
-  ws.onclose = () => { setWs(false, "нема"); setTimeout(connect, 1500) }
+  ws.onerror = () => { /* close handler reports the drop */ }
+  ws.onclose = () => {
+    if (sock !== ws) return
+    setWs(false, "перепідключення")
+    setTimeout(connect, 1500)
+  }
   ws.onmessage = e => {
     try {
       live.lastWs = Date.now()
       const m = JSON.parse(e.data)
+      if (m.type === "ping") return
+      if (m.type === "rotator") {
+        ingestRotator(m.data)
+        return
+      }
       if (m.type === "spectrum") {
         markSpectrumMsg()
+        if (m.data && m.data.grid) ingestGrid(m.data)
         applySpectrumPayload(m.data)
       } else if (m.type === "detection") {
         ingestHit(m.data)
@@ -484,6 +507,171 @@ function ingestLockStats(src) {
   if (ov != null && Number.isFinite(Number(ov))) live.overflows = Number(ov)
   const fps = src.fps ?? vm.fps
   if (fps != null && Number.isFinite(Number(fps))) live.engineFps = Number(fps)
+}
+
+let rotTimer = null
+let rotSeq = 0
+let rotDragging = false
+let rotPending = false
+let rotLocalTarget = null
+let rotAbort = null
+let rotPoll = null
+let rotPollInflight = false
+const rotator = {
+  enable: false,
+  available: false,
+  azimuth: 90,
+  target: 90,
+  displayMax: 180,
+  stepDeg: 90,
+  moving: false,
+  reason: "",
+}
+
+function rotatorHeld() {
+  return rotDragging || rotPending || rotLocalTarget != null
+}
+
+function paintRotator() {
+  const box = $("rotator-box")
+  if (!box) return
+  box.hidden = !rotator.enable
+  if (!rotator.enable) {
+    stopRotatorPoll()
+    return
+  }
+  const range = $("rot-az")
+  const num = $("rot-az-num")
+  const meta = $("rotator-meta")
+  const az = Number(rotator.azimuth)
+  const tgt = Number.isFinite(rotLocalTarget) ? rotLocalTarget : Number(rotator.target)
+  const span = Math.max(90, Number(rotator.displayMax) || 180)
+  const shown = Number.isFinite(tgt) ? tgt : az
+  const lo = $("rot-az-min")
+  const hi = $("rot-az-max")
+  if (lo) lo.textContent = "0"
+  if (hi) hi.textContent = String(Math.round(span))
+  box.classList.toggle("is-moving", !!rotator.moving)
+  box.setAttribute("aria-busy", rotator.moving ? "true" : "false")
+  if (range) {
+    range.min = "0"
+    range.max = String(span)
+    range.step = "1"
+    if (!rotDragging) {
+      range.value = String(Math.round(Number.isFinite(shown) ? shown : 90))
+    }
+  }
+  if (num) num.textContent = Number.isFinite(shown) ? String(Math.round(shown)) : "—"
+  if (meta) {
+    const bits = []
+    if (rotator.moving) bits.push("обертання…")
+    if (Number.isFinite(shown)) bits.push(`ціль ${Math.round(shown)}°`)
+    if (Math.round(shown) === 90) bits.push("центр")
+    else if (Math.round(shown) === 0) bits.push("ліворуч")
+    else if (Math.round(shown) === span) bits.push("праворуч")
+    if (rotator.available) bits.push("PWM")
+    else bits.push(rotator.reason || "нема PWM")
+    meta.textContent = bits.join(" · ")
+  }
+  if (rotator.moving && !rotatorHeld()) startRotatorPoll()
+  else if (!rotator.moving) stopRotatorPoll()
+}
+
+function startRotatorPoll() {
+  if (rotPoll) return
+  rotPoll = setInterval(async () => {
+    if (rotPollInflight || rotatorHeld()) return
+    rotPollInflight = true
+    try {
+      const r = await fetch("/api/rotator")
+      const data = await r.json().catch(() => null)
+      if (data && !rotatorHeld()) ingestRotator(data)
+    } catch { /* ignore */ }
+    rotPollInflight = false
+  }, 150)
+}
+
+function stopRotatorPoll() {
+  if (!rotPoll) return
+  clearInterval(rotPoll)
+  rotPoll = null
+  rotPollInflight = false
+}
+
+function ingestRotator(src, opts) {
+  const fromAck = !!(opts && opts.fromAck)
+  if (!src || typeof src !== "object") {
+    rotator.enable = false
+    paintRotator()
+    return
+  }
+  rotator.enable = !!src.enable
+  rotator.available = !!src.available
+  rotator.moving = !!(src.moving || src.busy)
+  if (src.display_max != null && Number.isFinite(Number(src.display_max))) {
+    rotator.displayMax = Number(src.display_max)
+  }
+  if (src.step_deg != null && Number.isFinite(Number(src.step_deg))) {
+    rotator.stepDeg = Number(src.step_deg)
+  }
+  if (!rotDragging) {
+    if (src.azimuth != null && Number.isFinite(Number(src.azimuth))) {
+      rotator.azimuth = Number(src.azimuth)
+    }
+  }
+  if (src.target_azimuth != null && Number.isFinite(Number(src.target_azimuth))) {
+    const ack = Number(src.target_azimuth)
+    if (rotLocalTarget == null || (fromAck && Math.round(ack) === Math.round(rotLocalTarget))) {
+      rotator.target = ack
+      if (fromAck) rotLocalTarget = null
+    }
+  }
+  rotator.reason = src.reason ? String(src.reason) : ""
+  paintRotator()
+}
+
+async function putRotator(body) {
+  const seq = ++rotSeq
+  rotPending = true
+  if (rotAbort) rotAbort.abort()
+  const ac = new AbortController()
+  rotAbort = ac
+  try {
+    const r = await fetch("/api/rotator", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: ac.signal,
+    })
+    const data = await r.json().catch(() => null)
+    if (seq !== rotSeq) return
+    rotPending = false
+    if (data) ingestRotator(data, { fromAck: true })
+  } catch (err) {
+    if (err && err.name === "AbortError") return
+    if (seq === rotSeq) rotPending = false
+  }
+}
+
+function setRotatorAzimuth(raw, commit) {
+  const span = Math.max(90, Number(rotator.displayMax) || 180)
+  const n = Math.max(0, Math.min(span, Math.round(Number(raw))))
+  if (!Number.isFinite(n)) return
+  rotator.target = n
+  rotLocalTarget = n
+  const num = $("rot-az-num")
+  if (num) num.textContent = String(n)
+  const meta = $("rotator-meta")
+  if (meta) meta.textContent = `ціль ${n}°`
+  clearTimeout(rotTimer)
+  if (commit) {
+    putRotator({ azimuth: n })
+    return
+  }
+  // Pointer dragging is visual-only. Send exactly the final target on release;
+  // keyboard changes still coalesce after a short idle period.
+  if (rotDragging) return
+  rotTimer = setTimeout(() => putRotator({ azimuth: n }), 160)
 }
 
 function fmtLockMs(v) {
@@ -649,6 +837,22 @@ function syncSpecKit() {
   }
 }
 
+function syncSpecSpan() {
+  const range = $("spec-span")
+  const num = $("spec-span-num")
+  if (range) range.value = String(specSpanDb)
+  if (num) num.textContent = String(specSpanDb)
+}
+
+function setSpecSpan(raw) {
+  const n = Math.max(15, Math.min(80, Math.round(Number(raw))))
+  if (!Number.isFinite(n)) return
+  specSpanDb = n
+  saveUi({ specSpanDb })
+  syncSpecSpan()
+  dirty.spec = true
+}
+
 function plotSpectrumBins(raw) {
   if (!raw || !raw.length) return raw
   if (live.mode !== "LOCK") {
@@ -707,7 +911,9 @@ function currentSpanHz() {
 
 function applySpectrumPayload(d) {
   if (!d || typeof d !== "object") return
+  if (d.grid && typeof d.grid === "object") ingestGrid(d)
   const src = d.spectrum || d
+  if (src !== d && src.grid && typeof src.grid === "object") ingestGrid(src)
   if (Array.isArray(src.bins) && src.bins.length) specView.bins = src.bins
   if (src.center_hz != null) specView.center_hz = Number(src.center_hz)
   if (src.span_hz != null) specView.span_hz = Number(src.span_hz)
@@ -745,8 +951,7 @@ function drawMiniSpectrum() {
   const bw = currentBwHz()
   const cursor = pinLockCursor(motion.cursorHz ?? specView.cursor_hz ?? displayedFreqHz())
   const floor = specView.floor_db ?? -90
-  const thresh = Number(values["scan.threshold_db"])
-  const scale = 45 + (Number.isFinite(thresh) ? Math.max(0, 8 - thresh) : 0)
+  const scale = Math.max(15, specSpanDb)
   const bins = plotSpectrumBins(specView.bins)
 
   if (bins && bins.length) {
@@ -1151,6 +1356,22 @@ function queueFrame(d) {
 }
 
 function decodeHealth() {
+  const metrics = live.metrics || {}
+  const sdrState = metrics.sdr_state
+  const reason = String(metrics.sdr_last_error || metrics.engine_error || "")
+    .replace(/\s+/g, " ").trim().slice(0, 96)
+  if (sdrState === "WAITING_DEVICE") {
+    return { cls: "err", text: "SDR очікує", label: `SDR: пристрій недоступний${reason ? ` — ${reason}` : ""}` }
+  }
+  if (sdrState === "RECOVERING") {
+    return { cls: "warn", text: "SDR відновлення", label: `SDR: перевідкриття${reason ? ` — ${reason}` : ""}` }
+  }
+  if (sdrState === "DEGRADED") {
+    return { cls: "warn", text: "SDR збій", label: `SDR: нестабільний потік${reason ? ` — ${reason}` : ""}` }
+  }
+  if (sdrState === "ERROR" || metrics.engine_alive === false) {
+    return { cls: "err", text: "рушій впав", label: `рушій: аварія${reason ? ` — ${reason}` : ""}` }
+  }
   if (live.mode !== "LOCK") return { cls: "off", text: "очікування", label: "декод: немає потоку" }
   const age = Date.now() - live.lastFrameAt
   if (!live.lastFrameAt || age > 4000) return { cls: "err", text: "мовчить", label: "декод: потік мовчить" }
@@ -1162,18 +1383,26 @@ function updateHealth() {
   const h = decodeHealth()
   const el = $("s-health")
   if (el) {
-    el.innerHTML = `<i class="dot ${h.cls === "warn" ? "" : h.cls}"></i>${h.label}`
+    el.innerHTML = `<i class="dot ${h.cls === "warn" ? "" : h.cls}"></i>${esc(h.label)}`
   }
   const bar = $("bar-health")
   if (bar) {
-    bar.innerHTML = `<i class="dot ${h.cls === "warn" ? "" : h.cls}"></i><span>${h.label}</span>`
+    bar.innerHTML = `<i class="dot ${h.cls === "warn" ? "" : h.cls}"></i><span>${esc(h.label)}</span>`
   }
 }
 
 function applyState(s) {
   const prevMode = live.mode
   live.recording = !!s.recording
-  live.mode = s.mode
+  if (pendingSweep && s.mode === "SWEEP") pendingSweep = false
+  if (pendingSweep && s.mode === "LOCK") {
+    live.mode = "SWEEP"
+  } else if (pendingLockHz && s.mode !== "LOCK") {
+    /* keep optimistic LOCK: heartbeat/live still SWEEP until inspect yields */
+  } else {
+    live.mode = s.mode
+    if (s.mode === "LOCK") pendingLockHz = null
+  }
   if (!modeIsLock()) blankPreview()
   live.clipFrac = s.clip_frac || 0
   live.metrics = s
@@ -1204,19 +1433,21 @@ function applyState(s) {
   if (srcEl) srcEl.textContent = s.source
   const m = $("s-mode")
   if (m) {
-    m.textContent = s.mode
-    m.className = "mode-" + s.mode
+    const mode = live.mode || s.mode
+    m.textContent = mode
+    m.className = "mode-" + mode
   }
   put("s-tuned", fmt(s.tuned_hz))
   put("s-sweeps", s.sweeps_done)
   ingestAfcLimit(s)
   ingestLockStats(s)
+  ingestRotator(s.rotator)
   updateAfcLimitUi()
   if (live.afcHz != null) put("v-afc", fmtAfc(live.afcHz))
   if (s.last_frame_ref) live.lastShot = s.last_frame_ref
   ingestGrid(s)
   applySpectrumPayload(s)
-  setWatching(s.mode === "LOCK")
+  setWatching(modeIsLock())
   dirty.hud = true
   updateMediaPath()
   const cf = (s.clip_frac || 0) * 100
@@ -1228,11 +1459,12 @@ function applyState(s) {
   if (s.fps != null) metric("v-fps", Number(s.fps).toFixed(1), " /с")
   const barMode = $("bar-mode")
   if (barMode) {
-    const label = s.mode === "LOCK" ? "утримання" : s.mode === "INSPECT" ? "перевірка" : "свіп"
-    barMode.innerHTML = `<i class="dot ${s.mode === "LOCK" ? "ok" : "info"}"></i><span>режим: ${label}</span>`
+    const mode = live.mode || s.mode
+    const label = mode === "LOCK" ? "утримання" : mode === "INSPECT" ? "перевірка" : "свіп"
+    barMode.innerHTML = `<i class="dot ${mode === "LOCK" ? "ok" : "info"}"></i><span>режим: ${label}</span>`
   }
   const barF = $("bar-freq")
-  if (barF) barF.textContent = fmt(s.lock_target || s.tuned_hz)
+  if (barF) barF.textContent = fmt(pendingLockHz || s.lock_target || s.tuned_hz)
   if (Array.isArray(s.detections)) {
     const prevHits = hits
     const next = new Map()
@@ -1253,16 +1485,16 @@ function applyState(s) {
     renderHits()
   }
   updateHealth()
-  if (s.mode && s.mode !== prevMode) syncParamToolset()
+  if (live.mode && live.mode !== prevMode) syncParamToolset()
 }
 
 async function lock(f, opts) {
   const hz = Number(f)
   if (!Number.isFinite(hz) || hz <= 0) return
-  const force = !!(opts && opts.force)
+  const force = opts == null || opts.force !== false
   const held = Number(live.freqHz || current)
   if (!force && live.mode === "LOCK" && Number.isFinite(held)) {
-    if (Math.abs(held - hz) <= MERGE_LOCK_HZ) return
+    if (Math.abs(held - hz) <= LOCK_SPURIOUS_HZ) return
   }
   const target = hz
   const prevKey = Number.isFinite(held) ? selectedHitKey(held) : null
@@ -1270,17 +1502,18 @@ async function lock(f, opts) {
   live.freqHz = target
   live.mode = "LOCK"
   live.locked = false
-  live.lastFrameAt = 0
   live.picScore = null
   live.rowCorr = null
   live.standard = "—"
   live.lines = null
+  pendingLockHz = target
   const rowKey = prevKey ?? nearestHitKey(target, hits, MERGE_LOCK_HZ)
   if (rowKey != null && hits.has(rowKey)) hits.get(rowKey).freq_hz = target
   armEmptyLockPrune(target)
   try {
-    await engineLock(target, force ? { force: true } : undefined)
+    await engineLock(target, { force: true })
   } catch (err) {
+    pendingLockHz = null
     note(String(err && err.message || err), true)
     return
   }
@@ -1319,7 +1552,7 @@ function syncScanMenus() {
   if (filt) {
     const v = values["scan.hit_filter"]
     const allowed = new Set(["all", "hide_weak", "hide_no_video", "hide_near_dup"])
-    filt.value = allowed.has(v) ? v : "hide_weak"
+    filt.value = allowed.has(v) ? v : "all"
   }
   syncSpecKit()
 }
@@ -1368,6 +1601,8 @@ function hideVideo() {
 }
 
 function startSweep() {
+  pendingLockHz = null
+  pendingSweep = true
   current = null
   live.freqHz = null
   live.locked = false
@@ -1380,7 +1615,9 @@ function startSweep() {
   renderHits()
   dirty.grid = true
   syncParamToolset()
-  return engineSweep()
+  // The operator's Scan button means manual SWEEP hold.  Automatic
+  // candidate handoff is available only through explicit auto_lock mode.
+  return engineSweep({ autoLock: false })
 }
 
 bindClick("b-sweep", () => {
@@ -1478,6 +1715,34 @@ for (const { id, key, defaultOn = true } of SPEC_KIT) {
     commitParam(key, next, true)
   })
 }
+const specSpan = $("spec-span")
+if (specSpan) {
+  specSpan.addEventListener("input", () => setSpecSpan(specSpan.value))
+  specSpan.addEventListener("change", () => setSpecSpan(specSpan.value))
+}
+const rotAz = $("rot-az")
+if (rotAz) {
+  rotAz.min = "0"
+  rotAz.step = "1"
+  const endRotDrag = () => {
+    if (!rotDragging) return
+    rotDragging = false
+    setRotatorAzimuth(rotAz.value, true)
+  }
+  rotAz.addEventListener("pointerdown", () => {
+    clearTimeout(rotTimer)
+    rotDragging = true
+  })
+  rotAz.addEventListener("pointerup", endRotDrag)
+  rotAz.addEventListener("pointercancel", endRotDrag)
+  rotAz.addEventListener("blur", endRotDrag)
+  rotAz.addEventListener("input", () => setRotatorAzimuth(rotAz.value, false))
+}
+on("b-rot-left", "click", () => putRotator({ step: -90 }))
+on("b-rot-nudge-left", "click", () => putRotator({ step: -1 }))
+on("b-rot-center", "click", () => putRotator({ azimuth: 90 }))
+on("b-rot-nudge-right", "click", () => putRotator({ step: 1 }))
+on("b-rot-right", "click", () => putRotator({ step: 90 }))
 on("b-fft-freq", "click", e => {
   e.stopPropagation()
   const pop = $("freq-pop")
@@ -1504,34 +1769,44 @@ document.addEventListener("mousedown", e => {
 })
 
 setInterval(async () => {
-  if (Date.now() - live.lastWs < 4000) return
+  if (Date.now() - live.lastWs < 4000) {
+    if (sock && sock.readyState === WebSocket.OPEN) setWs(true, "є")
+    return
+  }
   try {
     const s = await engineState()
     if (s.error) { note("сервер: " + s.error, true); return }
     try { applyState(s) } catch (err) { console.error("стан:", err) }
-    setWs(false, "опитування")
+    if (!sock || sock.readyState !== WebSocket.OPEN) setWs(false, "опитування")
   } catch {
-    setWs(false, "нема")
+    if (!sock || sock.readyState !== WebSocket.OPEN) setWs(false, "нема")
   }
 }, 1500)
 
 setInterval(() => {
   if (live.mode !== "LOCK") return
+  if (!live.lastFrameAt) return
   if (Date.now() - live.lastFrameAt < 6000) return
-  if (sock) { try { sock.close() } catch { /* ignore */ } }
   dirty.hud = true
 }, 2000)
 
 function applyLiveExtra(extra, opts = {}) {
   if (!extra || typeof extra !== "object") return
   const prevMode = live.mode
-  if (extra.mode && !(opts.keepLock && extra.mode !== "LOCK")) live.mode = extra.mode
-  if (extra.frequency_hz != null) live.freqHz = extra.frequency_hz
+  if (pendingSweep && extra.mode === "SWEEP") pendingSweep = false
+  if (pendingSweep && extra.mode === "LOCK") {
+    live.mode = "SWEEP"
+  } else if (extra.mode && !(opts.keepLock && extra.mode !== "LOCK")) live.mode = extra.mode
+  if (!(opts.keepLock && extra.mode !== "LOCK")) {
+    if (extra.frequency_hz != null) live.freqHz = extra.frequency_hz
+  }
   if (extra.lock_target_hz != null) live.freqHz = extra.lock_target_hz
-  if (extra.lock_state != null) live.locked = extra.lock_state
+  if (!(opts.keepLock && extra.mode !== "LOCK")) {
+    if (extra.lock_state != null) live.locked = extra.lock_state
+  }
   if (extra.video_metrics) {
     const vm = extra.video_metrics
-    if (vm.locked != null) live.locked = vm.locked
+    if (vm.locked != null && !(opts.keepLock && extra.mode !== "LOCK")) live.locked = vm.locked
     if (vm.fps != null && Number.isFinite(Number(vm.fps)) && Date.now() - live.lastFrameAt > 1500) {
       live.fps = Number(vm.fps)
     }
@@ -1558,15 +1833,30 @@ function applyLiveExtra(extra, opts = {}) {
 }
 
 async function refreshLiveSpectrum(opts = {}) {
-  const extra = await client.live()
-  applyLiveExtra(extra, { mergeParams: true, ...opts })
+  try {
+    const extra = await client.live()
+    if (!extra) return
+    applyLiveExtra(extra, {
+      mergeParams: true,
+      keepLock: live.mode === "LOCK" || pendingLockHz != null,
+      ...opts,
+    })
+  } catch (err) {
+    console.error("live:", err)
+  }
 }
 
 setInterval(async () => {
   if (Date.now() - live.lastWs < 4000) return
-  const extra = await client.live()
-  if (!extra) return
-  applyLiveExtra(extra)
+  try {
+    const extra = await client.live()
+    if (!extra) return
+    applyLiveExtra(extra, {
+      keepLock: live.mode === "LOCK" || pendingLockHz != null,
+    })
+  } catch (err) {
+    console.error("live poll:", err)
+  }
 }, 2500)
 
 /* ---------------- testing panel ---------------- */
@@ -1633,11 +1923,15 @@ function toggleUi(key, force) {
 function restoreUi() {
   const u = loadUi()
   autoRelock = u.autoRelock !== false
+  specSpanDb = Number(u.specSpanDb)
+  if (!Number.isFinite(specSpanDb)) specSpanDb = 45
+  specSpanDb = Math.max(15, Math.min(80, specSpanDb))
   applyCollapsed("rail", !!u.rail, $("b-rail"))
   applyCollapsed("status", !!u.status, $("b-status"))
   applyCollapsed("hits", !!u.hits, $("b-hits"))
   document.body.classList.remove("fft-collapsed")
   applyCollapsed("panel", false, $("b-panel-close"))
+  syncSpecSpan()
 }
 
 function togglePanel(force) {
@@ -1645,7 +1939,7 @@ function togglePanel(force) {
 }
 
 function specByKey(key) {
-  return catalog.find(p => p.key === key)
+  return catalog.find(p => p.key === key) || PARAMETER_CATALOG.find(p => p.key === key)
 }
 
 function effectLabel(spec) {
@@ -1688,33 +1982,43 @@ function setApplyStatus(kind, keys) {
   el.classList.toggle("waiting", kind === "після переналаштування" || kind === "після свіпу")
 }
 
-async function afterParamsApplied(r, patchKeys) {
-  const pending = (r && r.pending_keys) || []
+function afterParamsApplied(r) {
+  const ackKeys = (r && r.acknowledged_keys) || []
+  const ackSet = new Set(ackKeys)
+  const seq = Number((r && r.request_seq) || 0)
+  const pending = ((r && r.pending_keys) || []).filter(key => ackSet.has(key))
   const reasons = (r && r.pending_reasons) || {}
-  const applied = (r && r.applied_keys) || patchKeys || []
-  markPendingRows(pending, reasons)
-  refreshDirty()
-  const freq = displayedFreqHz()
-  const inLock = live.mode === "LOCK"
-  const canRelock = autoRelock && inLock && freq && pending.length
-  if (canRelock) {
-    try {
-      const res = await engineLock(freq, { force: true })
-      if (res && res.ok === false) throw new Error("lock")
-      markPendingRows([], {})
-      setApplyStatus("застосовано зараз", pending)
-      dirty.spec = true
-      dirty.grid = true
-      dirty.hud = true
-      return
-    } catch {
-      setApplyStatus("після переналаштування", pending)
-      return
+  const pendingSet = new Set(pending)
+  for (const key of ackKeys) {
+    if (seq < (pendingAckSeq.get(key) || 0)) continue
+    pendingAckSeq.set(key, seq)
+    if (pendingSet.has(key)) {
+      pendingNow.add(key)
+      pendingWhy[key] = reasons[key] || ""
+    } else {
+      pendingNow.delete(key)
+      delete pendingWhy[key]
     }
   }
-  if (pending.length) setApplyStatus("після переналаштування", pending)
-  else setApplyStatus("застосовано зараз", applied)
-  syncScanMenus()
+  markPendingRows([...pendingNow], pendingWhy)
+  refreshDirty()
+  const affects = (r && r.affects) || {}
+  if (ackKeys.some(key => key.startsWith("scan."))) {
+    dirty.grid = true
+    syncScanMenus()
+  }
+  if (ackKeys.some(key => affects[key] === "spectrum")) dirty.spec = true
+  if (ackKeys.some(key => key.startsWith("video.") && affects[key] === "picture")) {
+    dirty.frame = true
+    dirty.hud = true
+  }
+  if (seq >= latestParamStatusSeq) {
+    latestParamStatusSeq = seq
+    if (pending.length && pending.every(key => key.startsWith("scan."))) {
+      setApplyStatus("після свіпу", pending)
+    } else if (pending.length) setApplyStatus("після переналаштування", pending)
+    else setApplyStatus("застосовано зараз", ackKeys)
+  }
 }
 
 function currentToolset() {
@@ -1728,22 +2032,25 @@ function specTask(spec) {
   return ""
 }
 
-function specsForSection(section, toolset) {
-  const hide = toolset === "lock" ? LOCK_HIDE : null
-  const tags = new Set(section.tasks || [section.id])
-  const tagged = catalog.filter(p => tags.has(specTask(p)))
+function specsForSection(section, toolset, opts) {
+  const hide = new Set()
+  if (toolset === "lock") for (const k of LOCK_HIDE) hide.add(k)
+  if (opts && opts.hide) for (const k of opts.hide) hide.add(k)
+  const allowAny = !!(opts && opts.allowAny)
+  const tags = new Set(section.tasks || [])
+  const tagged = tags.size ? catalog.filter(p => tags.has(specTask(p))) : []
   const seen = new Set()
   const out = []
   for (const p of tagged) {
-    if (hide && hide.has(p.key)) continue
+    if (hide.has(p.key)) continue
     if (seen.has(p.key)) continue
     seen.add(p.key)
     out.push(p)
   }
   for (const k of section.keys || []) {
-    if (hide && hide.has(k)) continue
+    if (hide.has(k)) continue
     if (seen.has(k)) continue
-    if (toolsetKeys && !toolsetKeys.has(k)) continue
+    if (!allowAny && toolsetKeys && !toolsetKeys.has(k)) continue
     const spec = specByKey(k)
     if (!spec) continue
     seen.add(k)
@@ -1864,9 +2171,9 @@ function appendTaskSections(root, mode) {
 }
 
 function applyToolsetEnabled() {
+  const mode = currentToolset()
   const root = $("param-groups")
   if (!root) return
-  const mode = currentToolset()
   for (const fs of root.querySelectorAll("fieldset.toolset")) {
     const on = fs.dataset.toolset === mode
     fs.disabled = !on
@@ -1878,6 +2185,93 @@ function applyToolsetEnabled() {
     extra.disabled = !extraOn
     extra.classList.toggle("off", !extraOn)
   }
+}
+
+function walkToolSections(table, visit) {
+  for (const mode of Object.keys(table || {})) {
+    for (const section of table[mode] || []) {
+      visit(section, mode)
+      for (const child of section.children || []) visit(child, mode)
+    }
+  }
+}
+
+function collectSectionKeys(section, mode, opts) {
+  const keys = new Set()
+  for (const spec of specsForSection(section, mode, opts)) keys.add(spec.key)
+  for (const child of section.children || []) {
+    for (const spec of specsForSection(child, mode, opts)) keys.add(spec.key)
+  }
+  return keys
+}
+
+function shownParamKeys() {
+  const keys = new Set(TEST_CORE_HIDE)
+  walkToolSections(TASK_TOOLS, (section, mode) => {
+    if (PANEL_SKIP.has(section.id)) return
+    for (const k of collectSectionKeys(section, mode)) keys.add(k)
+  })
+  walkToolSections(TEST_TOOLS, (section, mode) => {
+    for (const k of collectSectionKeys(section, mode, { allowAny: true, hide: TEST_CORE_HIDE })) {
+      keys.add(k)
+    }
+  })
+  return keys
+}
+
+function appendTestSections(root, mode) {
+  for (const section of TEST_TOOLS[mode] || []) {
+    if (section.children) {
+      appendGroupHead(root, section)
+      for (const child of section.children) {
+        const items = specsForSection(child, mode, { allowAny: true, hide: TEST_CORE_HIDE })
+        if (!items.length) continue
+        const sub = document.createElement("h4")
+        sub.className = "sub-head"
+        sub.textContent = child.label
+        root.appendChild(sub)
+        for (const spec of items) root.appendChild(paramRow(spec))
+      }
+      continue
+    }
+    const items = specsForSection(section, mode, { allowAny: true, hide: TEST_CORE_HIDE })
+    if (!items.length) continue
+    appendGroupHead(root, section)
+    for (const spec of items) root.appendChild(paramRow(spec))
+  }
+}
+
+function appendAllParams(root) {
+  const used = shownParamKeys()
+  const leftover = catalog.filter(p => p && p.key && !used.has(p.key))
+  if (!leftover.length) return
+  const box = document.createElement("details")
+  box.className = "param-all"
+  const sum = document.createElement("summary")
+  sum.textContent = "Усі параметри"
+  box.appendChild(sum)
+  for (const group of GROUPS) {
+    const items = leftover.filter(p => p.group === group.id)
+    if (!items.length) continue
+    appendGroupHead(box, { id: `all_${group.id}`, label: group.label })
+    for (const spec of items) box.appendChild(paramRow(spec))
+  }
+  const rest = leftover.filter(p => !GROUPS.some(g => g.id === p.group))
+  for (const spec of rest) box.appendChild(paramRow(spec))
+  root.appendChild(box)
+}
+
+function renderTestParams() {
+  const root = $("param-test")
+  if (!root) return
+  root.innerHTML = ""
+  const kicker = document.createElement("p")
+  kicker.className = "test-kicker"
+  kicker.textContent = "Тест"
+  root.appendChild(kicker)
+  appendTestSections(root, "sweep")
+  appendTestSections(root, "lock")
+  appendAllParams(root)
 }
 
 function renderParams() {
@@ -1894,6 +2288,7 @@ function renderParams() {
   lockBox.dataset.toolset = "lock"
   appendLockCore(lockBox)
   root.appendChild(lockBox)
+  renderTestParams()
   applyToolsetEnabled()
   markPendingRows([...pendingNow], pendingWhy)
   updateAfcLimitUi()
@@ -2024,7 +2419,7 @@ function commitParam(key, raw, immediate) {
       values = r.values
       setApiStatus(r.remote)
       if (r.error) note(r.error, true)
-      else afterParamsApplied(r, Object.keys(patch))
+      else afterParamsApplied(r)
     })
   }
   if (immediate) {
@@ -2037,34 +2432,55 @@ function commitParam(key, raw, immediate) {
 }
 
 function sectionById(gid) {
-  for (const mode of Object.keys(TASK_TOOLS)) {
-    for (const section of TASK_TOOLS[mode]) {
-      if (section.id === gid) return section
-      for (const child of section.children || []) {
-        if (child.id === gid) return child
-      }
-    }
-  }
-  return null
+  let found = null
+  walkToolSections(TASK_TOOLS, section => {
+    if (!found && section.id === gid) found = section
+  })
+  if (found) return found
+  walkToolSections(TEST_TOOLS, section => {
+    if (!found && section.id === gid) found = section
+  })
+  return found
 }
 
 function sectionToolset(section) {
   if (!section) return currentToolset()
-  for (const [mode, sections] of Object.entries(TASK_TOOLS)) {
-    for (const s of sections) {
-      if (s.id === section.id) return mode
-      if ((s.children || []).some(c => c.id === section.id)) return mode
-    }
-  }
-  return currentToolset()
+  let modeFound = ""
+  walkToolSections(TASK_TOOLS, (s, mode) => {
+    if (!modeFound && s.id === section.id) modeFound = mode
+  })
+  if (modeFound) return modeFound
+  walkToolSections(TEST_TOOLS, (s, mode) => {
+    if (!modeFound && s.id === section.id) modeFound = mode
+  })
+  return modeFound || currentToolset()
+}
+
+function sectionIsTest(section) {
+  if (!section) return false
+  let yes = false
+  walkToolSections(TEST_TOOLS, s => {
+    if (s.id === section.id) yes = true
+  })
+  return yes
 }
 
 async function resetGroup(gid) {
-  const section = sectionById(gid)
+  const leftoverGroup = String(gid || "").startsWith("all_") ? gid.slice(4) : ""
+  const section = leftoverGroup ? null : sectionById(gid)
   const mode = sectionToolset(section)
-  const items = section
-    ? [...specsForSection(section, mode), ...(section.children || []).flatMap(c => specsForSection(c, mode))]
-    : catalog.filter(p => p.group === gid)
+  const specOpts = sectionIsTest(section)
+    ? { allowAny: true, hide: TEST_CORE_HIDE }
+    : undefined
+  const used = leftoverGroup ? shownParamKeys() : null
+  const items = leftoverGroup
+    ? catalog.filter(p => p.group === leftoverGroup && !used.has(p.key))
+    : section
+      ? [
+          ...specsForSection(section, mode, specOpts),
+          ...(section.children || []).flatMap(c => specsForSection(c, mode, specOpts)),
+        ]
+      : catalog.filter(p => p.group === gid)
   const patch = {}
   for (const spec of items) {
     if (spec) patch[spec.key] = defaults[spec.key] ?? spec.default
@@ -2074,7 +2490,7 @@ async function resetGroup(gid) {
   setApiStatus(r.remote)
   renderParams()
   if (r.error) note(r.error, true)
-  else afterParamsApplied(r, Object.keys(patch))
+  else afterParamsApplied(r)
 }
 
 function setApiStatus(remote) {

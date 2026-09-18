@@ -1,0 +1,96 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "command": "node .cursor/hooks/stop_repeat.js",
+        "timeout": 10
+      },
+      {
+        "command": "node .cursor/hooks/delivery_guard.js",
+        "timeout": 10
+      }
+    ],
+    "beforeSubmitPrompt": [
+      {
+        "command": "node .cursor/hooks/delivery_guard.js",
+        "timeout": 10
+      }
+    ],
+    "afterFileEdit": [
+      {
+        "command": "node .cursor/hooks/delivery_guard.js",
+        "timeout": 10
+      }
+    ],
+    "afterAgentResponse": [
+      {
+        "command": "node .cursor/hooks/delivery_guard.js",
+        "timeout": 10
+      }
+    ],
+    "stop": [
+      {
+        "command": "node .cursor/hooks/delivery_guard.js",
+        "timeout": 10,
+        "loop_limit": 1
+      }
+    ],
+    "preToolUse": [
+      {
+        "command": "node .cursor/hooks/stop_repeat.js",
+        "timeout": 10
+      }
+    ],
+    "postToolUse": [
+      {
+        "command": "node .cursor/hooks/stop_repeat.js",
+        "timeout": 10
+      },
+      {
+        "command": "node .cursor/hooks/delivery_guard.js",
+        "timeout": 10
+      }
+    ],
+    "postToolUseFailure": [
+      {
+        "command": "node .cursor/hooks/stop_repeat.js",
+        "timeout": 10
+      }
+    ],
+    "beforeShellExecution": [
+      {
+        "command": "node .cursor/hooks/stop_repeat.js",
+        "timeout": 10
+      },
+      {
+        "command": "node .cursor/hooks/delivery_guard.js",
+        "timeout": 10
+      }
+    ],
+    "afterShellExecution": [
+      {
+        "command": "node .cursor/hooks/stop_repeat.js",
+        "timeout": 10
+      }
+    ],
+    "beforeMCPExecution": [
+      {
+        "command": "node .cursor/hooks/stop_repeat.js",
+        "timeout": 10
+      }
+    ],
+    "subagentStart": [
+      {
+        "command": "node .cursor/hooks/stop_repeat.js",
+        "timeout": 10
+      }
+    ],
+    "subagentStop": [
+      {
+        "command": "node .cursor/hooks/stop_repeat.js",
+        "timeout": 10
+      }
+    ]
+  }
+}

@@ -164,6 +164,32 @@ def test_up_with_improve_can_climb_again() -> None:
     ), state) == 41.0
 
 
+def test_luma_sat_frac_ignores_black_crush() -> None:
+    from fpvscan.auto_mgc import luma_sat_frac
+
+    dark = __import__("numpy").zeros((48, 64), dtype="uint8")
+    white = __import__("numpy").full((48, 64), 255, dtype="uint8")
+    mixed = dark.copy()
+    mixed[:12] = 255
+    assert luma_sat_frac(dark) < 0.01
+    assert luma_sat_frac(white) > 0.9
+    assert 0.2 < luma_sat_frac(mixed) < 0.3
+
+
+def test_dark_identical_frames_do_not_walk_gain_down() -> None:
+    """Distant/no-signal snow is flat-black; freeze must not eat SNR."""
+    state = MgcState()
+    sig = tuple([2.0] * (12 * 12))
+    state.last_sig = sig
+    gain = 54.0
+    for i in range(12):
+        gain = next_gain_db(_sample(
+            gain_db=gain, pic_locked=False, pic_score=0.04, clip_frac=0.0,
+            sat_frac=0.0, frame_sig=sig, now_s=i * 0.4,
+        ), state)
+    assert gain == 54.0
+
+
 def test_frozen_identical_frames_do_not_climb_to_54() -> None:
     state = MgcState()
     sig = tuple([40.0] * (12 * 12))
@@ -197,9 +223,15 @@ class _GainSrc:
     adc_rms = 0.0
     bias_tee = False
     gain_db = 35.0
+    set_gain_calls = 0
+    rx_fragile = False
 
     def set_gain(self, db: float) -> None:
+        self.set_gain_calls += 1
         self.gain_db = float(db)
+
+    def set_rx_fragile(self, fragile: bool) -> None:
+        self.rx_fragile = bool(fragile)
 
 
 def _engine(gain_db: float = 35, auto_gain: bool = True, bias_tee: bool = False):
@@ -217,6 +249,7 @@ def _engine(gain_db: float = 35, auto_gain: bool = True, bias_tee: bool = False)
     }
     src = _GainSrc()
     src.gain_db = float(gain_db)
+    src.set_gain_calls = 0
     eng = Engine(src, cfg, Queue())
     return eng, cfg, src
 
@@ -231,6 +264,142 @@ def test_engine_steps_catalog_gain_and_respects_hold() -> None:
     eng._mgc_last_mono = 0.0
     eng._maybe_auto_mgc(None)
     assert cfg["sdr"]["gain_db"] == 38
+
+
+def test_motor_guard_defers_and_coalesces_gain_until_stable_rx(
+        monkeypatch) -> None:
+    eng, cfg, src = _engine()
+    cfg["rotator"] = {
+        "sdr_guard_settle_s": 0.5,
+        "sdr_guard_stable_iterations": 3,
+    }
+    now = [100.0]
+    moving = [True]
+    monkeypatch.setattr("fpvscan.engine.time.monotonic", lambda: now[0])
+    eng.rotator.status = lambda: {
+        "moving": moving[0], "busy": moving[0], "eta_ms": 0}
+    eng._set_sdr_state("OK")
+    eng._mgc_last_mono = 0.0
+    eng.begin_motor_guard()
+    eng.note_rotator({"moving": True, "busy": True, "eta_ms": 1000})
+    assert src.rx_fragile is True
+
+    eng._maybe_auto_mgc(None)
+    assert cfg["sdr"]["gain_db"] == 35
+    assert src.set_gain_calls == 0
+    assert eng.snapshot()["auto_mgc_hold_reason"] == "rotator motor guard"
+
+    cfg["sdr"]["gain_db"] = 44
+    eng._apply_bias_tee_gain(False, automatic=True)
+    assert src.set_gain_calls == 0
+
+    moving[0] = False
+    eng.note_rotator({"moving": False, "busy": False, "eta_ms": 0})
+    now[0] = 100.49
+    eng._note_motor_guard_rx_success()
+    assert src.set_gain_calls == 0
+
+    now[0] = 100.51
+    eng._note_motor_guard_rx_success()
+    eng._note_motor_guard_rx_success()
+    assert src.set_gain_calls == 0
+    eng._note_motor_guard_rx_success()
+    assert src.set_gain_calls == 1
+    assert src.gain_db == 44.0
+    assert src.rx_fragile is False
+    assert not eng._reader_pause.is_set()
+    assert eng.snapshot()["motor_sdr_guard"]["active"] is False
+
+
+def test_successful_gain_operation_returns_active_metric_to_idle() -> None:
+    eng, _cfg, src = _engine()
+    eng._set_sdr_state("OK")
+
+    eng._apply_bias_tee_gain(False)
+
+    snap = eng.snapshot()
+    assert src.set_gain_calls == 1
+    assert snap["sdr_operation"] == "idle"
+    assert snap["sdr_last_operation"] == "gain"
+
+
+def test_auto_mgc_does_not_write_during_device_recovery() -> None:
+    eng, cfg, src = _engine()
+    eng._set_sdr_state("WAITING_DEVICE")
+    eng._mgc_last_mono = 0.0
+
+    eng._maybe_auto_mgc(None)
+
+    assert cfg["sdr"]["gain_db"] == 35
+    assert src.set_gain_calls == 0
+
+
+def test_automatic_rf_retune_is_deferred_during_motor_guard(
+        monkeypatch) -> None:
+    eng, _cfg, _src = _engine()
+    eng._set_sdr_state("OK")
+    eng.state.mode = "LOCK"
+    eng.state.lock_target = 1.1e9
+    eng.state.tuned_hz = 1.1e9
+    eng._afc = 250e3
+    eng.rotator.status = lambda: {
+        "moving": True, "busy": True, "eta_ms": 100}
+    eng.begin_motor_guard()
+    monkeypatch.setattr(
+        "fpvscan.engine.scan_view.rf_snap_due", lambda **_kw: True)
+
+    changed = eng._maybe_rf_snap(
+        pic_locked=True, pic_score=1.0, digital_max_hz=250e3)
+
+    assert changed is False
+    assert eng.state.lock_target == 1.1e9
+    assert eng._afc == 250e3
+
+
+def test_lock_during_motor_does_not_retune_or_decode() -> None:
+    from fpvscan.sdr.bladerf import BladeRFError
+
+    eng, _cfg, src = _engine()
+    eng._set_sdr_state("OK")
+    eng.state.mode = "LOCK"
+    eng.state.lock_target = 1.1e9
+    eng.rotator.status = lambda: {
+        "moving": True, "busy": True, "eta_ms": 400}
+    eng.begin_motor_guard()
+    assert src.rx_fragile is True
+    assert eng._reader_pause.is_set()
+    eng._start_reader = lambda *_a, **_k: (_ for _ in ()).throw(
+        AssertionError("motor PWM must not retune/rebuild RX"))
+    eng._stream_lock_iq = lambda *_a, **_k: (_ for _ in ()).throw(
+        AssertionError("motor PWM must not run LOCK DSP"))
+    eng._stop_reader = lambda: (_ for _ in ()).throw(
+        AssertionError("motor PWM must not stop RX"))
+    eng._restart_reader_keep_stream = lambda *_a, **_k: (_ for _ in ()).throw(
+        AssertionError("motor PWM must not restart USB RX"))
+    eng._do_lock()
+    assert src.set_gain_calls == 0
+
+    eng._reader_err = BladeRFError("sync_rx: timed out (-6)", code=-6)
+    eng._do_lock()
+    assert eng._reader_err is not None
+
+
+def test_lock_chunk_stays_one_analog_field() -> None:
+    from fpvscan.engine import STREAM_LOCK_CHUNK_S
+
+    assert STREAM_LOCK_CHUNK_S == 0.040
+
+
+def test_auto_mgc_gain_update_never_stops_reader() -> None:
+    eng, cfg, src = _engine()
+    eng._stop_reader = lambda: (_ for _ in ()).throw(
+        AssertionError("ordinary gain must not stop/rebuild RX"))
+    eng._mgc_last_mono = 0.0
+
+    eng._maybe_auto_mgc(None)
+
+    assert cfg["sdr"]["gain_db"] == 38
+    assert src.set_gain_calls == 1
 
 
 def test_engine_bias_tee_uses_existing_offset_not_plus_15() -> None:
@@ -255,6 +424,26 @@ def test_engine_bias_tee_uses_existing_offset_not_plus_15() -> None:
     assert src.gain_db == 23.0
 
 
+def test_engine_bias_tee_max_slider_reaches_board_max() -> None:
+    from fpvscan.engine import Engine
+
+    cfg = {
+        "scan": {},
+        "video": {},
+        "sdr": {
+            "gain_db": 60,
+            "auto_gain": False,
+            "bias_tee": True,
+            "bias_tee_gain_offset_db": 15,
+        },
+    }
+    src = _GainSrc()
+    eng = Engine(src, cfg, Queue())
+    eng._apply_bias_tee_gain(True)
+    assert cfg["sdr"]["gain_db"] == 60
+    assert src.gain_db == 60.0
+
+
 def test_operator_gain_write_disables_auto(tmp_path: Path) -> None:
     from fpvscan.app.adapters.engine_adapter import EngineAdapter
 
@@ -262,6 +451,8 @@ def test_operator_gain_write_disables_auto(tmp_path: Path) -> None:
     yaml_path = tmp_path / "cfg.yaml"
     yaml_path.write_text("sdr:\n  gain_db: 54\n", encoding="utf-8")
     adapter = EngineAdapter(eng, yaml_path)
+    eng._stop_reader = lambda: (_ for _ in ()).throw(
+        AssertionError("manual gain must not stop/rebuild RX"))
     commands: list[tuple] = []
     eng.command = lambda name, **kw: commands.append((name, kw))  # type: ignore[method-assign]
 

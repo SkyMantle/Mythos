@@ -45,12 +45,14 @@ def test_hide_near_dup_drops_2mhz_beside_stronger() -> None:
 
 def test_hide_weak_keeps_3489_class_drops_inband_birdie() -> None:
     vtx = _det(3489, 20.0, pic_score=0.22)
-    bird = _det(3520, 6.0, pic_score=0.0)
-    shown = filter_published([vtx, bird], "hide_weak")
+    analog = _det(3505, 6.0, pic_score=0.0)
+    bird = _det(3520, 0.5, pic_score=0.0)
+    shown = filter_published([vtx, analog, bird], "hide_weak")
     freqs = {round(d["freq_hz"] / 1e6) for d in shown}
     assert 3489 in freqs
+    assert 3505 in freqs
     assert 3520 not in freqs
-    assert filter_published([vtx, bird], "all") == [vtx, bird]
+    assert filter_published([vtx, analog], "all") == [vtx, analog]
 
 
 def test_hide_no_video_drops_never_locked() -> None:

@@ -115,16 +115,40 @@ python run.py --file caps\vtx_f4.cf32        # уся консоль на зап
 
 ## Розгортання на Pi 5
 
-```bash
-git clone <repo> && cd fpvscan
-./deploy/install_pi.sh
+Ціль — Ubuntu 24.04 **arm64** (Raspberry Pi 5, 64-bit). ZeroTier
+на пристрої вже може стояти.
+
+Зібрати пакет (на Windows тягнуться готові aarch64 wheels, без
+крос-компіляції):
+
+```powershell
+cd fpvscan
+py -3 deploy\build_pi_package.py
 ```
 
-Далі ставиш `zerotier-one`, приєднуєш вузол до мережі — і консоль
-доступна на `http://<zerotier-адреса>:8080`. Порт назовні не
-відкривається взагалі: `web.host` можна лишити `0.0.0.0`, бо єдиний
-маршрут до нього — через ZeroTier, але надійніше прописати саме
-ZeroTier-адресу вузла.
+На Pi скопіюй **один** файл з `fpvscan/dist/` і встанови:
+
+```bash
+tar -xzf fpvscan-pi5-arm64-0.1.0.tar.gz
+cd fpvscan-pi5-arm64-0.1.0
+sudo bash install.sh
+```
+
+або `.deb`:
+
+```bash
+sudo dpkg -i fpvscan_0.1.0_arm64.deb
+sudo apt-get install -f -y
+```
+
+З git-клону на самій Pi, як раніше: `sudo ./deploy/install_pi.sh`.
+
+Докладніше: `deploy/INSTALL-PI.md`.
+
+Консоль: `http://<zerotier-адреса>:8080`. Сервер слухає
+`0.0.0.0:8080` (усі інтерфейси, включно з ZeroTier). Nginx / пробросу
+портів немає. Якщо треба лише ZT — у `config.yaml` постав
+`web.host` на IP вузла в ZeroTier.
 
 Живлення: bladeRF на повній смузі їсть помітно, Pi 5 потребує
 БЖ на 5 В / 5 А. Кабель — обов'язково USB 3.0, інакше потік рветься.

@@ -911,6 +911,57 @@ canvas {
   color: var(--accent);
   background: transparent;
 }
+.fft-span {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 8px;
+  margin-top: var(--space-2);
+  font-size: var(--fs-meta);
+  color: var(--muted);
+}
+.fft-span input[type="range"] {
+  width: 100%;
+  min-width: 0;
+  direction: rtl;
+}
+.fft-span-val {
+  font-variant-numeric: tabular-nums;
+  color: var(--fg);
+  white-space: nowrap;
+}
+.rotator {
+  margin-top: var(--space-2);
+}
+.rotator[hidden] { display: none; }
+.rotator-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  font-size: var(--fs-meta);
+  color: var(--muted);
+}
+.rotator-steps {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 6px;
+  margin: 6px 0;
+}
+.rotator-steps button {
+  min-height: 2rem;
+  font-variant-numeric: tabular-nums;
+}
+.rotator.is-moving .rotator-meta {
+  color: var(--accent);
+}
+.rotator-span input[type="range"] { direction: ltr; }
+.rotator-meta {
+  margin: 4px 0 0;
+  font-size: var(--fs-meta);
+  color: var(--muted);
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
 
 /* ----- testing panel ----- */
 .test-panel {
@@ -1213,6 +1264,49 @@ fieldset.toolset:disabled fieldset.toolset-extra {
   color: var(--faint);
   line-height: 1.6;
   margin-top: var(--space-4);
+}
+
+.param-test {
+  margin-top: var(--space-4);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--line);
+}
+.param-test .test-kicker {
+  margin: 0 0 var(--space-3);
+  font-size: var(--fs-meta);
+  font-weight: 600;
+  color: var(--muted);
+}
+.param-test .group-head:first-child { margin-top: 0; }
+.param-all {
+  margin-top: var(--space-4);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--line);
+}
+.param-all > summary {
+  cursor: pointer;
+  list-style: none;
+  font-size: var(--fs-support);
+  font-weight: 600;
+  color: var(--fg);
+  min-height: 32px;
+  display: flex;
+  align-items: center;
+}
+.param-all > summary::-webkit-details-marker { display: none; }
+.param-all > summary::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  margin-right: 8px;
+  border-right: 1.5px solid var(--muted);
+  border-bottom: 1.5px solid var(--muted);
+  transform: rotate(-45deg);
+}
+.param-all[open] > summary::before { transform: rotate(45deg); }
+.param-all > summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
 .toast-live {

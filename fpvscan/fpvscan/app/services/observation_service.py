@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 from uuid import UUID, uuid4
@@ -69,10 +70,14 @@ class ObservationService:
         if replay is not None:
             return Observation.from_dict(replay)
         session = await self._require_writable(session_id)
-        snap = self._engine.snapshot()
+        snap = await asyncio.to_thread(self._engine.snapshot)
         now = utc_now_iso()
         freq = _resolve_frequency_hz(frequency_hz, fields, snap)
         incoming = _autofill_fields(dict(fields or {}), freq, snap)
+        params = parameter_snapshot
+        if params is None:
+            params = await asyncio.to_thread(
+                lambda: catalog_values(self._engine.current_cfg()))
         obs = Observation(
             id=str(uuid4()),
             session_id=session.id,
@@ -81,7 +86,7 @@ class ObservationService:
             rssi=rssi,
             snr=snr if snr is not None else _snr_from_snap(snap),
             video_metrics=video_metrics or dict(snap.get("video") or {}),
-            parameter_snapshot=parameter_snapshot or catalog_values(self._engine.current_cfg()),
+            parameter_snapshot=params,
             fields=validate_field_values(_schema_for_values(session.schema_snapshot), incoming),
             frame_ref=frame_ref or snap.get("last_frame_ref"),
             engine_status=_status_view(snap),
