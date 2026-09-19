@@ -44,6 +44,8 @@ STD_GEOM = {
 # для екстраполяції позиції наступної кадрової синхри в трекінгу,
 # точність тут не критична (похибка в межах вікна пошуку tol_frac*period)
 FIELD_LINES = {"PAL": 312.5, "NTSC": 262.5, "?": 287.5}
+# Active raster only (VBI already skipped). NTSC 240 must not be cropped to 234.
+ACTIVE_FIELD_LINES = {"PAL": 288, "NTSC": 240, "?": 288}
 
 
 @dataclass
@@ -131,6 +133,25 @@ def score_picture(frame: Frame | None) -> PictureScore:
     return PictureScore(value, bool(frame.locked), int(frame.lines), float(corr))
 
 
+def active_field_lines(standard: str) -> int:
+    return int(ACTIVE_FIELD_LINES.get(str(standard), 288))
+
+
+def field_is_framed(frame: Frame | None, *, slack_lines: int = 2) -> bool:
+    """True when the raster is a full PAL/NTSC field, not a 234-line shear."""
+    if frame is None or not getattr(frame, "locked", False):
+        return False
+    if getattr(frame, "free_run", False):
+        return False
+    expected = active_field_lines(getattr(frame, "standard", "?"))
+    need = max(1, int(expected) - max(0, int(slack_lines)))
+    rows = (
+        int(frame.luma.shape[0])
+        if frame.luma is not None and getattr(frame.luma, "ndim", 0) == 2 else 0
+    )
+    return int(frame.lines or 0) >= need and rows >= need
+
+
 @dataclass
 class DecodeState:
     """Пам'ять декодера між послідовними викликами decode() для одного
@@ -168,29 +189,23 @@ def _sync_edges(v: np.ndarray, thr: float):
 
 def _genlock_starts(v: np.ndarray, t0: float, period: float, n_lines: int,
                     thr: float, max_corr_frac: float = 0.12) -> np.ndarray:
-    """Порядковий генлок (часовий коректор бази, TBC).
+    """Uniform H-grid: one median phase, constant line period.
 
-    Замість того, щоб брати старт кожного рядка як `t0 + i*period` за
-    єдиним глобальним періодом, знаходимо фактичний передній фронт
-    рядкової синхри поряд із прогнозом і рівняємо рядок по ньому. Це
-    прибирає дві найпомітніші вади: **нахил вертикалей** (навіть частка
-    відлічку похибки періоду накопичується у зсув за 288 рядків) і
-    **розрив кадру** по діагоналі. Корекція обмежена вузьким вікном
-    (±max_corr_frac·period), тож завади й зрівнювальні імпульси кадрового
-    гасіння не здатні «перекинути» рядок на сусідній період; де фронт не
-    знайдено — лишаємо прогноз.
+    Per-line snap sheared analog FPV into a diagonal wrap when H pulses
+    were noisy. Measure edges only to estimate a single field phase.
     """
+    starts = float(t0) + np.arange(int(n_lines), dtype=np.float64) * float(period)
+    if n_lines < 2 or period < 8.0 or len(v) < 8:
+        return starts
     w = max(2, int(max_corr_frac * period))
-    starts = t0 + np.arange(n_lines, dtype=np.float64) * period
     base = np.floor(starts).astype(np.int64)
     fracpos = starts - base
     rel = np.arange(-w, w + 2, dtype=np.int64)
     wi = base[:, None] + rel[None, :]
     np.clip(wi, 0, len(v) - 1, out=wi)
-    seg = v[wi]                                   # (n_lines, len(rel))
+    seg = v[wi]
     below = seg < thr
-    fall = below[:, 1:] & ~below[:, :-1]          # передній фронт синхри
-    # субвідлікова позиція перетину порогу для кожного потенційного фронту
+    fall = below[:, 1:] & ~below[:, :-1]
     a = seg[:, :-1]
     b = seg[:, 1:]
     denom = a - b
@@ -202,13 +217,11 @@ def _genlock_starts(v: np.ndarray, t0: float, period: float, n_lines: int,
     j = np.argmin(dist, axis=1)
     rows = np.arange(n_lines)
     found = dist[rows, j] < big
-    corr = base + edge_pos[rows, j]
-    corr = np.clip(corr, starts - w, starts + w)
-    # Не беремо повний стрибок фронту: 65% виміру + 35% прогнозу гасить
-    # поодинокі хибні фронти (зрівнювальні імпульси, шум), які інакше
-    # рвуть вертикалі. Де фронту немає — лишаємо прогноз.
-    blended = 0.65 * corr + 0.35 * starts
-    return np.where(found, blended, starts)
+    if not bool(found.any()):
+        return starts
+    corr = np.clip(base + edge_pos[rows, j], starts - w, starts + w)
+    residual = (corr - starts)[found]
+    return starts + float(np.median(residual))
 
 
 TBC_SEARCH_FRAC = 0.52
@@ -278,38 +291,18 @@ def _tbc_line_edges(v: np.ndarray, nom_starts: np.ndarray,
 def _tbc_smooth_edges(edges: np.ndarray, period: float,
                       max_delta: float = TBC_DELTA_CLAMP,
                       ema: float = TBC_SMOOTH_EMA) -> np.ndarray:
-    """median-3 + 1-tap EMA + Δ clamp on per-line residuals.
+    """One H-phase for the whole field. Period stays constant.
 
-    Tracked lock already searches ±15%. Does not roll the raster.
+    ``max_delta`` / ``ema`` kept for callers; a walking per-line residual
+    is what produced the 234-line diagonal shear on noisy FPV H.
     """
     e = np.asarray(edges, dtype=np.float64)
     n = int(e.size)
-    if n < 3 or period < 8.0:
+    if n < 1 or period < 8.0:
         return e
     idx = np.arange(n, dtype=np.float64)
-    base = float(np.median(e - idx * period))
-    grid = base + idx * period
-    r = e - grid
-    prev = np.empty(n, dtype=np.float64)
-    nxt = np.empty(n, dtype=np.float64)
-    prev[0] = r[0]
-    prev[1:] = r[:-1]
-    nxt[-1] = r[-1]
-    nxt[:-1] = r[1:]
-    r = np.median(np.stack((prev, r, nxt), axis=0), axis=0)
-    out = np.empty(n, dtype=np.float64)
-    out[0] = r[0]
-    a = float(np.clip(ema, 0.05, 0.95))
-    lim = float(max_delta)
-    for i in range(1, n):
-        pred = (1.0 - a) * out[i - 1] + a * r[i]
-        d = pred - out[i - 1]
-        if d > lim:
-            pred = out[i - 1] + lim
-        elif d < -lim:
-            pred = out[i - 1] - lim
-        out[i] = pred
-    return grid + out
+    base = float(np.median(e - idx * float(period)))
+    return base + idx * float(period)
 
 
 def _tbc_hold_footer(edges: np.ndarray, period: float,
@@ -539,7 +532,11 @@ def _h_crop(luma: np.ndarray,
     bl = min(max(int(bottom_lines), 0), 24)
     left = int(round(w * lf))
     left = min(left, max(0, w - 48))
+    # NTSC active field is 240. Cropping 6 footer lines made LOCK read
+    # 234 and ate the last OSD row. PAL 288 still allows the footer trim.
     bottom = min(bl, max(0, h - 24))
+    if 220 <= h <= 252:
+        bottom = 0
     out = luma[:, left:] if left else luma
     if bottom:
         out = out[:-bottom]
@@ -569,14 +566,13 @@ def _render(v: np.ndarray, starts: np.ndarray, period: float,
             h_phase_frac: float = 0.0,
             thr: float = 0.18,
             tbc_locked: bool = False) -> np.ndarray:
-    """TBC: slice PAL/NTSC active window from each line's H-sync edge.
+    """TBC: slice PAL/NTSC active window from a uniform H-grid.
 
-    `starts` are the period-grid / genlock estimate. Per-line TBC finds
-    the 1D leading edge, then copies a0…a1 from that edge so H-blank
-    never enters luma. Tracked lock uses a narrow search; blind / lost
-    / weak edges keep ±52%. Edges are median-3 + EMA, Δ clamped.
+    `starts` are the period-grid / genlock estimate. Line edges are
+    measured only to pick one field H-phase; the sample grid keeps a
+    constant period so noisy H cannot shear columns. Tracked lock uses
+    a narrow search; blind / lost / weak edges keep ±52%.
     `h_phase_frac` is a residual offset after TBC (0 / |x|<0.01 = none).
-    2D roll is not used to hide blank.
     """
     frac = tbc_search_frac(locked=tbc_locked)
     edges, found = _tbc_line_edges(
@@ -721,13 +717,15 @@ def _attempt(v: np.ndarray, fs: float, width: int, max_lines: int,
     luma = _render(v, starts, period, a0_frac, a1_frac, width,
                    auto_levels=auto_levels, sharpen=sharpen, state=state,
                    h_phase_frac=h_phase_frac, thr=thr, tbc_locked=False)
+    want = active_field_lines(standard)
     if state is not None:
         if state.target_lines is None:
-            state.target_lines = max_lines
+            state.target_lines = want
         luma = _fit_height(luma, state.target_lines)
+    rows = int(luma.shape[0]) if luma is not None and luma.ndim == 2 else n_lines
     return score, Frame(
         luma=luma,
-        line_rate=line_rate, lines=n_lines,
+        line_rate=line_rate, lines=rows,
         standard=standard, locked=locked), t0
 
 
@@ -827,10 +825,11 @@ def _attempt_tracked(v: np.ndarray, fs: float, width: int, max_lines: int,
                    auto_levels=auto_levels, sharpen=sharpen, state=state,
                    h_phase_frac=h_phase_frac, thr=thr, tbc_locked=True)
     if state.target_lines is None:
-        state.target_lines = max_lines
+        state.target_lines = active_field_lines(standard)
     luma = _fit_height(luma, state.target_lines)
+    rows = int(luma.shape[0]) if luma is not None and luma.ndim == 2 else n_lines
     frame = Frame(luma=luma,
-                line_rate=fs / period, lines=n_lines,
+                line_rate=fs / period, lines=rows,
                 standard=standard, locked=True,
                 field_parity=int(n_fields) % 2)
 
@@ -900,6 +899,8 @@ def decode(base: np.ndarray, fs: float, width: int = 640,
             state.abs_t0 = abs_t0
             state.lost = 0
             frame.luma = _h_crop(frame.luma, crop_left_frac, crop_bottom_lines)
+            if frame.luma is not None and getattr(frame.luma, "ndim", 0) == 2:
+                frame.lines = int(frame.luma.shape[0])
             return frame
         state.lost += 1
 
@@ -931,9 +932,11 @@ def decode(base: np.ndarray, fs: float, width: int = 640,
         state.h_roll = None
         state.h_edge_hist = ()
         if state.target_lines is None:
-            state.target_lines = max_lines
+            state.target_lines = active_field_lines(best_f.standard)
         best_f.luma = _fit_height(best_f.luma, state.target_lines)
     best_f.luma = _h_crop(best_f.luma, crop_left_frac, crop_bottom_lines)
+    if best_f.luma is not None and getattr(best_f.luma, "ndim", 0) == 2:
+        best_f.lines = int(best_f.luma.shape[0])
     return best_f
 
 

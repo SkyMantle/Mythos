@@ -6,9 +6,11 @@ from fpvscan.dsp.cvbs import (
     CROP_BOTTOM_LINES,
     CROP_LEFT_FRAC,
     DecodeState,
+    Frame,
     _h_crop,
     _h_unwrap,
     edge_col_stable,
+    field_is_framed,
     h_blank_col,
     h_phase_col,
     h_phase_manual_px,
@@ -155,6 +157,28 @@ def test_rf_snap_due_cooldown_blocks_spam() -> None:
         **kw, last_snap_mono=1.0, now_mono=1.0 + RF_SNAP_COOLDOWN_S - 0.1)
     assert rf_snap_due(
         **kw, last_snap_mono=1.0, now_mono=1.0 + RF_SNAP_COOLDOWN_S + 0.1)
+
+
+def test_field_is_framed_rejects_short_ntsc_shear() -> None:
+    torn = Frame(
+        luma=np.full((234, 80), 90, np.uint8),
+        line_rate=15734.0, lines=234, standard="NTSC", locked=True,
+    )
+    assert not field_is_framed(torn)
+    full = Frame(
+        luma=np.full((240, 80), 90, np.uint8),
+        line_rate=15734.0, lines=240, standard="NTSC", locked=True,
+    )
+    assert field_is_framed(full)
+
+
+def test_h_crop_does_not_eat_ntsc_active_field() -> None:
+    ntsc = np.ones((240, 120), np.uint8) * 80
+    cropped = _h_crop(ntsc, 0.0, 6)
+    assert cropped.shape[0] == 240
+    pal = np.ones((288, 120), np.uint8) * 80
+    pal_out = _h_crop(pal, 0.0, 6)
+    assert pal_out.shape[0] == 282
 
 
 def test_h_phase_deadzone_freeze_and_stable_edge() -> None:

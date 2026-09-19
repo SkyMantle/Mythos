@@ -59,6 +59,16 @@ def test_tbc_render_drops_midframe_hblank() -> None:
     assert float(cmid.min()) > 40
 
 
+def test_tbc_smooth_keeps_constant_period() -> None:
+    period = 100.0
+    grid = 12.0 + np.arange(12, dtype=np.float64) * period
+    measured = grid + 6.5
+    measured[4] += 18.0
+    out = _tbc_smooth_edges(measured, period)
+    assert np.allclose(np.diff(out), period, atol=1e-9)
+    assert abs(float(np.median(out - grid)) - 6.5) < 2.0
+
+
 def test_tbc_median3_kills_single_line_spike() -> None:
     period = 64.0
     n = 24
