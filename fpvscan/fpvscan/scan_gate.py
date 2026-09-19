@@ -46,11 +46,12 @@ def should_full_inspect(
     scan: dict[str, Any],
     line_hint: bool = False,
 ) -> bool:
-    """Expensive inspect (retune + offsets + decode) only near a dwell or extra.
+    """Expensive inspect only near a dwell, and only with a PAL/NTSC comb.
 
-    Far coarse LTE blobs still queue cluster extras; they do not stall the pass.
-    Narrow analog next to the dwell keeps the 0.6× min_bw path.
-    Extras need a cheap 15.7 kHz comb hint so DJI/Wi-Fi skip decode.
+    Far coarse LTE blobs do not stall the pass. Narrow analog next to the
+    dwell keeps the 0.6× min_bw path. Default ``inspect_need_comb`` /
+    ``inspect_extras_need_comb`` skip the 40 ms decode when the dwell IQ
+    already classified analog — or had no comb at all.
     """
     hit_tol = float(scan.get("hit_tol_hz") or HIT_TOL_HZ)
     min_bw = float(scan.get("min_bw_hz") or INSPECT_MIN_BW_HZ)
@@ -61,8 +62,14 @@ def should_full_inspect(
         if not (near and bw >= 0.6 * min_bw and float(snr_db) >= 8):
             return False
     if from_extra:
+        if scan.get("inspect_extras_need_comb", True):
+            return bool(line_hint)
+        return True
+    if not near:
+        return False
+    if scan.get("inspect_need_comb", True):
         return bool(line_hint)
-    return bool(near)
+    return True
 
 
 def inspect_soft_ok(
