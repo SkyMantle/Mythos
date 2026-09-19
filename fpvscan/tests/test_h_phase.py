@@ -7,6 +7,8 @@ from fpvscan.dsp.cvbs import (
     CROP_LEFT_FRAC,
     DecodeState,
     Frame,
+    _field_n_lines,
+    _fit_height,
     _h_crop,
     _h_unwrap,
     edge_col_stable,
@@ -170,6 +172,34 @@ def test_field_is_framed_rejects_short_ntsc_shear() -> None:
         line_rate=15734.0, lines=240, standard="NTSC", locked=True,
     )
     assert field_is_framed(full)
+    pal = Frame(
+        luma=np.full((288, 80), 90, np.uint8),
+        line_rate=15625.0, lines=288, standard="PAL", locked=True,
+    )
+    assert field_is_framed(pal)
+
+
+def test_field_n_lines_keeps_ntsc_when_early_vsync_is_noise() -> None:
+    assert _field_n_lines("NTSC", avail=400.0, max_lines=288,
+                          next_vs_lines=210.0) == 240
+    assert _field_n_lines("NTSC", avail=400.0, max_lines=288,
+                          next_vs_lines=237.0) == 240
+    assert _field_n_lines("NTSC", avail=400.0, max_lines=288,
+                          next_vs_lines=242.0) == 240
+    # Mid-field grab: real next vsync must still stop the splice.
+    assert _field_n_lines("NTSC", avail=120.0, max_lines=288,
+                          next_vs_lines=100.0) == 100
+    assert _field_n_lines("PAL", avail=400.0, max_lines=288,
+                          next_vs_lines=None) == 288
+
+
+def test_fit_height_does_not_pad_short_ntsc() -> None:
+    short = np.ones((237, 40), np.uint8) * 80
+    out = _fit_height(short, 240)
+    assert out.shape[0] == 237
+    tall = np.ones((288, 40), np.uint8) * 80
+    ntsc = _fit_height(tall, 240)
+    assert ntsc.shape[0] == 240
 
 
 def test_h_crop_does_not_eat_ntsc_active_field() -> None:

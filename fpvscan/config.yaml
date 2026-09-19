@@ -43,6 +43,8 @@ scan:
   min_confidence: 0.45 # поріг ухвалення за рядковою лінією
   min_harmonics: 1 # без гребінця гармонік рядок — вузька завада, не відео
   inspect_decode: true # м'який фільтр: кадр на зсуві АБО спектральний PAL/NTSC
+  inspect_need_comb: true # грубий тайль: 40 мс inspect лише з PAL/NTSC гребінкою
+  inspect_extras_need_comb: true # extras без 15.7 кГц не inspect; гребінка вже в списку
   inspect_min_row_corr: 0.12 # схожість сусідніх рядків; шум/сніг дає ~0
   inspect_require_lock: false # 40 мс INSPECT часто не ловить кадрову; фільтр — corr
   inspect_min_lines: 80 # мінімум рядків у димовому кадрі
@@ -92,7 +94,7 @@ video:
   h_phase_frac: 0.0 # залишковий зсув ПІСЛЯ TBC; 0 / |x|<0.01 = немає; не ховає blank
   h_pll: false # ФАПЧ рядка: повільно уточнює period у DecodeState; вимк = заморожений період
   crop_left_frac: 0.07 # страховий зріз leftover porch на 4991; футер не чіпати
-  crop_bottom_lines: 6 # нижні рядки 288-поля; OSD 3487 сидить внизу
+  crop_bottom_lines: 0 # не різати OSD; NTSC 240 захищений і в _h_crop, якщо знову 6
   hunt_min_gain: 0.10 # наскільки оцінка має зрости, щоб прийняти зсув
   hunt_skip_if_score: 0.70 # якщо вже добре — не витрачати CPU
   hunt_drop: 0.12 # шукати лише коли оцінка впала відносно недавнього піку

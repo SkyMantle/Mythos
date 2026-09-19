@@ -68,6 +68,21 @@ def _fm_tone(n: int = 4096, fs: float = 1e6, f0: float = 50e3) -> np.ndarray:
     return (np.cos(ph) + 1j * np.sin(ph)).astype(np.complex64)
 
 
+def test_classify_video_reads_comb_at_4096_samples() -> None:
+    fs = 400e3
+    pal = classify_video(
+        _tone(LINE_PAL, fs=fs, n=4096), fs,
+        min_harmonics=0, min_conf=0.0, min_prominence_db=0.0,
+    )
+    assert pal.is_video and pal.standard == "PAL"
+    short = classify_video(
+        _tone(LINE_PAL, fs=fs, n=4095), fs,
+        min_harmonics=0, min_conf=0.0, min_prominence_db=0.0,
+    )
+    assert not short.is_video
+    assert "закороткий" in short.reason
+
+
 def test_fm_demod_numpy_fallback_runs() -> None:
     iq = _fm_tone()
     out = _fm_demod_numpy(iq, 1e6, 4e6)

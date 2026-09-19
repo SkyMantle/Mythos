@@ -183,7 +183,7 @@ def test_sweep_comb_pass_is_at_least_twice_as_fast_as_inspect_storm() -> None:
     n = coarse_sweep_len(scan)
     assert 400 <= n <= 500
     assert SWEEP_AVERAGES_MAX == 8
-    assert 0.018 <= SWEEP_COMB_S <= 0.025
+    assert 0.010 <= SWEEP_COMB_S <= 0.015
     before_s = n * 0.70
     after_s = n * (SWEEP_COMB_S + 0.012)
     assert after_s * 2.0 <= before_s

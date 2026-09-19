@@ -31,8 +31,8 @@ from .web.coalesce import enqueue_live_event
 from .recorder import VideoRecorder, FfmpegMissing
 
 STREAM_LOCK_CHUNK_S = 0.040
-# Enough dwell IQ for classify_video after ~400 kHz decimation.
-SWEEP_COMB_S = 0.022
+# classify_video needs ~10 ms after ~400 kHz decimation (4096 bins).
+SWEEP_COMB_S = 0.012
 SWEEP_AVERAGES_MAX = 8
  
  
@@ -586,15 +586,16 @@ class Engine:
                 dc_notch_hz=float(scan.get("dc_notch_hz", 200e3)))
 
             for o in occ:
-                score = self._sweep_classify(iq, fs, f, o, scan)
+                score, freq_off = self._sweep_classify(iq, fs, f, o, scan)
                 line_hint = bool(
                     score is not None
                     and score.is_video
                     and score.standard in ("PAL", "NTSC")
                 )
                 if line_hint:
-                    self._queue_cluster_dense(o.center_hz, f, scan)
-                    self._merge_comb_detection(o, score)
+                    peak = float(o.center_hz) + float(freq_off)
+                    self._queue_cluster_dense(peak, f, scan)
+                    self._merge_comb_detection(o, score, freq_off=freq_off)
                     continue
                 if not scan_gate.should_full_inspect(
                     dwell_hz=f, center_hz=o.center_hz,
@@ -726,6 +727,7 @@ class Engine:
             row_corr=0.0 if pic is None else round(pic.row_corr, 3),
             pic_locked=False if pic is None else bool(pic.locked),
             pic_lines=0 if pic is None else int(pic.lines),
+            analog_evidence=score.standard in ("PAL", "NTSC"),
         )
         self._merge(det)
 
@@ -777,46 +779,82 @@ class Engine:
 
     def _sweep_line_hint(self, iq, fs, dwell_hz, occ, scan) -> bool:
         """Cheap 15.7 kHz comb on extra-dwell IQ. No retune, no decode."""
-        score = self._sweep_classify(iq, fs, dwell_hz, occ, scan)
+        score, _off = self._sweep_classify(iq, fs, dwell_hz, occ, scan)
         return bool(score is not None and score.is_video)
 
     def _sweep_classify(self, iq, fs, dwell_hz, occ, scan):
-        """PAL/NTSC comb on the dwell IQ. No extra retune, no decode."""
-        try:
-            mix = float(occ.center_hz) - float(dwell_hz)
-            insp_bw = scan_gate.inspect_bw_hz(scan, occ.center_hz)
-            out_bw = min(max(float(occ.bandwidth_hz), 8e6), insp_bw, fs * 0.9)
-            ch, fs2 = demod.channelize(
-                iq, fs, mix, out_bw_hz=out_bw,
-                fast=bool(scan.get("fast_channelizer", False)))
-            base = demod.fm_demod(
-                ch, fs2, deviation_hz=max(float(occ.bandwidth_hz), 8e6) / 5)
-            return demod.classify_video(
-                base, fs2,
-                tol_hz=float(scan.get("line_tol_hz", 150)),
-                min_prominence_db=float(scan.get("line_prominence_db", 8)),
-                min_conf=float(scan.get("min_confidence", 0.45)),
-                min_harmonics=int(scan.get("min_harmonics", 1)),
-            )
-        except Exception:
-            return None
+        """PAL/NTSC comb on the dwell IQ. No extra retune, no decode.
 
-    def _merge_comb_detection(self, occ, score) -> None:
+        Returns (score, freq_off). Offsets are tried only when the occupancy
+        already has a 15.7 kHz ridge that failed classify at 0 Hz.
+        """
+        bw = float(occ.bandwidth_hz)
+        if not (4.0e6 <= bw <= 25.0e6):
+            return None, 0.0
+        try:
+            insp_bw = scan_gate.inspect_bw_hz(scan, occ.center_hz)
+            out_bw = min(max(bw, 8e6), insp_bw, fs * 0.9)
+            fast = bool(scan.get("fast_channelizer", False))
+            tol = float(scan.get("line_tol_hz", 150))
+            prom = float(scan.get("line_prominence_db", 8))
+            min_conf = float(scan.get("min_confidence", 0.45))
+            min_h = int(scan.get("min_harmonics", 1))
+            mixes = [0.0]
+            best = None
+            best_off = 0.0
+            for mix_off in mixes:
+                mix = (float(occ.center_hz) + mix_off) - float(dwell_hz)
+                ch, fs2 = demod.channelize(
+                    iq, fs, mix, out_bw_hz=out_bw, fast=fast)
+                base = demod.fm_demod(
+                    ch, fs2, deviation_hz=max(bw, 8e6) / 5)
+                score = demod.classify_video(
+                    base, fs2, tol_hz=tol, min_prominence_db=prom,
+                    min_conf=min_conf, min_harmonics=min_h)
+                if score is not None and score.is_video and score.standard in (
+                        "PAL", "NTSC"):
+                    return score, mix_off
+                best, best_off = score, mix_off
+            ridge = bool(
+                best is not None and float(getattr(best, "prominence_db", 0) or 0) >= 6.0)
+            if not ridge:
+                return best, best_off
+            for mix_off in (1.0e6, -1.0e6, 2.0e6, -2.0e6, 4.0e6, -4.0e6, 8.0e6, -8.0e6):
+                mix = (float(occ.center_hz) + mix_off) - float(dwell_hz)
+                ch, fs2 = demod.channelize(
+                    iq, fs, mix, out_bw_hz=out_bw, fast=fast)
+                base = demod.fm_demod(
+                    ch, fs2, deviation_hz=max(bw, 8e6) / 5)
+                if not demod.line_comb_hint(base, fs2):
+                    continue
+                score = demod.classify_video(
+                    base, fs2, tol_hz=tol, min_prominence_db=prom,
+                    min_conf=min_conf, min_harmonics=min_h)
+                if score is not None and score.is_video and score.standard in (
+                        "PAL", "NTSC"):
+                    return score, mix_off
+            return best, best_off
+        except Exception:
+            return None, 0.0
+
+    def _merge_comb_detection(self, occ, score, freq_off: float = 0.0) -> None:
         """List analog PAL/NTSC from the dwell comb without a 40 ms inspect."""
         if score is None or not score.is_video:
             return
         if score.standard not in ("PAL", "NTSC"):
             return
         now = time.time()
+        need = int((self.cfg.get("scan") or {}).get("confirm_hits", 2))
         self._merge(Detection(
-            freq_hz=occ.center_hz,
+            freq_hz=float(occ.center_hz) + float(freq_off),
             bandwidth_hz=occ.bandwidth_hz,
             snr_db=round(occ.snr_db, 1),
             standard=score.standard,
             confidence=float(score.confidence),
-            channel=nearest_channel(occ.center_hz),
-            band=band_of(occ.center_hz),
+            channel=nearest_channel(float(occ.center_hz) + float(freq_off)),
+            band=band_of(float(occ.center_hz) + float(freq_off)),
             first_seen=now, last_seen=now,
+            hits=max(1, need),
             line_rate=float(score.line_rate),
             analog_evidence=True,
         ))
@@ -1232,8 +1270,9 @@ class Engine:
         pic = cvbs.score_picture(frame)
         skip = float(vcfg.get("hunt_skip_if_score", 0.70))
         hold = float(vcfg.get("hunt_hold_score", scan_view.HUNT_HOLD_SCORE))
+        # 234-line shear is locked CVBS, not a framed field — keep hunting.
         if scan_view.freeze_afc_hunt(
-                pic_locked=bool(frame.locked), pic_score=float(pic.value),
+                pic_locked=cvbs.field_is_framed(frame), pic_score=float(pic.value),
                 min_score=hold):
             return
         peak = self._lock_score_peak
@@ -1451,8 +1490,9 @@ class Engine:
 
         pic = cvbs.score_picture(frame)
         hold = float(vcfg.get("hunt_hold_score", scan_view.HUNT_HOLD_SCORE))
+        framed = cvbs.field_is_framed(frame)
         freeze_hunt = scan_view.freeze_afc_hunt(
-            pic_locked=bool(pic.locked), pic_score=float(pic.value),
+            pic_locked=bool(framed), pic_score=float(pic.value),
             min_score=hold)
 
         self._maybe_auto_mgc(frame, iq)
@@ -1461,7 +1501,7 @@ class Engine:
             self._apply_afc(fm_base, fs, off, ch_bw, deviation, vcfg,
                             pic_locked=freeze_hunt)
         self._maybe_rf_snap(
-            pic_locked=bool(pic.locked), pic_score=float(pic.value),
+            pic_locked=bool(framed), pic_score=float(pic.value),
             digital_max_hz=self._digital_afc_lim(fs, off, ch_bw, vcfg),
         )
         t = self._mark("afc", t)
@@ -1677,6 +1717,10 @@ class Engine:
         det.pic_lines = int(pic.lines)
         if frame is not None and getattr(frame, "standard", None):
             det.standard = frame.standard
+            if str(frame.standard) in ("PAL", "NTSC"):
+                det.analog_evidence = True
+        elif pic.locked:
+            det.analog_evidence = True
 
     def _lock_pic_sample(self, frame, pic) -> dict:
         std = getattr(frame, "standard", "") if frame is not None else ""

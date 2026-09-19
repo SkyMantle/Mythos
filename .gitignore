@@ -10,3 +10,10 @@ fpvscan/scripts/decoded.png
 
 # Generated runtime output
 fpvscan/out/
+
+# Local Cursor hook state (never ship)
+.cursor/hooks/
+
+# Pi package artifacts and accidental npm lock
+fpvscan/dist/
+fpvscan/package-lock.json

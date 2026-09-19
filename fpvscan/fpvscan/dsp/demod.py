@@ -311,7 +311,7 @@ def classify_video(base: np.ndarray, fs: float,
     # спектр яскравості на ту саму ділянку. Ставимо перед ним
     # ковзне середнє — дешевий ФНЧ з нулями кратно частоті прорідження.
     x, fs2 = _decimate_for_line(base, fs)
-    if len(x) < 8192:      # менше ~20 мс ефіру — рядкову не виміряти
+    if len(x) < 4096:      # ~10 мс @400 кГц — гребінка вже читається
         return VideoScore(False, 0.0, "?", 0.0, reason="закороткий буфер")
 
     comb = _line_comb_spectrum(x, fs2)

@@ -152,6 +152,26 @@ def field_is_framed(frame: Frame | None, *, slack_lines: int = 2) -> bool:
     return int(frame.lines or 0) >= need and rows >= need
 
 
+def _field_n_lines(standard: str, avail: float, max_lines: int,
+                   next_vs_lines: float | None = None) -> int:
+    """Active PAL/NTSC field length. Ignore a noisy early V pulse.
+
+    A false 0.55-low window at ~210 lines cut NTSC to 210–237 and the
+    288 pad made the footer twitch. Mid-field grabs still stop at a
+    real next vsync so two fields are not spliced.
+    """
+    want = active_field_lines(standard)
+    cap = min(float(max(0, max_lines)), float(max(0.0, avail)))
+    if next_vs_lines is not None and next_vs_lines > 32.0:
+        if next_vs_lines >= want - 2:
+            cap = min(cap, next_vs_lines)
+        elif cap >= want - 2:
+            cap = min(cap, float(want))
+        else:
+            cap = min(cap, next_vs_lines)
+    return int(min(want, cap))
+
+
 @dataclass
 class DecodeState:
     """Пам'ять декодера між послідовними викликами decode() для одного
@@ -544,19 +564,21 @@ def _h_crop(luma: np.ndarray,
 
 
 def _fit_height(luma: np.ndarray, target: int) -> np.ndarray:
-    """Підганяє растр до стабільної висоти: обрізає зверху або дописує
-    останнім рядком (менше мерехтить, ніж чорна смуга)."""
-    h, w = luma.shape
-    if h == target:
+    """Crop a tall field to the standard. Never pad 237→240/288.
+
+    Repeating the last row (old path) turned a short NTSC field into a
+    twitching 288-line footer. Leave a short raster short; assembly
+    should take a full field from the IQ instead.
+    """
+    if luma is None or getattr(luma, "ndim", 0) != 2:
         return luma
-    if h > target:
-        return luma[:target]
-    out = np.empty((target, w), dtype=luma.dtype)
-    out[:h] = luma
-    # Do not repeat the VBI/footer row — that twitches when stretched to 288.
-    src = luma[max(0, h - TBC_FOOTER_HOLD - 1)]
-    out[h:] = src
-    return out
+    h = int(luma.shape[0])
+    t = int(target)
+    if t <= 0 or h == t:
+        return luma
+    if h > t:
+        return luma[:t]
+    return luma
 
 
 def _render(v: np.ndarray, starts: np.ndarray, period: float,
@@ -707,9 +729,10 @@ def _attempt(v: np.ndarray, fs: float, width: int, max_lines: int,
     a0 = a0_frac * period
     a1 = a1_frac * period
     avail = (len(v) - t0 - period) / period
+    next_vs_lines = None
     if next_vs_start is not None:
-        avail = min(avail, (next_vs_start - t0) / period - 1.0)
-    n_lines = int(min(max_lines, avail))
+        next_vs_lines = (next_vs_start - t0) / period - 1.0
+    n_lines = _field_n_lines(standard, avail, max_lines, next_vs_lines)
     if a1 <= a0 or n_lines < 32:
         return 0.0, None, None
 
@@ -803,20 +826,20 @@ def _attempt_tracked(v: np.ndarray, fs: float, width: int, max_lines: int,
     a0 = a0_frac * period
     a1 = a1_frac * period
     avail = (len(vv) - t0 - period) / period
-    # Той самий захист від розриву, що й у сліпому шляху: не заходити за
-    # наступне кадрове гасіння. Шукаємо його лише в тій частині буфера,
-    # яку збираємось рендерити (обмежений cumsum — дешево).
+    # Same V-guard as the blind path: do not splice the next field, but
+    # do not let a noisy 0.55-low window shorten a complete NTSC field.
     win = int(period)
     lo_s = int(t0 + 5 * period)
     hi_s = int(min(len(vv), t0 + (max_lines + 6) * period))
+    next_vs_lines = None
     if hi_s - lo_s > 2 * win:
         seg_below = (vv[lo_s:hi_s] < thr).astype(np.int32)
         csum = np.cumsum(np.concatenate(([0], seg_below)))
         vfrac = (csum[win:] - csum[:-win]) / win
         vsloc = np.flatnonzero(vfrac > 0.55)
         if len(vsloc):
-            avail = min(avail, (lo_s + int(vsloc[0]) - t0) / period - 1.0)
-    n_lines = int(min(max_lines, avail))
+            next_vs_lines = (lo_s + int(vsloc[0]) - t0) / period - 1.0
+    n_lines = _field_n_lines(standard, avail, max_lines, next_vs_lines)
     if a1 <= a0 or n_lines < 32:
         return None
 

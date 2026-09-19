@@ -27,7 +27,8 @@ def _det(freq_mhz: float, snr: float, **kw) -> dict:
         "pic_locked": kw.get("pic_locked", False),
         "confidence": kw.get("confidence", 0.6),
     }
-    for key in ("standard", "row_corr", "pic_lines", "lines", "last_picture_at"):
+    for key in ("standard", "row_corr", "pic_lines", "lines", "last_picture_at",
+                "analog_evidence"):
         if key in kw:
             row[key] = kw[key]
     return row
@@ -160,3 +161,16 @@ def test_sticky_published_hz_freezes_and_pins_lock() -> None:
     assert sticky_published_hz(
         4990.5e6, 5000.5e6, lock_target=4990.5e6, locked=True,
     ) == 5000.5e6
+
+
+def test_hide_weak_keeps_analog_comb_without_picture_score() -> None:
+    analog = _det(
+        1100, 20.0, pic_score=0.0, standard="NTSC", analog_evidence=True, band="1G2",
+    )
+    bird = _det(1125, 5.0, pic_score=0.0, band="1G2")
+    shown = filter_published([analog, bird], "hide_weak")
+    freqs = {round(d["freq_hz"] / 1e6) for d in shown}
+    assert 1100 in freqs
+    assert 1125 not in freqs
+    video = filter_published([analog, bird], "hide_no_video")
+    assert [round(d["freq_hz"] / 1e6) for d in video] == [1100]
