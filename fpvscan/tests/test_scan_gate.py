@@ -95,10 +95,15 @@ def test_inspect_skipped_for_far_wide_digital_blob() -> None:
     )
     assert far is False
     near = should_full_inspect(
-        dwell_hz=3489e6, center_hz=3491e6, bandwidth_hz=10e6, snr_db=18.0,
-        from_extra=False, scan=scan,
+        dwell_hz=1.1e9, center_hz=1.102e9, bandwidth_hz=10e6, snr_db=18.0,
+        from_extra=False, scan=scan, line_hint=True,
     )
     assert near is True
+    near_no_comb = should_full_inspect(
+        dwell_hz=1.1e9, center_hz=1.102e9, bandwidth_hz=10e6, snr_db=18.0,
+        from_extra=False, scan=scan, line_hint=False,
+    )
+    assert near_no_comb is False
     extra_no_comb = should_full_inspect(
         dwell_hz=2412e6, center_hz=2430e6, bandwidth_hz=10e6, snr_db=16.0,
         from_extra=True, scan=scan, line_hint=False,
@@ -110,21 +115,21 @@ def test_inspect_skipped_for_far_wide_digital_blob() -> None:
     )
     assert extra_comb is True
     narrow_near = should_full_inspect(
-        dwell_hz=3489e6, center_hz=3491e6, bandwidth_hz=3.1e6, snr_db=12.0,
-        from_extra=False, scan=scan,
+        dwell_hz=1.1e9, center_hz=1.102e9, bandwidth_hz=3.1e6, snr_db=12.0,
+        from_extra=False, scan=scan, line_hint=True,
     )
     assert narrow_near is True
 
 
 def test_inspect_near_is_14mhz() -> None:
-    dwell = 4988e6
+    dwell = 5.1e9
     near = should_full_inspect(
         dwell_hz=dwell, center_hz=dwell + 13e6, bandwidth_hz=10e6, snr_db=18.0,
-        from_extra=False, scan=SCAN,
+        from_extra=False, scan=SCAN, line_hint=True,
     )
     far = should_full_inspect(
         dwell_hz=dwell, center_hz=dwell + 15e6, bandwidth_hz=10e6, snr_db=18.0,
-        from_extra=False, scan=SCAN,
+        from_extra=False, scan=SCAN, line_hint=True,
     )
     assert near is True
     assert far is False
@@ -162,6 +167,26 @@ def test_extra_without_line_comb_skips_full_inspect() -> None:
         from_extra=True, scan=SCAN, line_hint=line_comb_hint(pal, fs),
     )
     assert go is True
+
+
+def test_sweep_comb_pass_is_at_least_twice_as_fast_as_inspect_storm() -> None:
+    from fpvscan.engine import SWEEP_AVERAGES_MAX, SWEEP_COMB_S
+    from fpvscan.scan_view import coarse_sweep_len
+
+    scan = {
+        "start_hz": 400e6,
+        "stop_hz": 6000e6,
+        "sample_rate": 20e6,
+        "step_hz": 12e6,
+        "channel_bw_hz": 16e6,
+    }
+    n = coarse_sweep_len(scan)
+    assert 400 <= n <= 500
+    assert SWEEP_AVERAGES_MAX == 8
+    assert 0.018 <= SWEEP_COMB_S <= 0.025
+    before_s = n * 0.70
+    after_s = n * (SWEEP_COMB_S + 0.012)
+    assert after_s * 2.0 <= before_s
 
 
 def test_auto_peek_skipped_when_pic_score_zero() -> None:

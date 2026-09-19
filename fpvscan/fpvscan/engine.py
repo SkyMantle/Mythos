@@ -29,6 +29,11 @@ from .dsp.field_blend import blend_same_field
 from . import auto_mgc, paths, scan_gate, scan_hits, scan_view
 from .web.coalesce import enqueue_live_event
 from .recorder import VideoRecorder, FfmpegMissing
+
+STREAM_LOCK_CHUNK_S = 0.040
+# Enough dwell IQ for classify_video after ~400 kHz decimation.
+SWEEP_COMB_S = 0.022
+SWEEP_AVERAGES_MAX = 8
  
  
 @dataclass
@@ -49,6 +54,7 @@ class Detection:
     pic_locked: bool = False
     pic_lines: int = 0
     last_picture_at: float = 0.0
+    analog_evidence: bool = False
  
  
  
@@ -525,8 +531,8 @@ class Engine:
             self.src.set_sample_rate(fs)
         # fs = float(scan["sample_rate"])
         nfft = int(scan.get("fft_size", 4096))
-        avg = int(scan.get("averages", 8))
-        need = nfft * avg
+        avg = max(1, min(int(scan.get("averages", 8)), SWEEP_AVERAGES_MAX))
+        need = max(nfft * avg, int(fs * SWEEP_COMB_S))
  
         plan = self._sweep_plan()
         if self._sweep_i >= len(plan) and not self._dense_q:
@@ -580,15 +586,20 @@ class Engine:
                 dc_notch_hz=float(scan.get("dc_notch_hz", 200e3)))
 
             for o in occ:
-                self._queue_cluster_dense(o.center_hz, f, scan)
-                line_hint = (
-                    self._sweep_line_hint(iq, fs, f, o, scan)
-                    if from_extra else True
+                score = self._sweep_classify(iq, fs, f, o, scan)
+                line_hint = bool(
+                    score is not None
+                    and score.is_video
+                    and score.standard in ("PAL", "NTSC")
                 )
+                if line_hint:
+                    self._queue_cluster_dense(o.center_hz, f, scan)
+                    self._merge_comb_detection(o, score)
+                    continue
                 if not scan_gate.should_full_inspect(
                     dwell_hz=f, center_hz=o.center_hz,
                     bandwidth_hz=o.bandwidth_hz, snr_db=o.snr_db,
-                    from_extra=from_extra, scan=scan, line_hint=line_hint,
+                    from_extra=from_extra, scan=scan, line_hint=False,
                 ):
                     continue
                 self._inspect(iq, f, fs, o)
@@ -766,6 +777,11 @@ class Engine:
 
     def _sweep_line_hint(self, iq, fs, dwell_hz, occ, scan) -> bool:
         """Cheap 15.7 kHz comb on extra-dwell IQ. No retune, no decode."""
+        score = self._sweep_classify(iq, fs, dwell_hz, occ, scan)
+        return bool(score is not None and score.is_video)
+
+    def _sweep_classify(self, iq, fs, dwell_hz, occ, scan):
+        """PAL/NTSC comb on the dwell IQ. No extra retune, no decode."""
         try:
             mix = float(occ.center_hz) - float(dwell_hz)
             insp_bw = scan_gate.inspect_bw_hz(scan, occ.center_hz)
@@ -775,9 +791,35 @@ class Engine:
                 fast=bool(scan.get("fast_channelizer", False)))
             base = demod.fm_demod(
                 ch, fs2, deviation_hz=max(float(occ.bandwidth_hz), 8e6) / 5)
-            return demod.line_comb_hint(base, fs2)
+            return demod.classify_video(
+                base, fs2,
+                tol_hz=float(scan.get("line_tol_hz", 150)),
+                min_prominence_db=float(scan.get("line_prominence_db", 8)),
+                min_conf=float(scan.get("min_confidence", 0.45)),
+                min_harmonics=int(scan.get("min_harmonics", 1)),
+            )
         except Exception:
-            return False
+            return None
+
+    def _merge_comb_detection(self, occ, score) -> None:
+        """List analog PAL/NTSC from the dwell comb without a 40 ms inspect."""
+        if score is None or not score.is_video:
+            return
+        if score.standard not in ("PAL", "NTSC"):
+            return
+        now = time.time()
+        self._merge(Detection(
+            freq_hz=occ.center_hz,
+            bandwidth_hz=occ.bandwidth_hz,
+            snr_db=round(occ.snr_db, 1),
+            standard=score.standard,
+            confidence=float(score.confidence),
+            channel=nearest_channel(occ.center_hz),
+            band=band_of(occ.center_hz),
+            first_seen=now, last_seen=now,
+            line_rate=float(score.line_rate),
+            analog_evidence=True,
+        ))
 
     def _inspect_soft(self, score, occ, pic, sc) -> bool:
         """Спектральний обхід, коли decode не зібрав кадр."""
@@ -885,6 +927,7 @@ class Engine:
                 det.pic_locked = old.pic_locked or det.pic_locked
                 det.pic_lines = max(old.pic_lines, det.pic_lines)
                 det.last_picture_at = max(old.last_picture_at, det.last_picture_at)
+                det.analog_evidence = old.analog_evidence or det.analog_evidence
                 det.standard = old.standard if old.pic_score >= det.pic_score else det.standard
                 det.channel = old.channel or det.channel
                 det.band = old.band or det.band
@@ -912,6 +955,7 @@ class Engine:
                     det.pic_locked = old.pic_locked or det.pic_locked
                     det.pic_lines = max(old.pic_lines, det.pic_lines)
                     det.last_picture_at = max(old.last_picture_at, det.last_picture_at)
+                    det.analog_evidence = old.analog_evidence or det.analog_evidence
                     det.standard = old.standard if old.pic_score >= det.pic_score else det.standard
                     det.channel = old.channel or det.channel
                     det.band = old.band or det.band
@@ -1028,7 +1072,7 @@ class Engine:
         self._ring = None
  
     def _reader_loop(self, fs: float):
-        chunk = max(1024, int(fs * 0.005))     # 5 мс за раз
+        chunk = max(1024, int(fs * STREAM_LOCK_CHUNK_S))
         while not self._reader_stop.is_set():
             try:
                 iq = self.src.read(chunk)
