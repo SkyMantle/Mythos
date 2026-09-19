@@ -119,6 +119,8 @@ def _pic(d: dict[str, Any]) -> float:
 def _has_video(d: dict[str, Any]) -> bool:
     if d.get("pic_locked"):
         return True
+    if d.get("analog_evidence") and analog_standard(d.get("standard")):
+        return True
     return _pic(d) >= NO_VIDEO_SCORE
 
 
@@ -215,6 +217,9 @@ def _hide_weak(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         peak = max(_snr(d) for d in group)
         for d in group:
             if d.get("pic_locked") or _pic(d) >= KEEP_PIC_SCORE:
+                keep.append(d)
+                continue
+            if d.get("analog_evidence") and analog_standard(d.get("standard")):
                 keep.append(d)
                 continue
             if _snr(d) >= peak - WEAK_REL_DB:
