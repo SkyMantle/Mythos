@@ -11,7 +11,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from fpvscan.engine import Engine
+from fpvscan.engine import Detection, Engine
 
 
 class _Source:
@@ -136,6 +136,31 @@ def test_run_writes_actual_rate_into_cfg():
     assert cfg["video"]["sample_rate"] == actual
 
 
+def test_clear_keeps_lock_channel_bw():
+    """Очистити під час LOCK не має звужувати вікно каналайзера."""
+    src = _Source(2e6, 2e6)
+    eng = Engine(src, _cfg(2e6), Queue())
+    eng.state.detections[5800] = Detection(
+        freq_hz=5800e6, bandwidth_hz=20e6, snr_db=18.0, hits=2)
+    measured = eng._lock_bw(5800e6, 8e6)
+    assert measured == 20e6 + 2 * eng.MERGE_TOL_HZ
+    eng._handle_command("clear", {})
+    assert eng.state.detections == {}
+    assert eng._lock_bw(5800e6, 8e6) == measured
+    # 0.5 МГц nudge — той самий передавач, навіть без рядка в списку
+    assert eng._lock_bw(5800.5e6, 8e6) == measured
+
+
+def test_lock_bw_default_on_unrelated_frequency_after_clear():
+    src = _Source(2e6, 2e6)
+    eng = Engine(src, _cfg(2e6), Queue())
+    eng.state.detections[5800] = Detection(
+        freq_hz=5800e6, bandwidth_hz=20e6, snr_db=18.0, hits=2)
+    eng._lock_bw(5800e6, 8e6)
+    eng._handle_command("clear", {})
+    assert eng._lock_bw(1280e6, 8e6) == 8e6
+
+
 def test_manual_lock_listener_is_registered_once():
     """Heartbeat applyState() раніше вішав новий keydown щодва секунди."""
     html = (Path(__file__).resolve().parents[1]
@@ -151,5 +176,7 @@ if __name__ == "__main__":
     test_lock_keeps_reader_when_fs_off_by_fraction()
     test_lock_retunes_when_fs_really_changes()
     test_run_writes_actual_rate_into_cfg()
+    test_clear_keeps_lock_channel_bw()
+    test_lock_bw_default_on_unrelated_frequency_after_clear()
     test_manual_lock_listener_is_registered_once()
     print("OK")

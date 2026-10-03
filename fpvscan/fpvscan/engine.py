@@ -78,6 +78,8 @@ class Engine:
         self._lock_n = 0
         self._acc: np.ndarray | None = None
         self._afc = 0.0
+        self._lock_ch_bw: float | None = None
+        self._lock_ch_bw_for: float | None = None
         self._sweep_i = 0
         self._timings: dict[str, float] = {}   # ковзне середнє по етапах, мс
         self._frame_ts: float | None = None    # час минулого відданого кадру
@@ -156,6 +158,8 @@ class Engine:
             self.state.lock_target = None
             self.state.mode = "SWEEP"
             self.state.auto = False
+            self._lock_ch_bw = None
+            self._lock_ch_bw_for = None
             self._stop_reader()
         elif name == "clear":
             self._peeked.clear()
@@ -516,7 +520,16 @@ class Engine:
         """
         for d in self.state.detections.values():
             if abs(d.freq_hz - freq_hz) < 6e6:
-                return max(8e6, d.bandwidth_hz +2 * self.MERGE_TOL_HZ)
+                bw = max(8e6, d.bandwidth_hz + 2 * self.MERGE_TOL_HZ)
+                self._lock_ch_bw = bw
+                self._lock_ch_bw_for = d.freq_hz
+                return bw
+        # Очистити список знахідок не має звужувати вже відкритий LOCK:
+        # без цього dec стрибає (типово 1→3 на 35 Мвідл/с), DecodeState
+        # скидається і вікно каналайзера ріже бічні смуги аналогового ЧМ.
+        if (self._lock_ch_bw is not None and self._lock_ch_bw_for is not None
+                and abs(freq_hz - self._lock_ch_bw_for) < 6e6):
+            return self._lock_ch_bw
         return max(8e6, default_bw)
  
     def _start_reader(self, want: float, fs: float, ring_seconds: float):
