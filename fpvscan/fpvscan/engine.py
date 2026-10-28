@@ -214,7 +214,29 @@ class Engine:
         self._emit("notice", {"level": "ok", "text":
                    f"{Path(st['path']).name}: {st['bytes']/1e6:.2f} МБ, "
                    f"{st['seconds']} с, {st['kbps']} кбіт/с"})
- 
+
+    def _rec_abort(self, st: dict | None = None):
+        """ffmpeg already died. Stop the handle and tell the operator.
+
+        Without this, snapshot() keeps `recording: true` and rec_seconds
+        ticks over a 0-byte mp4 — the fly is gone and nothing was saved.
+        """
+        if self._rec is None:
+            return
+        if st is None:
+            st = self._rec.stop()
+        self._rec = None
+        err = (st.get("error") or "").strip() or "ffmpeg зупинився"
+        name = Path(st.get("path", "")).name or "запис"
+        self._emit("notice", {"level": "error", "text":
+                   f"{name} обірвався: {err}"})
+
+    def _rec_watchdog(self):
+        if self._rec is None:
+            return
+        if not self._rec.alive:
+            self._rec_abort()
+
     def _apply_bias_tee_gain(self, on: bool):
         """LNA на bias-tee додає власне підсилення поверх gain_db приймача.
  
@@ -273,6 +295,7 @@ class Engine:
             fails = 0
             while not self._stop.is_set():
                 self._drain_commands()
+                self._rec_watchdog()
                 try:
                     if self.state.mode == "LOCK" and self.state.lock_target:
                         self._do_lock()
@@ -730,7 +753,10 @@ class Engine:
                 frame.luma = np.clip(self._acc, 0, 255).astype(np.uint8)
  
             if self._rec is not None:
-                self._rec.push(frame.luma)
+                if not self._rec.alive:
+                    self._rec_abort()
+                else:
+                    self._rec.push(frame.luma)
  
             if self._snap:
                 self._snap = False
@@ -781,10 +807,10 @@ class Engine:
             "lock_target": self.state.lock_target,
             "auto": self.state.auto,
             "source": self.src.name,
-            "recording": self._rec is not None,
+            "recording": self._rec is not None and self._rec.alive,
             "bias_tee": bool(getattr(self.src, "bias_tee", False)),
             "rec_seconds": (round(time.time() - self._rec.started_at, 1)
-            if self._rec else 0),
+            if self._rec is not None and self._rec.alive else 0),
             "fps": round(self._fps_ema, 2),
             "timings_ms": {k: round(v, 1) for k, v in self._timings.items()},
             "overflows": int(getattr(self.src, "overflows", 0)),
