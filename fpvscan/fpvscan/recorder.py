@@ -90,6 +90,7 @@ class VideoRecorder:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._failed = False
         self.frames_written = 0
         self.started_at = 0.0
         self.exe = exe
@@ -116,6 +117,7 @@ class VideoRecorder:
                                       stdout=subprocess.DEVNULL,
                                       stderr=subprocess.PIPE)
         self.started_at = time.time()
+        self._failed = False
         self._stop.clear()
         self._thread = threading.Thread(target=self._pump, daemon=True)
         self._thread.start()
@@ -140,8 +142,15 @@ class VideoRecorder:
             try:
                 self._proc.stdin.write(fr.tobytes())
                 self.frames_written += 1
-            except (BrokenPipeError, ValueError):
+            except (BrokenPipeError, ValueError, OSError):
+                # ffmpeg already exited (no libx264, disk full, killed).
+                # The engine must see this; otherwise the console keeps
+                # showing «Запис» over a 0-byte file.
+                self._failed = True
                 break
+        if not self._stop.is_set() and self._proc is not None \
+                and self._proc.poll() is not None:
+            self._failed = True
 
     def stop(self) -> dict:
         self._stop.set()
@@ -173,8 +182,26 @@ class VideoRecorder:
         }
 
     @property
+    def alive(self) -> bool:
+        """True only while ffmpeg is still accepting frames.
+
+        `_proc is not None` stays true after the child exits, so the
+        engine used to report `recording: true` over a dead encoder.
+        """
+        if self._failed or self._proc is None:
+            return False
+        if self._proc.poll() is not None:
+            self._failed = True
+            return False
+        if self._thread is not None and not self._thread.is_alive() \
+                and not self._stop.is_set():
+            self._failed = True
+            return False
+        return True
+
+    @property
     def active(self) -> bool:
-        return self._proc is not None
+        return self.alive
 
 
 def _resize_nearest(a: np.ndarray, h: int, w: int) -> np.ndarray:
