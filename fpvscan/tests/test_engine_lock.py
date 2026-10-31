@@ -147,9 +147,82 @@ def test_manual_lock_listener_is_registered_once():
     assert html.count("manual-freq').addEventListener") == 1
 
 
+def test_snapshot_survives_recorder_torn_down_concurrently():
+    """time.time() відпускає GIL між `if _rec` і `_rec.started_at`.
+
+    Heartbeat / /api/state читають snapshot() з іншої нитки. Стоп запису
+    (або lock/sweep, які теж ріжуть ролик) обнуляє `_rec` у цей проміжок
+    — і без локальної копії посилання консоль ловить AttributeError.
+    """
+    import threading
+    from fpvscan.engine import Detection
+
+    src = _Source(2e6, 2e6)
+    eng = Engine(src, _cfg(2e6), Queue())
+
+    class _Rec:
+        started_at = time.time()
+
+    rec = _Rec()
+    stop = threading.Event()
+    errors: list[BaseException] = []
+
+    def flip():
+        i = 0
+        while not stop.is_set():
+            if i % 2 == 0:
+                eng._rec = rec
+                eng.state.detections[i % 40] = Detection(
+                    freq_hz=5800e6 + i, bandwidth_hz=8e6, snr_db=12, hits=2)
+            else:
+                eng._rec = None
+                if i % 6 == 0:
+                    eng.state.detections.clear()
+                eng._timings[f"s{i % 3}"] = float(i)
+            i += 1
+
+    def snap():
+        try:
+            for _ in range(30_000):
+                s = eng.snapshot()
+                assert "recording" in s
+                assert "detections" in s
+        except BaseException as e:
+            errors.append(e)
+
+    t1 = threading.Thread(target=flip)
+    t2 = threading.Thread(target=snap)
+    t1.start()
+    t2.start()
+    t2.join()
+    stop.set()
+    t1.join()
+    assert not errors, f"snapshot() впав під час гонки: {errors!r}"
+
+
+def test_snapshot_binds_recorder_before_time():
+    """Навіть якщо _rec обнулили після входу, rec_seconds лишається валідним."""
+    src = _Source(2e6, 2e6)
+    eng = Engine(src, _cfg(2e6), Queue())
+
+    class _Rec:
+        started_at = time.time() - 3.0
+
+    eng._rec = _Rec()
+    s = eng.snapshot()
+    assert s["recording"] is True
+    assert s["rec_seconds"] >= 3.0
+    eng._rec = None
+    s = eng.snapshot()
+    assert s["recording"] is False
+    assert s["rec_seconds"] == 0
+
+
 if __name__ == "__main__":
     test_lock_keeps_reader_when_fs_off_by_fraction()
     test_lock_retunes_when_fs_really_changes()
     test_run_writes_actual_rate_into_cfg()
     test_manual_lock_listener_is_registered_once()
+    test_snapshot_survives_recorder_torn_down_concurrently()
+    test_snapshot_binds_recorder_before_time()
     print("OK")

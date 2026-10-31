@@ -99,7 +99,11 @@ def create_app(engine) -> FastAPI:
     async def heartbeat():
         while True:
             await asyncio.sleep(2)
-            msg = json.dumps({"type": "state", "data": engine.snapshot()})
+            try:
+                msg = json.dumps({"type": "state", "data": engine.snapshot()})
+            except Exception as e:
+                print(f"[web] snapshot: {e}", flush=True)
+                continue
             for c in list(clients):
                 try:
                     await c.send_text(msg)

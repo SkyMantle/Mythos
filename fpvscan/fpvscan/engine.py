@@ -774,6 +774,15 @@ class Engine:
             self._stop_reader()        # звільняємо src перед _do_sweep()
  
     def snapshot(self) -> dict:
+        # Heartbeat і /api/state читають з іншої нитки, ніж _run.
+        # time.time() відпускає GIL між `if self._rec` і `.started_at` —
+        # _rec_stop() встигає обнулити посилання, і нитка heartbeat падає
+        # з AttributeError, після чого консоль більше не оновлює стан.
+        # detections/timings копіюємо атомарно: ітерація live-view під
+        # Clear/merge може зловити RuntimeError.
+        rec = self._rec
+        dets = list(self.state.detections.copy().values())
+        timings = self._timings.copy()
         return {
             "mode": self.state.mode,
             "tuned_hz": self.state.tuned_hz,
@@ -781,17 +790,16 @@ class Engine:
             "lock_target": self.state.lock_target,
             "auto": self.state.auto,
             "source": self.src.name,
-            "recording": self._rec is not None,
+            "recording": rec is not None,
             "bias_tee": bool(getattr(self.src, "bias_tee", False)),
-            "rec_seconds": (round(time.time() - self._rec.started_at, 1)
-            if self._rec else 0),
+            "rec_seconds": (round(time.time() - rec.started_at, 1)
+                            if rec else 0),
             "fps": round(self._fps_ema, 2),
-            "timings_ms": {k: round(v, 1) for k, v in self._timings.items()},
+            "timings_ms": {k: round(v, 1) for k, v in timings.items()},
             "overflows": int(getattr(self.src, "overflows", 0)),
             "clip_frac": round(float(getattr(self.src, "clip_frac", 0.0)), 4),
             "detections": [asdict(d) for d in
-                        sorted(self.state.detections.values(),
-                        key=lambda x: -x.snr_db)
+                        sorted(dets, key=lambda x: -x.snr_db)
                         if d.hits >= int(self.cfg["scan"].get(
                         "confirm_hits", 2))],
         }
