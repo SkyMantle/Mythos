@@ -147,9 +147,76 @@ def test_manual_lock_listener_is_registered_once():
     assert html.count("manual-freq').addEventListener") == 1
 
 
+def test_stop_reader_clears_reader_err():
+    """Сканувати гасить кільце; зрив USB від минулого LOCK не має лишатись."""
+    src = _Source(2e6, 2e6)
+    eng = Engine(src, _cfg(2e6), Queue())
+    eng._reader_err = RuntimeError("sync_rx: USB bulk transfer failed")
+    try:
+        eng._stop_reader()
+        assert eng._reader_err is None
+        assert eng._ring is None
+    finally:
+        eng._stop_reader()
+
+
+def test_lock_after_sweep_does_not_reraise_stale_reader_err():
+    """USB зірвався в LOCK, оператор натиснув Сканувати, кабель живий —
+    наступний lock має стартувати читач, а не підняти старий зрив."""
+    src = _Source(2e6, 2e6)
+    eng = Engine(src, _cfg(2e6), Queue())
+    eng.state.mode = "LOCK"
+    eng.state.lock_target = 5800e6
+    try:
+        eng._do_lock()
+        assert src.retune_calls == 1
+        # зрив після перевірки _reader_err у цьому кадрі (під час DSP)
+        eng._reader_err = RuntimeError("sync_rx: USB bulk transfer failed")
+        eng._handle_command("sweep", {})
+        assert eng.state.mode == "SWEEP"
+        assert eng._ring is None
+        assert eng._reader_err is None
+
+        eng._handle_command("lock", {"freq_hz": 5800e6})
+        eng._do_lock()
+        assert src.retune_calls == 2, (
+            f"після Sweep→Lock читач мав стартувати знову, "
+            f"retune_calls={src.retune_calls}"
+        )
+        assert eng._ring is not None
+        assert eng._reader_err is None
+    finally:
+        eng._stop_reader()
+
+
+def test_do_lock_reraises_live_reader_err():
+    """Жива сесія: мертвий читач усе ще має вилізти, щоб _run дав паузу."""
+    src = _Source(2e6, 2e6)
+    eng = Engine(src, _cfg(2e6), Queue())
+    eng.state.mode = "LOCK"
+    eng.state.lock_target = 5800e6
+    try:
+        eng._do_lock()
+        assert eng._ring is not None
+        eng._reader_err = RuntimeError("sync_rx: USB bulk transfer failed")
+        try:
+            eng._do_lock()
+        except RuntimeError as e:
+            assert "USB" in str(e)
+        else:
+            raise AssertionError("живий зрив читача мав піднятись")
+        assert eng._reader_err is None
+        assert eng._ring is None
+    finally:
+        eng._stop_reader()
+
+
 if __name__ == "__main__":
     test_lock_keeps_reader_when_fs_off_by_fraction()
     test_lock_retunes_when_fs_really_changes()
     test_run_writes_actual_rate_into_cfg()
     test_manual_lock_listener_is_registered_once()
+    test_stop_reader_clears_reader_err()
+    test_lock_after_sweep_does_not_reraise_stale_reader_err()
+    test_do_lock_reraises_live_reader_err()
     print("OK")
