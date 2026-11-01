@@ -549,6 +549,11 @@ class Engine:
             self._reader_thread.join(timeout=2)
         self._reader_thread = None
         self._ring = None
+        # Помилка належить щойно згашеній нитці. Якщо її лишити,
+        # Sweep→Lock підніме старий зрив USB і зарахує його в ліміт
+        # 8 помилок — після реального відвалу цей шлях відновлення
+        # вб'є робочу нитку, хоча кабель уже живий.
+        self._reader_err = None
  
     def _reader_loop(self, fs: float):
         chunk = max(1024, int(fs * 0.005))     # 5 мс за раз
@@ -596,7 +601,10 @@ class Engine:
  
         ring_s = float(vcfg.get("ring_seconds", max(0.3, capture_s * 3)))
  
-        if self._reader_err is not None:
+        # Піднімати можна лише зрив ПОТОЧНОЇ сесії читача. Після
+        # «Сканувати» кільця вже немає — leftover _reader_err це
+        # минулий LOCK і він не має блокувати _start_reader нижче.
+        if self._reader_err is not None and self._ring is not None:
             err, self._reader_err = self._reader_err, None
             self._stop_reader()
             raise err
