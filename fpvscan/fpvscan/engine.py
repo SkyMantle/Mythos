@@ -517,7 +517,11 @@ class Engine:
         for d in self.state.detections.values():
             if abs(d.freq_hz - freq_hz) < 6e6:
                 return max(8e6, d.bandwidth_hz +2 * self.MERGE_TOL_HZ)
-        return max(8e6, default_bw)
+        # No occupancy (manual lock, empty hit list). 10 MHz at 35 Msps
+        # is dec=3 and clips analog FM so vsync is lost — LOCK then
+        # emits a wrapping 288-line raster. 12 MHz is dec=2 (17.5 MHz)
+        # and holds a field.
+        return max(12e6, default_bw)
  
     def _start_reader(self, want: float, fs: float, ring_seconds: float):
         """Запускає нитку безперервного читання IQ у кільцевий буфер.
