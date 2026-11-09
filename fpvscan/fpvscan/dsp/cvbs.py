@@ -392,9 +392,17 @@ def decode(base: np.ndarray, fs: float, width: int = 640,
     for sign in (1.0, -1.0):
         s, f, t0 = _attempt(v * sign, fs, width, max_lines,
                             auto_levels=auto_levels, sharpen=sharpen)
-        if f is not None and s > best_s:
+        if f is None:
+            continue
+        # H-interval regularity alone can score an inverted wrap (no
+        # vsync, max_lines of two fields sheared together) higher than a
+        # real locked field. Prefer the polarity that found vertical sync.
+        better = (best_f is None
+                  or (f.locked and not best_f.locked)
+                  or (f.locked == best_f.locked and s > best_s))
+        if better:
             best_s, best_f, best_t0, best_sign = s, f, t0, sign
-    if best_s <= 0.5:
+    if best_f is None or best_s <= 0.5:
         return None
 
     if state is not None:

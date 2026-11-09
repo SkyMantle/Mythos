@@ -5,13 +5,15 @@ from __future__ import annotations
 import sys
 import time
 from pathlib import Path
-from queue import Queue
+from queue import Empty, Queue
 
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from fpvscan.engine import Engine
+from fpvscan.engine import Detection, Engine
+from fpvscan.dsp import cvbs
+from fpvscan.sdr.sim import SimSource
 
 
 class _Source:
@@ -136,6 +138,98 @@ def test_run_writes_actual_rate_into_cfg():
     assert cfg["video"]["sample_rate"] == actual
 
 
+def test_lock_bw_floor_without_occupancy():
+    """10 MHz YAML fallback is below analog FM; 12 MHz is the first that holds."""
+    eng = Engine(_Source(2e6, 2e6), _cfg(2e6), Queue())
+    assert eng._lock_bw(5800e6, 8e6) == 12e6
+    assert eng._lock_bw(5800e6, 10e6) == 12e6
+    assert eng._lock_bw(5800e6, 16e6) == 16e6
+    eng.state.detections[5800] = Detection(
+        freq_hz=5800e6, bandwidth_hz=10e6, snr_db=20.0, hits=2)
+    # Occupancy path is unchanged: measured + 2*MERGE_TOL.
+    assert eng._lock_bw(5800e6, 10e6) == 10e6 + 2 * Engine.MERGE_TOL_HZ
+
+
+def _ntsc_luma(fs: float, seconds: float = 0.08) -> np.ndarray:
+    """Baseband NTSC bars (no FM) so both polarities produce a Frame."""
+    n = int(fs * seconds)
+    t = np.arange(n, dtype=np.float64) / fs
+    lt = 63.555e-6
+    line = np.floor(t / lt)
+    x = t - line * lt
+    field_line = np.mod(line, 525.0)
+    fl = np.where(field_line >= 262.5, field_line - 262.5, field_line)
+    v = np.full(n, 0.30, dtype=np.float32)
+    v[x < 4.7e-6] = 0.0
+    in_act = (x >= 9.4e-6) & (x < 62.0e-6) & (fl >= 20) & (fl < 258)
+    u = np.clip((x - 9.4e-6) / 52.6e-6, 0, 0.999)
+    bars = np.floor(u * 8) / 7.0
+    v[in_act] = (0.30 + 0.70 * bars[in_act]).astype(np.float32)
+    vs = fl < 3
+    if np.any(vs):
+        x2 = np.mod(x, lt / 2)
+        v[vs] = np.where(x2 < 27.1e-6, 0.0, 0.30).astype(np.float32)[vs]
+    return v
+
+
+def test_decode_prefers_locked_field_over_inverted_wrap():
+    """Score-only polarity used to pick a 288-line unlocked wrap on NTSC."""
+    fs = 35e6
+    fr = cvbs.decode(_ntsc_luma(fs), fs, width=640)
+    assert fr is not None, "decoder returned nothing"
+    assert fr.locked, f"picked unlocked wrap ({fr.lines} lines)"
+    assert fr.lines < 288, f"wrapping raster leaked through ({fr.lines} lines)"
+    assert 200 <= fr.lines <= 250, f"unexpected field height {fr.lines}"
+
+
+def test_manual_lock_holds_field_without_occupancy():
+    """Typing 5800 MHz with shipped 10 MHz YAML and an empty hit list."""
+    fs = 35e6
+    cfg = _cfg(fs)
+    cfg["video"]["channel_bw_hz"] = 10e6
+    cfg["video"]["capture_ms"] = 80
+    cfg["video"]["ring_seconds"] = 0.3
+    cfg["video"]["idle_ms"] = 0
+    cfg["video"]["min_lines"] = 200
+    cfg["video"]["width"] = 640
+    cfg["video"]["afc"] = False
+    cfg["video"]["average"] = 0
+    src = SimSource()
+    src.open()
+    src.set_sample_rate(fs)
+    src.set_gain(40)
+    eng = Engine(src, cfg, Queue())
+    eng.state.mode = "LOCK"
+    eng.state.lock_target = 5800e6
+    locked = []
+    try:
+        eng._do_lock()          # start the IQ reader
+        need = int(fs * cfg["video"]["capture_ms"] / 1000)
+        t_fill = time.time()
+        while (eng._ring is None or eng._ring.filled < need) and time.time() - t_fill < 8:
+            time.sleep(0.05)
+        for _ in range(12):
+            eng._do_lock()
+            try:
+                while True:
+                    ev = eng.events.get_nowait()
+                    if ev["type"] == "frame":
+                        locked.append(ev["data"])
+            except Empty:
+                pass
+            if any(d["locked"] and d["lines"] < 288 for d in locked):
+                break
+    finally:
+        eng._stop_reader()
+    assert eng._lock_bw(5800e6, 10e6) == 12e6
+    assert locked, "manual LOCK produced no frames"
+    good = [d for d in locked if d["locked"] and d["lines"] < 288]
+    assert good, (
+        "manual LOCK wrapped the field: "
+        + ", ".join(f"{d['lines']} loc={d['locked']}" for d in locked)
+    )
+
+
 def test_manual_lock_listener_is_registered_once():
     """Heartbeat applyState() раніше вішав новий keydown щодва секунди."""
     html = (Path(__file__).resolve().parents[1]
@@ -151,5 +245,8 @@ if __name__ == "__main__":
     test_lock_keeps_reader_when_fs_off_by_fraction()
     test_lock_retunes_when_fs_really_changes()
     test_run_writes_actual_rate_into_cfg()
+    test_lock_bw_floor_without_occupancy()
+    test_decode_prefers_locked_field_over_inverted_wrap()
+    test_manual_lock_holds_field_without_occupancy()
     test_manual_lock_listener_is_registered_once()
     print("OK")
