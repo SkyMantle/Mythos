@@ -519,6 +519,38 @@ class Engine:
                 return max(8e6, d.bandwidth_hz +2 * self.MERGE_TOL_HZ)
         return max(8e6, default_bw)
  
+    def _abandon_lock(self, why: str):
+        """Зірване утримання не повинно валити робочу нитку.
+
+        Інакше вісім відмов підряд (бюджет USB у `_run`) закривають
+        приймач, а консоль лишається «живою»: Sweep/Стати кладуться в
+        чергу, яку вже ніхто не читає.
+        """
+        self._stop_reader()
+        self._emit("notice", {"level": "error", "text": why})
+        self.state.mode = "SWEEP"
+        self.state.lock_target = None
+        self.state.auto = False
+        self._afc = 0.0
+        self._acc = None
+        self._lock_tuned = None
+        print(f"[рушій] {why}", flush=True)
+
+    def _try_start_reader(self, want: float, fs: float, ring_seconds: float) -> bool:
+        """_start_reader, але відмова перебудови повертає у SWEEP.
+
+        У полі МГц «5.8» (мали на увазі гігагерци) дає 5.8 МГц — нижче
+        підлоги bladeRF 2.0 (47 МГц). `retune_and_read` падає щокадру,
+        `_run` вичерпує 8 спроб і вбиває нитку. Тут одразу виходимо
+        зі LOCK, щоб можна було натиснути Сканувати або ввести частоту ще раз.
+        """
+        try:
+            self._start_reader(want, fs, ring_seconds)
+            return True
+        except Exception as e:
+            self._abandon_lock(f"не можу стати на {want/1e6:.3f} МГц: {e}")
+            return False
+
     def _start_reader(self, want: float, fs: float, ring_seconds: float):
         """Запускає нитку безперервного читання IQ у кільцевий буфер.
  
@@ -567,6 +599,8 @@ class Engine:
         vcfg = self.cfg["video"]
         fs_want = float(vcfg.get("sample_rate", 20e6))
         f = self.state.lock_target
+        if f is None:
+            return
  
         # Точне `!=` тут неприпустиме: плата часто повертає, наприклад,
         # 34999872 замість 35000000. Свіп уже порівнює з допуском 1 Гц;
@@ -612,7 +646,8 @@ class Engine:
         # подією (див. afc_recenter_frac нижче).
         want = f + off
         if self._ring is None or self._lock_tuned != want:
-            self._start_reader(want, fs, ring_s)
+            if not self._try_start_reader(want, fs, ring_s):
+                return
  
         iq, abs_start_iq = self._ring.snapshot(n)
         if len(iq) < n:
@@ -671,7 +706,8 @@ class Engine:
             # відновиться протягом ≤3 викликів).
             recenter_frac = float(vcfg.get("afc_recenter_frac", 0.75))
             if lim > 0 and abs(self._afc) > lim * recenter_frac:
-                self._start_reader(f + off + self._afc, fs, ring_s)
+                if not self._try_start_reader(f + off + self._afc, fs, ring_s):
+                    return
                 self._lock_tuned = want
                 self._afc = 0.0
             elif lim <= 0 and self._afc != 0.0:
@@ -679,7 +715,8 @@ class Engine:
                 # широкий канал) — одразу віддаємо корекцію в
                 # перебудову, інакше clamp занулить afc і дрейф
                 # перестане компенсуватись.
-                self._start_reader(f + off + self._afc, fs, ring_s)
+                if not self._try_start_reader(f + off + self._afc, fs, ring_s):
+                    return
                 self._lock_tuned = want
                 self._afc = 0.0
         t = self._mark("afc", t)
