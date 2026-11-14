@@ -552,6 +552,16 @@ class Engine:
  
     def _reader_loop(self, fs: float):
         chunk = max(1024, int(fs * 0.005))     # 5 мс за раз
+        # Файл (і будь-яке fixed_freq джерело без власного realtime)
+        # віддає відліки миттєво. Без темпу нитка за десятки мілісекунд
+        # проганяє весь .cf32 крізь кільце, genlock бачить стрибок на
+        # секунди ефіру між сусідніми знімками і зриває картинку.
+        # Жива плата сама задає темп у sync_rx — її не спимо.
+        pace = (bool(getattr(self.src, "fixed_freq", False))
+                and not bool(getattr(self.src, "realtime", False))
+                and fs > 0)
+        period = chunk / fs if pace else 0.0
+        nxt = time.perf_counter()
         while not self._reader_stop.is_set():
             try:
                 iq = self.src.read(chunk)
@@ -562,6 +572,14 @@ class Engine:
             if ring is None:
                 return
             ring.write(iq)
+            if pace:
+                nxt += period
+                delay = nxt - time.perf_counter()
+                if delay > 0:
+                    if self._reader_stop.wait(timeout=delay):
+                        return
+                elif delay < -0.05:
+                    nxt = time.perf_counter()
  
     def _do_lock(self):
         vcfg = self.cfg["video"]

@@ -147,9 +147,80 @@ def test_manual_lock_listener_is_registered_once():
     assert html.count("manual-freq').addEventListener") == 1
 
 
+def test_lock_file_reader_paces_to_sample_rate():
+    """LOCK на .cf32 не повинен прокручувати запис на тисячі × realtime.
+
+    Нитка читання кличе FileSource.read без паузи: 50 мс стіни
+    з'їдали десятки секунд ефіру, genlock бачив стрибок між знімками
+    і зривав картинку. Фіксоване джерело тепер тримає темп fs.
+    """
+    import tempfile
+    from fpvscan.sdr.file import FileSource, write_capture
+
+    fs = 1_000_000.0
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "cap.cf32"
+        write_capture(path, np.zeros(int(fs * 0.4), dtype=np.complex64),
+                      5800e6, fs)
+        src = FileSource(path, loop=True)
+        src.open()
+        src.samples_read = 0
+        orig = src.read
+
+        def _count(n):
+            out = orig(n)
+            src.samples_read += len(out)
+            return out
+
+        src.read = _count
+        eng = Engine(src, _cfg(fs), Queue())
+        try:
+            t0 = time.perf_counter()
+            eng._start_reader(5800e6, fs, 0.05)
+            time.sleep(0.05)
+            dt = time.perf_counter() - t0
+        finally:
+            eng._stop_reader()
+            src.close()
+
+        # стартовий grab ~10 мс + ~50 мс темпу. Без темпу було б >1000×.
+        rf_s = src.samples_read / fs
+        assert rf_s < 0.25, (
+            f"читач прокрутив {rf_s*1000:.0f} мс ефіру за {dt*1000:.0f} мс "
+            f"стіни ({rf_s/dt:.0f}× realtime)"
+        )
+        assert src.samples_read > 2048, "мав прочитати хоча б стартовий блок"
+
+
+def test_lock_live_reader_is_not_paced():
+    """Жива плата сама задає темп у sync_rx — зайвий sleep подвоїв би затримку."""
+    src = _Source(2e6, 2e6)
+    src.samples_read = 0
+    orig = src.read
+
+    def _count(n):
+        out = orig(n)
+        src.samples_read += len(out)
+        return out
+
+    src.read = _count
+    eng = Engine(src, _cfg(2e6), Queue())
+    try:
+        t0 = time.perf_counter()
+        eng._start_reader(5800e6, 2e6, 0.05)
+        time.sleep(0.03)
+        dt = time.perf_counter() - t0
+    finally:
+        eng._stop_reader()
+    # без sleep у нитці встигаємо далеко за realtime
+    assert src.samples_read / 2e6 / dt > 10
+
+
 if __name__ == "__main__":
     test_lock_keeps_reader_when_fs_off_by_fraction()
     test_lock_retunes_when_fs_really_changes()
     test_run_writes_actual_rate_into_cfg()
     test_manual_lock_listener_is_registered_once()
+    test_lock_file_reader_paces_to_sample_rate()
+    test_lock_live_reader_is_not_paced()
     print("OK")
