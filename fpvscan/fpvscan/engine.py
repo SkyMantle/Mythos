@@ -773,7 +773,23 @@ class Engine:
             self._afc = 0.0
             self._stop_reader()        # звільняємо src перед _do_sweep()
  
+    @staticmethod
+    def _copy_dict(d: dict) -> dict:
+        """Snapshot a dict that another thread may insert into or clear.
+
+        A Python loop over ``d.items()`` can raise ``RuntimeError: dictionary
+        changed size during iteration`` at a bytecode boundary. ``dict(d)``
+        copies under the C API; retry if a rare concurrent resize still trips.
+        """
+        for _ in range(8):
+            try:
+                return dict(d)
+            except RuntimeError:
+                continue
+        return {}
+
     def snapshot(self) -> dict:
+        timings = self._copy_dict(self._timings)
         return {
             "mode": self.state.mode,
             "tuned_hz": self.state.tuned_hz,
@@ -786,7 +802,7 @@ class Engine:
             "rec_seconds": (round(time.time() - self._rec.started_at, 1)
             if self._rec else 0),
             "fps": round(self._fps_ema, 2),
-            "timings_ms": {k: round(v, 1) for k, v in self._timings.items()},
+            "timings_ms": {k: round(v, 1) for k, v in timings.items()},
             "overflows": int(getattr(self.src, "overflows", 0)),
             "clip_frac": round(float(getattr(self.src, "clip_frac", 0.0)), 4),
             "detections": [asdict(d) for d in
