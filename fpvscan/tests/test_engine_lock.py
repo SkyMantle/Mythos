@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 import time
 from pathlib import Path
 from queue import Queue
@@ -136,6 +137,44 @@ def test_run_writes_actual_rate_into_cfg():
     assert cfg["video"]["sample_rate"] == actual
 
 
+def test_snapshot_survives_timings_mutation():
+    """First LOCK adds _timings keys while the web heartbeat iterates them.
+
+    snapshot() used a Python dict comprehension over the live mapping, so a
+    concurrent insert raised RuntimeError and killed the heartbeat task —
+    after that the console stopped applying state (recording button stuck).
+    """
+    src = _Source(2_000_000.0, 2_000_000.0)
+    eng = Engine(src, _cfg(2_000_000.0), Queue())
+    stop = threading.Event()
+    errors: list[str] = []
+
+    def mutate():
+        i = 0
+        while not stop.is_set():
+            eng._timings[f"stage{i}"] = float(i)
+            i += 1
+            if i % 16 == 0:
+                eng._timings.clear()
+
+    t = threading.Thread(target=mutate)
+    t.start()
+    try:
+        for _ in range(20_000):
+            try:
+                snap = eng.snapshot()
+            except Exception as e:
+                errors.append(repr(e))
+                break
+            assert "timings_ms" in snap
+            assert isinstance(snap["timings_ms"], dict)
+    finally:
+        stop.set()
+        t.join(timeout=2)
+
+    assert errors == [], f"snapshot raised while timings mutated: {errors[:3]}"
+
+
 def test_manual_lock_listener_is_registered_once():
     """Heartbeat applyState() раніше вішав новий keydown щодва секунди."""
     html = (Path(__file__).resolve().parents[1]
@@ -151,5 +190,6 @@ if __name__ == "__main__":
     test_lock_keeps_reader_when_fs_off_by_fraction()
     test_lock_retunes_when_fs_really_changes()
     test_run_writes_actual_rate_into_cfg()
+    test_snapshot_survives_timings_mutation()
     test_manual_lock_listener_is_registered_once()
     print("OK")
