@@ -50,6 +50,36 @@ META_STATUS_OVERRUN = 1 << 0
 
 SC16_SCALE = 2048.0     # Q11: 12-бітний АЦП у форматі int16
 
+# libbladeRF застосовує timeout_ms до ВСЬОГО виклику sync_rx, а не до
+# одного USB-трансферу. Захоплення довше за цей ліміт (типово 3500 мс)
+# ніколи не встигає — scripts/record.py з -d 4 при 40 Мвідл/с падає,
+# хоча в докстрінгу «2–4 с» саме рекомендований розмір запису.
+SYNC_RX_TIMEOUT_FRAC = 0.4
+
+
+def max_sync_rx_samples(sample_rate: float, timeout_ms: int,
+                        safety: float = SYNC_RX_TIMEOUT_FRAC) -> int:
+    """Найбільша кількість відліків, яку sync_rx встигне набрати за timeout."""
+    if timeout_ms <= 0:
+        timeout_ms = 1000
+    if sample_rate <= 0:
+        sample_rate = 1e6
+    n = int(float(sample_rate) * (timeout_ms / 1000.0) * float(safety))
+    return max(1024, n)
+
+
+def iter_sync_rx_chunks(n: int, sample_rate: float, timeout_ms: int):
+    """Ділить запит на шматки, кожен коротший за USB-таймаут."""
+    n = int(n)
+    if n <= 0:
+        return
+    cap = max_sync_rx_samples(sample_rate, timeout_ms)
+    done = 0
+    while done < n:
+        take = min(cap, n - done)
+        yield take
+        done += take
+
 # Розмір struct bladerf_quick_tune відрізняється між поколіннями плат
 # (для xA4 це профіль швидкого захоплення RFIC). Виділяємо з запасом —
 # нам вміст непотрібен, ми тільки передаємо його назад у бібліотеку.
@@ -560,9 +590,11 @@ class BladeRF(SdrSource):
 
     # ---------- читання ----------
 
-    def read(self, n: int) -> np.ndarray:
-        self._need_dev()
+    def _sync_rx(self, n: int) -> np.ndarray:
+        """Один виклик libbladeRF sync_rx на n відліків."""
         n = int(n)
+        if n <= 0:
+            return np.zeros(0, dtype=np.complex64)
         need = 2 * n
         if self._raw is None or self._raw.size < need:
             self._raw = np.empty(need, dtype=np.int16)
@@ -594,6 +626,26 @@ class BladeRF(SdrSource):
         # відео — тому міряємо це на кожному читанні.
         self.clip_frac = float(np.mean(np.abs(raw) > 2000))
         return (raw.astype(np.float32) / SC16_SCALE).view(np.complex64)
+
+    def read(self, n: int) -> np.ndarray:
+        self._need_dev()
+        n = int(n)
+        if n <= 0:
+            return np.zeros(0, dtype=np.complex64)
+        chunks = list(iter_sync_rx_chunks(n, self._fs, self.timeout_ms))
+        if len(chunks) == 1:
+            return self._sync_rx(chunks[0])
+        # Довгий запис (scripts/record.py -d 3..4) не вміщається в один
+        # sync_rx: таймаут 3.5 с, а захоплення саме стільки ж або довше.
+        out = np.empty(n, dtype=np.complex64)
+        pos = 0
+        clip = 0.0
+        for take in chunks:
+            out[pos:pos + take] = self._sync_rx(take)
+            clip = max(clip, self.clip_frac)
+            pos += take
+        self.clip_frac = clip
+        return out
 
     def retune_and_read(self, hz: float, n: int) -> np.ndarray:
         self.set_center_freq(hz)
