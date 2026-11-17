@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 import time
 from pathlib import Path
 from queue import Queue
@@ -147,9 +148,62 @@ def test_manual_lock_listener_is_registered_once():
     assert html.count("manual-freq').addEventListener") == 1
 
 
+class _SlowRec:
+    """ffmpeg wait() stand-in: stop() blocks longer than the old join(3)."""
+
+    def __init__(self, hold_s: float):
+        self.hold_s = hold_s
+        self.started_at = time.time()
+        self.stop_done = threading.Event()
+        self.stop_calls = 0
+
+    def stop(self):
+        self.stop_calls += 1
+        time.sleep(self.hold_s)
+        self.stop_done.set()
+        return {
+            "path": "/tmp/x.mp4",
+            "bytes": 1234,
+            "seconds": 1.0,
+            "kbps": 1.0,
+            "error": "",
+        }
+
+
+def test_stop_waits_for_recorder_finalize():
+    """Ctrl+C / systemd stop used to kill the daemon engine thread
+    while ffmpeg was still rewriting the MP4 (+faststart, wait 10 s).
+    join(3) returned early; the recording was unreadable."""
+    src = _Source(2_000_000.0, 2_000_000.0)
+    eng = Engine(src, _cfg(2_000_000.0), Queue())
+    rec = _SlowRec(3.5)
+    eng._rec = rec
+    eng.start()
+    try:
+        deadline = time.time() + 2.0
+        while eng._thread is None or not eng._thread.is_alive():
+            assert time.time() < deadline, "engine thread did not start"
+            time.sleep(0.01)
+        time.sleep(0.2)
+        t0 = time.time()
+        eng.stop()
+        dt = time.time() - t0
+        assert rec.stop_done.is_set(), (
+            f"stop() returned after {dt:.1f}s without waiting for the recorder"
+        )
+        assert dt >= 3.5, f"stop() returned too fast ({dt:.1f}s); join timed out"
+        assert rec.stop_calls == 1
+        assert eng._rec is None
+    finally:
+        eng._stop.set()
+        if eng._thread:
+            eng._thread.join(timeout=5)
+
+
 if __name__ == "__main__":
     test_lock_keeps_reader_when_fs_off_by_fraction()
     test_lock_retunes_when_fs_really_changes()
     test_run_writes_actual_rate_into_cfg()
     test_manual_lock_listener_is_registered_once()
+    test_stop_waits_for_recorder_finalize()
     print("OK")
