@@ -92,7 +92,12 @@ class Engine:
     def stop(self):
         self._stop.set()
         if self._thread:
-            self._thread.join(timeout=3)
+            # Нитка рушія — daemon. У finally вона кличе _stop_reader
+            # (join 2 с) і _rec_stop() (ffmpeg.wait 10 с плюс перепис
+            # MP4 з +faststart). join(3) повертався, поки ffmpeg ще
+            # писав файл; вихід процесу вбивав нитку і лишав
+            # нечитабельний запис.
+            self._thread.join(timeout=20)
  
     def command(self, name: str, **kw):
         self._cmd.put((name, kw))
@@ -290,8 +295,10 @@ class Engine:
                     if fails >= 8:
                         raise
                     # Пауза росте: якщо плата переперелічується на USB,
-                    # їй потрібні секунди, а не мілісекунди.
-                    time.sleep(min(5.0, 0.5 * fails))
+                    # їй потрібні секунди, а не мілісекунди. wait(), щоб
+                    # stop() не застрягав на цьому сні.
+                    if self._stop.wait(timeout=min(5.0, 0.5 * fails)):
+                        break
         finally:
             self._stop_reader()
             self._rec_stop()
