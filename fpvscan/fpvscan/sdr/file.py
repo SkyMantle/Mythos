@@ -50,22 +50,50 @@ class FileSource(SdrSource):
         self._data = None
 
     def read(self, n: int) -> np.ndarray:
+        """Return the next n samples. Looping splices tail+head instead of
+        jumping to sample 0, so a LOCK reader that straddles EOF does not
+        drop the remaining field (that jump rolled genlock on short .cf32).
+        """
         d = self._data
         if d is None:
             raise IOError("Джерело не відкрите")
-        if self._pos + n > d.size:
+        n = int(n)
+        if n <= 0:
+            return np.zeros(0, dtype=np.complex64)
+
+        if self._pos >= d.size:
             if not self.loop:
                 raise EOFError("Запис закінчився")
             self._pos = 0
-        out = d[self._pos:self._pos + n]
-        self._pos += n
-        if out.size < n:                      # запис коротший за запит
-            reps = int(np.ceil(n / out.size))
-            out = np.tile(out, reps)[:n]
+
+        if self._pos + n <= d.size:
+            out = d[self._pos:self._pos + n]
+            self._pos += n
+        elif not self.loop:
+            # Deliver the remaining tail instead of raising first: otherwise
+            # a LOCK 5 ms chunk that straddles EOF drops up to a full field.
+            out = d[self._pos:]
+            self._pos = d.size
+            if out.size == 0:
+                raise EOFError("Запис закінчився")
+        else:
+            # Splice tail + head (possibly several wraps if n > file length)
+            # so DecodeState.abs_t0 tracking sees a continuous stream.
+            parts = []
+            need = n
+            while need > 0:
+                if self._pos >= d.size:
+                    self._pos = 0
+                take = min(need, d.size - self._pos)
+                parts.append(d[self._pos:self._pos + take])
+                self._pos += take
+                need -= take
+            out = parts[0] if len(parts) == 1 else np.concatenate(parts)
+
         if self.realtime:
             import time
-            time.sleep(n / self._fs)
-        return out.copy()
+            time.sleep(len(out) / self._fs)
+        return np.array(out, dtype=np.complex64, copy=True)
 
     # Частота і смуга зафіксовані записом. Перебудову ігноруємо, але
     # чесно повідомляємо, щоб не гадати, чому свіп нічого не бачить.
