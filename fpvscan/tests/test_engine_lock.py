@@ -5,7 +5,7 @@ from __future__ import annotations
 import sys
 import time
 from pathlib import Path
-from queue import Queue
+from queue import Empty, Queue
 
 import numpy as np
 
@@ -147,9 +147,91 @@ def test_manual_lock_listener_is_registered_once():
     assert html.count("manual-freq').addEventListener") == 1
 
 
+def _notices(eng):
+    out = []
+    while True:
+        try:
+            ev = eng.events.get_nowait()
+        except Empty:
+            break
+        if ev.get("type") == "notice":
+            out.append(ev["data"])
+    return out
+
+
+def test_snapshot_during_sweep_does_not_arm_photo():
+    """Photo in Sweep used to set _snap; the next LOCK wrote the wrong VTx."""
+    src = _Source(2_000_000.0, 2_000_000.0)
+    eng = Engine(src, _cfg(2_000_000.0), Queue())
+    eng.state.mode = "SWEEP"
+    eng.state.lock_target = None
+    eng._handle_command("snapshot", {})
+    assert eng._snap is False
+    notes = _notices(eng)
+    assert notes and notes[-1]["level"] == "error"
+
+
+def test_snapshot_during_lock_arms_photo():
+    src = _Source(2_000_000.0, 2_000_000.0)
+    eng = Engine(src, _cfg(2_000_000.0), Queue())
+    eng.state.mode = "LOCK"
+    eng.state.lock_target = 5800e6
+    eng._handle_command("snapshot", {})
+    assert eng._snap is True
+
+
+def test_sweep_clears_pending_photo():
+    src = _Source(2_000_000.0, 2_000_000.0)
+    eng = Engine(src, _cfg(2_000_000.0), Queue())
+    eng.state.mode = "LOCK"
+    eng.state.lock_target = 5800e6
+    eng._snap = True
+    try:
+        eng._handle_command("sweep", {})
+        assert eng._snap is False
+        assert eng.state.mode == "SWEEP"
+    finally:
+        eng._stop_reader()
+
+
+def test_lock_command_clears_pending_photo():
+    """Nudge / click-to-hold must not save the previous channel's pending shot."""
+    src = _Source(2_000_000.0, 2_000_000.0)
+    eng = Engine(src, _cfg(2_000_000.0), Queue())
+    eng.state.mode = "LOCK"
+    eng.state.lock_target = 5800e6
+    eng._snap = True
+    eng._handle_command("lock", {"freq_hz": 5800.5e6})
+    assert eng._snap is False
+    assert eng.state.lock_target == 5800.5e6
+
+
+def test_auto_peek_timeout_clears_pending_photo():
+    """Peek expiry used to leave _snap set; the next peek wrote that photo."""
+    want = 2_000_000.0
+    src = _Source(want, want)
+    eng = Engine(src, _cfg(want), Queue())
+    eng.state.mode = "LOCK"
+    eng.state.lock_target = 5800e6
+    eng.state.auto = True
+    eng.state.auto_until = 0.0
+    eng._snap = True
+    try:
+        eng._do_lock()
+        assert eng._snap is False
+        assert eng.state.mode == "SWEEP"
+    finally:
+        eng._stop_reader()
+
+
 if __name__ == "__main__":
     test_lock_keeps_reader_when_fs_off_by_fraction()
     test_lock_retunes_when_fs_really_changes()
     test_run_writes_actual_rate_into_cfg()
     test_manual_lock_listener_is_registered_once()
+    test_snapshot_during_sweep_does_not_arm_photo()
+    test_snapshot_during_lock_arms_photo()
+    test_sweep_clears_pending_photo()
+    test_lock_command_clears_pending_photo()
+    test_auto_peek_timeout_clears_pending_photo()
     print("OK")

@@ -149,6 +149,8 @@ class Engine:
             self._acc = None
             self._afc = 0.0
             self._lock_tuned = None
+            self._snap = False          # знімок прив'язаний до поточного утримання
+
             self.state.lock_target = float(kw["freq_hz"])
             self.state.mode = "LOCK"
             self.state.auto = False
@@ -156,12 +158,19 @@ class Engine:
             self.state.lock_target = None
             self.state.mode = "SWEEP"
             self.state.auto = False
+            self._snap = False
             self._stop_reader()
         elif name == "clear":
             self._peeked.clear()
             self._sweep_i = 0
             self.state.detections.clear()
         elif name == "snapshot":
+            if self.state.mode != "LOCK" or not self.state.lock_target:
+                # Як rec_start: у свіпі кадру немає. Залишений _snap
+                # записав би наступний автоперегляд як «знімок».
+                self._emit("notice", {"level": "error",
+                                    "text": "спершу стань на канал"})
+                return
             self._snap = True
         elif name == "rec_start":
             self._rec_start()
@@ -771,6 +780,7 @@ class Engine:
             self.state.mode = "SWEEP"
             self._acc = None
             self._afc = 0.0
+            self._snap = False
             self._stop_reader()        # звільняємо src перед _do_sweep()
  
     def snapshot(self) -> dict:
