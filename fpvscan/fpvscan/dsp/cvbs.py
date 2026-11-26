@@ -249,21 +249,26 @@ def _attempt(v: np.ndarray, fs: float, width: int, max_lines: int,
 
 def _predict_local_t0(state: DecodeState, abs_start: float) :
     """Прогнозує локальну (відносно початку нового знімку) позицію
-    найближчого фронту кадрової синхри за відомими період+abs_t0.
+    наступного фронту кадрової синхри за відомими період+abs_t0.
 
-    Екстраполяція йде по цілій кількості польових періодів
-    (`round(...)`), тому прогноз завжди влучає в межі поточного поля
-    незалежно від того, наскільки великий розрив між знімками —
-    буфер міг не встигнути записати частину відліків, виклик
-    decode() міг прийти з затримкою тощо. «Пливти» разом з розміром
-    розриву тут нема чому.
+    Знімок з кільця не прив'язаний до поля: між викликами decode()
+    минає десятки мілісекунд, тож початок буфера майже завжди лежить
+    всередині поля, а не на його межі. `round` тоді цілить у вже
+    минулий фронт (від'ємний local_t0), а трекінг шукає лише ±0.55
+    рядка навколо прогнозу — і промахується. Захоплення навмисно
+    ~1.7 поля, щоб наступний фронт ще був у буфері: тому беремо
+    `ceil` (перший фронт не раніше abs_start). «Пливти» разом з
+    розміром розриву тут нема чому.
     """
     if state.period is None or state.abs_t0 is None:
         return None
     field_period = state.period * FIELD_LINES.get(state.standard, FIELD_LINES["?"])
     if field_period <= 0:
         return None
-    n = round((abs_start - state.abs_t0) / field_period)
+    # -1e-9: точний збіг abs_start==abs_t0 лишається n=0, а не стрибає на +1.
+    n = int(np.ceil((abs_start - state.abs_t0) / field_period - 1e-9))
+    if n < 0:
+        n = 0
     abs_pred = state.abs_t0 + n * field_period
     return float(abs_pred - abs_start), n, field_period
 
